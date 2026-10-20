@@ -2,7 +2,8 @@
 //!
 //! 负责：已运行则跳过、启动、启动后缓冲、等待主窗口、关闭启动画面、置前窗口。
 //! 「已运行则跳过」由调用方传入**有效开关**（`workflow.skip_existing_processes
-//! && spec.skip_if_running`），为 false 时必定真正启动。
+//! && spec.skip_if_running`），为 false 时必定真正启动、且不会发起任何检测；
+//! 检测走 `platform::proc::find_running_app`（普通应用按进程名，浏览器 PWA 按可见窗口标题）。
 //! 所有分支都会给出中文 `message`，失败时返回带上下文的 `Err`。
 
 use std::sync::atomic::AtomicBool;
@@ -27,30 +28,37 @@ pub struct LaunchOutcome {
 /// `skip_existing` 是**有效**的「已运行则跳过」开关：调用方负责把
 /// `workflow.skip_existing_processes && spec.skip_if_running` 合进来
 /// （见 [`crate::engine::executor::skip_existing_enabled`]）。为 false 时即使进程
-/// 已在运行也必须真正启动。
+/// 已在运行也必须真正启动，而且不会调用任何运行状态检测。
+///
+/// `display_name` 是节点展示名（executor 传 `node.name`）：浏览器 PWA 需要靠它匹配
+/// 可见窗口标题；为空时退回从启动路径推导的进程名。
 pub async fn launch_spec(
     spec: &AppLaunchSpec,
     cancel: &Arc<AtomicBool>,
     skip_existing: bool,
+    display_name: &str,
 ) -> Result<LaunchOutcome> {
     if spec.path.trim().is_empty() {
         bail!("启动路径为空，无法启动");
     }
 
     let process_name = resolve_process_name(spec);
+    // 消息里优先用节点显示名，没有时退回进程名。
+    let label = display_label(display_name, &process_name);
 
-    // 1. 已经在运行则跳过（默认行为，避免重复拉起常驻程序）。
-    //    只有「有效开关为真」时才去查进程，避免无谓的枚举开销。
-    let is_running = if skip_existing && !process_name.is_empty() {
-        platform::is_process_running(&process_name)
+    // 1. 已经在运行则跳过（避免重复拉起常驻程序 / 重复打开 PWA）。
+    //    普通应用按进程名检测，浏览器按可见窗口标题匹配 display_name；
+    //    只有「有效开关为真」时才发起检测，避免无谓的进程/窗口枚举。
+    let existing_pid = if should_check_running(skip_existing) {
+        proc::find_running_app(spec, display_name)
     } else {
-        false
+        None
     };
-    if should_skip(skip_existing, &process_name, is_running) {
+    if let Some(pid) = existing_pid {
         return Ok(LaunchOutcome {
-            pid: None,
+            pid: Some(pid),
             already_running: true,
-            message: format!("「{process_name}」已在运行，跳过启动"),
+            message: format!("「{label}」已在运行，跳过启动"),
         });
     }
 
@@ -126,12 +134,22 @@ pub async fn launch_spec(
     })
 }
 
-/// 是否因为「已在运行」而跳过启动。
+/// 是否发起「已运行」检测。
 ///
-/// 三个条件同时成立才跳过：有效开关为真、进程名可推导、进程确实在运行。
-/// 工作流级开关关闭时 `skip_existing` 为 false，这里必然是 false。
-fn should_skip(skip_existing: bool, process_name: &str, is_running: bool) -> bool {
-    skip_existing && !process_name.trim().is_empty() && is_running
+/// 工作流级开关关闭时调用方给的 `skip_existing` 为 false，这里直接返回 false，
+/// 连 `find_running_app` 都不会调用（不产生任何进程/窗口枚举开销）。
+fn should_check_running(skip_existing: bool) -> bool {
+    skip_existing
+}
+
+/// 消息里展示的名字：优先节点显示名（浏览器 PWA 需要它），为空时退回进程名。
+fn display_label<'a>(display_name: &'a str, process_name: &'a str) -> &'a str {
+    let trimmed = display_name.trim();
+    if trimmed.is_empty() {
+        process_name
+    } else {
+        trimmed
+    }
 }
 
 /// 进程名：优先使用显式的 `process_name`，否则从启动路径推导（不含 .exe）。
@@ -178,11 +196,20 @@ mod tests {
     }
 
     #[test]
-    fn should_skip_requires_effective_switch() {
-        // 工作流级开关为 false 时即使进程在跑也绝不跳过。
-        assert!(!should_skip(false, "WeChat", true));
-        assert!(should_skip(true, "WeChat", true));
-        assert!(!should_skip(true, "WeChat", false));
-        assert!(!should_skip(true, "   ", true));
+    fn should_check_running_respects_workflow_switch() {
+        assert!(should_check_running(true));
+        // 工作流级开关为 false 时连查询都不发起，等价于绝不因「已在运行」跳过。
+        assert!(!should_check_running(false));
+    }
+
+    #[test]
+    fn display_label_prefers_node_name_and_falls_back() {
+        // 有节点显示名时用显示名（浏览器 PWA 的窗口标题匹配 / 消息展示）。
+        assert_eq!(display_label("微信", "WeChat"), "微信");
+        assert_eq!(display_label("  微信  ", "WeChat"), "微信");
+        // 没有显示名时退回从启动路径推导的进程名。
+        assert_eq!(display_label("", "WeChat"), "WeChat");
+        assert_eq!(display_label("   ", "WeChat"), "WeChat");
+        assert_eq!(display_label("", ""), "");
     }
 }

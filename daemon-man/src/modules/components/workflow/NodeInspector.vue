@@ -18,6 +18,7 @@ import { useWorkflowStore } from "@/modules/stores/workflows";
 import { formatDuration } from "@/modules/utils/format";
 
 import { nodeKindMeta } from "./meta";
+import { computeDelayPills } from "./delayPill";
 import NumberField from "./NumberField.vue";
 import { errorText, fieldGroupClass, sectionLabelClass } from "./shared";
 import ToggleRow from "./ToggleRow.vue";
@@ -33,6 +34,13 @@ const { t } = useI18n();
 const meta = computed(() => nodeKindMeta[props.node.kind]);
 const runState = computed(() => store.nodeRun(props.node.id));
 const testing = ref(false);
+
+/** 该 delay 节点是否已折叠成「连线上的药丸」（是则提示这是连线延时）。 */
+const edgeDelayPill = computed(() => {
+  const draft = store.draft;
+  if (!draft) return null;
+  return computeDelayPills(draft.nodes, draft.edges).get(props.node.id) ?? null;
+});
 
 const argsText = computed({
   get: () => props.node.app.args.join("\n"),
@@ -335,6 +343,12 @@ async function testLaunch() {
           :label="t('node.delay')"
           :step="100"
         />
+        <p
+          v-if="edgeDelayPill"
+          class="rounded-lg bg-amber-50 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-700 dark:bg-amber-500/10 dark:text-amber-200"
+        >
+          {{ t("workflow.edgeDelayHint") }}
+        </p>
       </template>
 
       <template v-else-if="props.node.kind === 'wait'">

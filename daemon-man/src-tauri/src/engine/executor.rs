@@ -1063,7 +1063,8 @@ async fn execute_node(
             // 工作流级开关关闭时，无论节点怎么配置都真正执行启动。
             let skip_existing =
                 skip_existing_enabled(skip_existing_processes, node.app.skip_if_running);
-            match launcher::launch_spec(&node.app, cancel, skip_existing).await {
+            // 节点名作为 display_name 传给 launcher：浏览器 PWA 靠它匹配窗口标题。
+            match launcher::launch_spec(&node.app, cancel, skip_existing, &node.name).await {
                 Ok(outcome) => NodeExec::Success {
                     message: outcome.message,
                     pid: outcome.pid,
@@ -1120,6 +1121,16 @@ async fn execute_wait(node: &WorkflowNode, cancel: &Arc<AtomicBool>) -> NodeExec
     } else {
         spec.timeout_ms
     };
+
+    // 不要求窗口可见时，「进程已经在跑」就等价于就绪：先做一次同步快检，
+    // 命中就省掉后面的轮询等待（与 wait_for_window 的语义一致）。
+    if !spec.window_visible && platform::is_process_running(process_name) {
+        return NodeExec::Success {
+            message: format!("进程「{process_name}」已就绪"),
+            pid: None,
+            already_running: false,
+        };
+    }
 
     let ready = platform::wait_for_window(
         process_name,

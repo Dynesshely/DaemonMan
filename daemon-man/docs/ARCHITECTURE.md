@@ -92,6 +92,7 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 5. **失败传播**：失败/取消会让 `success` 边的下游节点变为 `skipped`，但 `failure`/`always` 边继续执行，从而支持降级分支。
 6. **单点执行**：`engine::spawn_single_node_run` 校验节点存在且非分组、强制 `enabled=true`，用只含该节点的最小工作流（edges 清空、沿用原 workflow id/name/skip_existing）复用同一执行器，便于调试；不校验整张图，未保存的草稿也能单点运行。节点 id 保持不变，前端按 `run.workflowId + nodeId` 显示状态。
 7. **进程父进程**：普通启动走 `CreateProcessW + STARTUPINFOEXW`，用 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 把父进程指向当前 shell（`GetShellWindow` 所属 explorer），使工作流启动的进程不挂在 DaemonMan 进程树下；属性列表/句柄失败或 `CREATE_BREAKAWAY_FROM_JOB` 不被允许时按「去 breakaway → 普通 CreateProcess」回退。管理员启动仍由 ShellExecuteEx(runas) 处理。
+8. **已运行检测**：`platform::proc::find_running_app(spec, display_name)` 先按 processName/目标 exe 检测；若目标是浏览器（chrome/msedge/brave/chromium/opera/vivaldi），再枚举可见顶层窗口，按窗口标题与节点显示名打分匹配，并过滤「 - Google Chrome」「 - Microsoft Edge」等普通标签页标题，从而识别 PWA/Web App 是否已打开。无法精确读取命令行 `--app-id`（windows crate 未导出对应 API），标题匹配可能对无浏览器后缀的标签页产生误判，取舍为「宁可跳过也不重复开窗」。
 
 ## 4. 自启动接管
 
@@ -130,7 +131,9 @@ GUI 始终以普通权限运行。需要管理员权限的单个操作（启用/
 `components/workflow/layout.ts` 负责自动排列，`graph.ts` 提供 Kahn 拓扑分层：
 
 - 每个可执行节点计算 `layer`（1 + max(上游层)）与 `拓扑序`（Kahn 出队顺序）。顶层单元按层分列，同层按拓扑序排列；顺序分组内子项按拓扑序排列（延时节点位于其真实前后节点之间），并行分组用三列紧凑网格。
-- 节点卡片显示执行步骤号（拓扑序）；分组容器边界由子节点位置递归推导。
+- 自动排列采用「单元图 + 思维导图森林」：顶层单元（分组/未分组节点）先按拓扑分层，再以主父关系构造森林，父节点在左、子节点向右纵向展开并垂直居中；多棵树按面积估算目标宽度水平换行，使整体保持 landscape；分组内部同算法，分组尺寸与子项坐标同源。
+- 连线延时：只有一个入边/一个出边且条件均为 success 的 delay 节点视为「连线延时」，自动排列时从布局图折叠（两条边合并为 source→target 虚拟边），画布渲染为连线上的小药丸并放到两端中点；选中药丸或相邻连线会选中该延时节点，右侧可编辑延时。
+- 吸附：Vue Flow `snap-to-grid` 16px，可开关；分组节点可拖动，拖动时整组后代按整数 delta 平移。
 - 边分类：`target.layer === source.layer + 1 && condition === "success"` 为执行流（实线、品牌色、粗箭头）；其余（跨层/同层跳线、失败/总是）为依赖线（虚线、灰色、细箭头）。图例见画布工具栏。
 - 历史：`stores/workflows.ts` 对 `draft` 做深度 watch + 约 400ms 防抖，把 JSON 快照压入 past/future 栈；上限取 `AppSettings.undo_limit`（默认 100，范围 1..=10000），加载/保存/切换工作流时重置。撤销/重做恢复快照并保持 dirty/选中态一致。
 - 新建启动应用：`api.list_start_menu_apps` 扫描用户与系统开始菜单中的 `.lnk`（解析目标与参数、过滤卸载/帮助/文档等噪声），前端 `StartMenuPicker` 搜索/图标/键盘选择后填入节点。

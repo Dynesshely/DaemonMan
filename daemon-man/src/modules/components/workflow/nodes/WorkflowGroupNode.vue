@@ -71,16 +71,16 @@ const parallelLabel = computed(() =>
 </script>
 
 <template>
-  <div class="relative h-full w-full cursor-default" :class="disabled ? 'opacity-60' : ''">
-    <!-- 容器背景（不拦截指针事件，避免遮挡子节点与画布平移） -->
+  <div class="relative h-full w-full cursor-grab active:cursor-grabbing" :class="disabled ? 'opacity-60' : ''">
+    <!-- 容器背景：可拖动整组（子节点层级更高，不会被子项遮挡） -->
     <div
       class="absolute inset-0 rounded-2xl border-2 border-dashed transition-colors"
       :class="containerClass"
     />
 
-    <!-- 标题栏：唯一可交互区域，点击选中分组 -->
+    <!-- 标题栏：可拖动整组 / 点击选中分组 -->
     <div
-      class="pointer-events-auto absolute left-0 top-0 flex max-w-full items-center gap-1.5 overflow-hidden rounded-br-xl rounded-tl-2xl border-b border-r px-2.5 py-1.5 shadow-sm"
+      class="pointer-events-auto absolute left-0 top-0 flex max-w-full cursor-grab items-center gap-1.5 overflow-hidden rounded-br-xl rounded-tl-2xl border-b border-r px-2.5 py-1.5 shadow-sm active:cursor-grabbing"
       :class="headerClass"
       :title="t('node.groupHint')"
     >

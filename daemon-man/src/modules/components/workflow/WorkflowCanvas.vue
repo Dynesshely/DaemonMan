@@ -13,6 +13,7 @@ import {
   type Node,
   type NodeChange,
   type NodeDragEvent,
+  type EdgeMouseEvent,
   type NodeMouseEvent,
   type NodeRemoveChange,
 } from "@vue-flow/core";
@@ -22,6 +23,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   GitBranch,
   LayoutGrid,
+  Magnet,
   Maximize2,
   Minus,
   Play,
@@ -46,6 +48,14 @@ import { useWorkflowStore } from "@/modules/stores/workflows";
 import WorkflowEdgeLine from "./edges/WorkflowEdgeLine.vue";
 import { runSingleNode } from "./commands";
 import {
+  DELAY_PILL_HEIGHT,
+  DELAY_PILL_WIDTH,
+  buildDelayLayoutGraph,
+  computeDelayPills,
+  pillByEdge,
+  placeDelayPills,
+} from "./delayPill";
+import {
   buildFlowEdge,
   buildFlowNode,
   createWorkflowNode,
@@ -61,14 +71,11 @@ import {
   GROUP_PADDING,
   NODE_HEIGHT,
   NODE_WIDTH,
-  PARALLEL_COLUMNS,
-  PARALLEL_GAP_X,
-  PARALLEL_GAP_Y,
-  SEQUENTIAL_GAP_Y,
   computeAutoLayout,
-  computeGroupSizes,
+  computeGroupPlans,
 } from "./layout";
 import { nodeKindMeta, nodeKindOrder } from "./meta";
+import WorkflowDelayPill from "./nodes/WorkflowDelayPill.vue";
 import WorkflowGroupNode from "./nodes/WorkflowGroupNode.vue";
 import WorkflowNodeCard from "./nodes/WorkflowNodeCard.vue";
 import { errorText } from "./shared";
@@ -126,6 +133,41 @@ const gridColor = computed(() => (theme.isDark ? "#27272a" : "#e4e4e7"));
 const DEFAULT_VIEWPORT = { zoom: 1 };
 const DELETE_KEYS = ["Delete", "Backspace"];
 
+// ---------------------------------------------------------------------------
+// 吸附（snap 16px，默认开启，localStorage 记忆）
+// ---------------------------------------------------------------------------
+const SNAP_STORAGE_KEY = "daemon-man-workflow-snap";
+const SNAP_GRID: [number, number] = [16, 16];
+
+function readSnapPreference(): boolean {
+  try {
+    return localStorage.getItem(SNAP_STORAGE_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+const snapEnabled = ref(readSnapPreference());
+
+function toggleSnap() {
+  snapEnabled.value = !snapEnabled.value;
+  try {
+    localStorage.setItem(SNAP_STORAGE_KEY, snapEnabled.value ? "1" : "0");
+  } catch {
+    // 忽略隐私模式等写入失败。
+  }
+}
+
+const snapLabel = computed(() => {
+  const value = t("workflow.snap");
+  return value === "workflow.snap" ? "吸附 16px" : value;
+});
+
+const snapHint = computed(() => {
+  const value = t("workflow.snapHint");
+  return value === "workflow.snapHint" ? "拖动节点时按 16px 网格对齐" : value;
+});
+
 /** 执行步骤号（拓扑序），通过 provide 给节点卡片显示 `#N` 徽标。 */
 const stepOf = ref<Map<string, number>>(new Map());
 /** 执行层，用于区分「执行流」与「依赖跳线」。 */
@@ -133,9 +175,18 @@ const layerMap = ref<Map<string, number>>(new Map());
 provide(WORKFLOW_STEPS, stepOf);
 
 function applyTopology(draft: Workflow) {
-  const topology = computeTopology(draft.nodes, draft.edges);
-  stepOf.value = topology.stepOf;
-  layerMap.value = topology.layerOf;
+  const pills = computeDelayPills(draft.nodes, draft.edges);
+  if (pills.size === 0) {
+    const topology = computeTopology(draft.nodes, draft.edges);
+    stepOf.value = topology.stepOf;
+    layerMap.value = topology.layerOf;
+    return;
+  }
+  // 步骤号：把折叠成药丸的延时排除在外，可见节点保持连续编号（#1 → #2，不再断档）。
+  const graph = buildDelayLayoutGraph(draft.nodes, draft.edges, pills);
+  stepOf.value = computeTopology(graph.nodes, graph.edges).stepOf;
+  // 连线分类仍按完整图算：药丸两侧的边要按真实层级判定为执行流（实线）。
+  layerMap.value = computeTopology(draft.nodes, draft.edges).layerOf;
 }
 
 /** 相邻层 + success 才算执行流；跨层、同层、失败/总是都算依赖跳线。 */
@@ -157,10 +208,48 @@ function buildEdgesFor(draft: Workflow): Edge[] {
 let refreshToken = 0;
 let suppressSelectionEmit = false;
 
+/**
+ * 依据当前图结构同步节点类型：
+ * - 候选「连线延时」→ delay-pill（药丸，尺寸 88×28）；
+ * - 不再候选 → 恢复普通 delay 卡片；
+ * - 其它 kind 切换照旧。
+ */
+function syncFlowNodeTypes() {
+  const draft = store.draft;
+  if (!draft) return;
+  const pills = computeDelayPills(draft.nodes, draft.edges);
+  for (const node of draft.nodes) {
+    const current = findNode(node.id);
+    if (!current) continue;
+    const isPill = node.kind === "delay" && pills.has(node.id);
+    const expectedType = isPill ? "delay-pill" : node.kind;
+    if (current.type === expectedType) continue;
+
+    const update: Partial<Node> = { type: expectedType };
+    if (node.kind === "group") {
+      update.connectable = false;
+    } else {
+      // 药丸锁定在连线上：不可拖拽 / 不可连线；恢复卡片时再打开。
+      update.draggable = !isPill;
+      update.connectable = !isPill;
+    }
+    if (isPill) {
+      update.style = {
+        width: `${DELAY_PILL_WIDTH}px`,
+        height: `${DELAY_PILL_HEIGHT}px`,
+      };
+    } else if (current.type === "delay-pill") {
+      update.style = {};
+    }
+    updateNode(node.id, update);
+  }
+}
+
 function refreshFlowEdges() {
   const current = store.draft;
   if (!current) return;
   applyTopology(current);
+  syncFlowNodeTypes();
   const selectedIds = getSelectedEdges.value.map((edge) => edge.id);
   const token = ++refreshToken;
   // 重建期间先屏蔽选中回传，避免右栏属性面板被瞬间清空。
@@ -186,6 +275,42 @@ interface GroupBox {
 
 /** 分组容器的最新边界（由子节点位置/尺寸推导）。 */
 const groupBoxes = ref<Map<string, GroupBox>>(new Map());
+
+/** 正在被拖动的分组 id：拖动期间该组的几何位置交给拖拽逻辑，避免互相抢。 */
+const draggingGroupId = ref<string | null>(null);
+
+interface GroupDragState {
+  groupId: string;
+  last: NodePosition;
+  /** 分组的所有后代节点（含嵌套分组及其子项） */
+  subtree: string[];
+}
+
+let groupDragState: GroupDragState | null = null;
+
+/** 收集分组的所有后代节点 id（用于整组平移）。 */
+function collectSubtreeIds(groupId: string): string[] {
+  const draft = store.draft;
+  if (!draft) return [];
+  const childrenByParent = new Map<string, string[]>();
+  for (const node of draft.nodes) {
+    if (!node.parentId) continue;
+    const list = childrenByParent.get(node.parentId);
+    if (list) list.push(node.id);
+    else childrenByParent.set(node.parentId, [node.id]);
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  const stack = [...(childrenByParent.get(groupId) ?? [])];
+  while (stack.length > 0) {
+    const id = stack.pop() as string;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    result.push(id);
+    stack.push(...(childrenByParent.get(id) ?? []));
+  }
+  return result;
+}
 
 /** 上一次的结构快照，用于识别「子项被加入/移出分组」「并行开关变化」。 */
 const lastGroupSignature = new Map<string, string>();
@@ -298,6 +423,8 @@ function updateGroupGeometry() {
 
   for (const group of draft.nodes) {
     if (group.kind !== "group") continue;
+    // 正在被拖动的那一组由拖拽逻辑控制位置，这里不要抢。
+    if (draggingGroupId.value === group.id) continue;
     const box = boxes.get(group.id);
     if (!box) continue;
     const current = findNode(group.id);
@@ -315,7 +442,6 @@ function updateGroupGeometry() {
       style: {
         width: `${box.width}px`,
         height: `${box.height}px`,
-        pointerEvents: "none",
       },
     });
   }
@@ -349,7 +475,7 @@ function scheduleGroupGeometry() {
   });
 }
 
-/** 在分组现有边界内重新摆放其直接子项（顺序纵向 / 并行三列网格），嵌套分组递归处理。 */
+/** 在分组现有边界内按「分组布局计划」重新摆放其直接子项，嵌套分组递归处理。 */
 function layoutChildrenOf(
   group: WorkflowNode,
   origin?: { x: number; y: number },
@@ -359,69 +485,61 @@ function layoutChildrenOf(
   const box = origin ?? groupBoxes.value.get(group.id);
   const left = box?.x ?? Math.round(group.position.x);
   const top = box?.y ?? Math.round(group.position.y);
-  const children = draft.nodes.filter((node) => node.parentId === group.id);
-  const groupSizes = computeGroupSizes(draft.nodes);
 
-  const sizeOf = (child: WorkflowNode) => {
-    if (child.kind === "group") {
-      return (
-        groupSizes.get(child.id) ?? {
-          width: DEFAULT_GROUP_WIDTH,
-          height: DEFAULT_GROUP_HEIGHT,
-        }
-      );
+  // 连线药丸不参与分组内的常规排布：布局图里先折叠掉，最后按两端中点摆放。
+  const pills = computeDelayPills(draft.nodes, draft.edges);
+  const layoutGraph = buildDelayLayoutGraph(draft.nodes, draft.edges, pills);
+  const plan = computeGroupPlans(layoutGraph.nodes, layoutGraph.edges).get(
+    group.id,
+  );
+
+  if (plan) {
+    for (const [childId, relative] of plan.children) {
+      const child = draft.nodes.find((node) => node.id === childId);
+      if (!child) continue;
+      const position: NodePosition = {
+        x: Math.round(left + relative.x),
+        y: Math.round(top + relative.y),
+      };
+      if (child.position.x !== position.x || child.position.y !== position.y) {
+        child.position = position;
+      }
+      updateNode(childId, { position });
     }
-    const measured = findNode(child.id)?.dimensions;
-    return {
-      width: measured?.width && measured.width > 0 ? measured.width : NODE_WIDTH,
-      height:
-        measured?.height && measured.height > 0 ? measured.height : NODE_HEIGHT,
-    };
-  };
-
-  let cellWidth = NODE_WIDTH;
-  let cellHeight = NODE_HEIGHT;
-  for (const child of children) {
-    const size = sizeOf(child);
-    cellWidth = Math.max(cellWidth, size.width);
-    cellHeight = Math.max(cellHeight, size.height);
   }
 
-  let offsetY = 0;
-  children.forEach((child, index) => {
-    const size = sizeOf(child);
-    const position: NodePosition = group.groupParallel
-      ? {
-          x:
-            left +
-            GROUP_PADDING +
-            (index % PARALLEL_COLUMNS) * (cellWidth + PARALLEL_GAP_X),
-          y:
-            top +
-            GROUP_HEADER +
-            GROUP_PADDING +
-            Math.floor(index / PARALLEL_COLUMNS) * (cellHeight + PARALLEL_GAP_Y),
-        }
-      : {
-          x: left + GROUP_PADDING,
-          y: top + GROUP_HEADER + GROUP_PADDING + offsetY,
-        };
-    if (!group.groupParallel) {
-      offsetY += size.height + SEQUENTIAL_GAP_Y;
-    }
-    if (child.position.x !== position.x || child.position.y !== position.y) {
-      child.position = position;
-    }
-    updateNode(child.id, { position });
-  });
-
   // 嵌套分组：子分组的内部节点跟随新位置重排（否则会留在旧坐标导致容器异常膨大）。
-  for (const child of children) {
-    if (child.kind !== "group") continue;
+  for (const child of draft.nodes) {
+    if (child.parentId !== group.id || child.kind !== "group") continue;
     layoutChildrenOf(child, {
       x: Math.round(child.position.x),
       y: Math.round(child.position.y),
     });
+  }
+
+  // 组内的连线药丸：按 source/target 当前位置取中点。
+  const pillChildren = draft.nodes.filter(
+    (node) => node.parentId === group.id && pills.has(node.id),
+  );
+  if (pillChildren.length > 0) {
+    const positions = new Map<string, NodePosition>();
+    for (const node of draft.nodes) {
+      positions.set(node.id, { x: node.position.x, y: node.position.y });
+    }
+    const pillSubset = new Map(
+      [...pills].filter(([id]) =>
+        pillChildren.some((child) => child.id === id),
+      ),
+    );
+    placeDelayPills(pillSubset, positions);
+    for (const child of pillChildren) {
+      const position = positions.get(child.id);
+      if (!position) continue;
+      if (child.position.x !== position.x || child.position.y !== position.y) {
+        child.position = position;
+      }
+      updateNode(child.id, { position });
+    }
   }
 }
 
@@ -766,12 +884,13 @@ function rebuildFromDraft(next: Workflow | null) {
   // 分组节点必须先创建并带上尺寸：Vue Flow 需要量测到尺寸才会显示节点，
   // 若是 0×0 就会一直 visibility:hidden，容器背景不可见。
   const initialBoxes = computeGroupBoxes();
+  const pills = computeDelayPills(next.nodes, next.edges);
   const orderedNodes = [
     ...next.nodes.filter((node) => node.kind === "group"),
     ...next.nodes.filter((node) => node.kind !== "group"),
   ];
   flowNodes.value = orderedNodes.map((node) =>
-    buildFlowNode(node, initialBoxes.get(node.id)),
+    buildFlowNode(node, initialBoxes.get(node.id), pills.has(node.id)),
   );
   applyTopology(next);
   flowEdges.value = buildEdgesFor(next);
@@ -813,21 +932,15 @@ watch(
     (store.draft?.nodes ?? [])
       .map(
         (node) =>
-          `${node.id}:${node.kind}:${node.parentId ?? "-"}:${
-            node.kind === "group" ? (node.groupParallel ? "p" : "s") : ""
-          }`,
+          `${node.id}:${node.kind}:${node.enabled ? "1" : "0"}:${
+            node.parentId ?? "-"
+          }:${node.kind === "group" ? (node.groupParallel ? "p" : "s") : ""}`,
       )
       .join("|"),
   () => {
-    const draft = store.draft;
-    if (!draft) return;
-    for (const node of draft.nodes) {
-      const current = findNode(node.id);
-      if (current && current.type !== node.kind) {
-        updateNode(node.id, { type: node.kind });
-      }
-    }
+    if (!store.draft) return;
     syncGroupStructure();
+    // refreshFlowEdges 内部会同步节点类型（含连线药丸的折叠/还原）。
     refreshFlowEdges();
   },
 );
@@ -881,6 +994,23 @@ function onConnect(connection: Connection) {
   refreshFlowEdges();
 }
 
+/** 点击连线：若该边两端折叠了延时药丸，则改为选中延时节点，右栏可直接改延时。 */
+function onEdgeClick(event: EdgeMouseEvent) {
+  const current = store.draft;
+  if (!current) return;
+  const pills = computeDelayPills(current.nodes, current.edges);
+  const delayId = pillByEdge(pills).get(event.edge.id);
+  if (!delayId) return;
+  // Vue Flow 会在 click 内先选中边，这里下一拍改成选中节点。
+  void nextTick(() => {
+    const node = findNode(delayId);
+    if (!node) return;
+    removeSelectedElements();
+    addSelectedNodes([node]);
+    emitSelection();
+  });
+}
+
 /** Vue Flow 内置删除（Delete / Backspace）只会改内部 state，这里同步回 draft。 */
 function onNodesChange(changes: NodeChange[]) {
   const current = store.draft;
@@ -909,8 +1039,56 @@ function onEdgesChange(changes: EdgeChange[]) {
   current.edges = current.edges.filter((edge) => !removedIds.includes(edge.id));
 }
 
-/** 拖动过程中：分组容器边界跟随子节点实时变化（按帧节流）。 */
+function onNodeDragStart(event: NodeDragEvent) {
+  if (event.node.type !== "group") {
+    groupDragState = null;
+    draggingGroupId.value = null;
+    return;
+  }
+  const flow = findNode(event.node.id);
+  // 以「取整后的分组位置」为基准，保证后续每次应用到后代上的 delta 都是整数。
+  const last = flow
+    ? { x: Math.round(flow.position.x), y: Math.round(flow.position.y) }
+    : {
+        x: Math.round(event.node.position.x),
+        y: Math.round(event.node.position.y),
+      };
+  groupDragState = {
+    groupId: event.node.id,
+    last,
+    subtree: collectSubtreeIds(event.node.id),
+  };
+  draggingGroupId.value = event.node.id;
+}
+
+/** 拖动过程中：分组整体平移（子节点跟随），子节点拖动则只收敛分组边界。 */
 function onNodeDrag(event: NodeDragEvent) {
+  if (groupDragState && event.node.id === groupDragState.groupId) {
+    const groupFlow = findNode(groupDragState.groupId);
+    if (!groupFlow) return;
+    // 分组视觉位置可能带小数（缩放/吸附），只取整数 delta 应用到后代，
+    // 余量留到下一帧或拖动结束再补齐，保证相对位置不被抹成小数。
+    const targetX = Math.round(groupFlow.position.x);
+    const targetY = Math.round(groupFlow.position.y);
+    const deltaX = targetX - groupDragState.last.x;
+    const deltaY = targetY - groupDragState.last.y;
+    if (deltaX !== 0 || deltaY !== 0) {
+      for (const id of groupDragState.subtree) {
+        const child = findNode(id);
+        if (!child) continue;
+        updateNode(id, {
+          position: {
+            x: Math.round(child.position.x + deltaX),
+            y: Math.round(child.position.y + deltaY),
+          },
+        });
+      }
+      groupDragState.last = { x: targetX, y: targetY };
+      // 嵌套分组的边界要跟着平移后的子项重新收敛。
+      scheduleGroupGeometry();
+    }
+    return;
+  }
   if (event.nodes.some((node) => node.type !== "group")) {
     scheduleGroupGeometry();
   }
@@ -919,6 +1097,52 @@ function onNodeDrag(event: NodeDragEvent) {
 function onNodeDragStop(event: NodeDragEvent) {
   const current = store.draft;
   if (!current) return;
+
+  const draggedGroups = event.nodes.filter((node) => node.type === "group");
+  if (draggedGroups.length > 0) {
+    // 收尾：把拖动过程中剩余的整数 delta 也应用到后代，保证分组与子项同步。
+    if (groupDragState) {
+      const groupFlow = findNode(groupDragState.groupId);
+      if (groupFlow) {
+        const deltaX = Math.round(groupFlow.position.x) - groupDragState.last.x;
+        const deltaY = Math.round(groupFlow.position.y) - groupDragState.last.y;
+        if (deltaX !== 0 || deltaY !== 0) {
+          for (const id of groupDragState.subtree) {
+            const child = findNode(id);
+            if (!child) continue;
+            updateNode(id, {
+              position: {
+                x: Math.round(child.position.x + deltaX),
+                y: Math.round(child.position.y + deltaY),
+              },
+            });
+          }
+        }
+      }
+    }
+
+    // 整组拖动：分组本身 + 所有后代的位置一起写回 draft（只产生一条撤销记录）。
+    const ids = new Set<string>();
+    for (const group of draggedGroups) {
+      ids.add(group.id);
+      for (const id of collectSubtreeIds(group.id)) ids.add(id);
+    }
+    for (const id of ids) {
+      const flow = findNode(id);
+      const node = current.nodes.find((item) => item.id === id);
+      if (!flow || !node) continue;
+      node.position = {
+        x: Math.round(flow.position.x),
+        y: Math.round(flow.position.y),
+      };
+    }
+    groupDragState = null;
+    draggingGroupId.value = null;
+    updateGroupGeometry();
+    persistGroupPositions();
+    return;
+  }
+
   for (const dragged of event.nodes) {
     const node = current.nodes.find((item) => item.id === dragged.id);
     if (!node) continue;
@@ -1026,7 +1250,7 @@ function removeEdgeById(id: string) {
   removeEdges([id]);
 }
 
-/** 分组感知自动排列：未分组节点按执行层分列，顺序分组纵排、并行分组三列紧凑网格。 */
+/** 自动排列（landscape 思维导图）：按拓扑展开、同层水平排开，写回 draft（可撤销）。 */
 function autoLayout() {
   const current = store.draft;
   if (!current || current.nodes.length === 0) return;
@@ -1075,11 +1299,15 @@ defineExpose({
       :elevate-edges-on-select="true"
       :elevate-nodes-on-select="false"
       :edges-updatable="false"
+      :snap-to-grid="snapEnabled"
+      :snap-grid="SNAP_GRID"
       :default-marker-color="theme.isDark ? '#818cf8' : '#6366f1'"
       @init="onInit"
       @connect="onConnect"
       @nodes-change="onNodesChange"
       @edges-change="onEdgesChange"
+      @edge-click="onEdgeClick"
+      @node-drag-start="onNodeDragStart"
       @node-drag="onNodeDrag"
       @node-drag-stop="onNodeDragStop"
       @node-context-menu="openNodeContextMenu"
@@ -1090,6 +1318,9 @@ defineExpose({
       </template>
       <template #node-delay="nodeProps">
         <WorkflowNodeCard v-bind="nodeProps" />
+      </template>
+      <template #node-delay-pill="nodeProps">
+        <WorkflowDelayPill v-bind="nodeProps" />
       </template>
       <template #node-wait="nodeProps">
         <WorkflowNodeCard v-bind="nodeProps" />
@@ -1150,6 +1381,22 @@ defineExpose({
         position="bottom-left"
         class="flex items-center gap-0.5 rounded-lg border border-zinc-200 bg-white/95 p-1 shadow-sm backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/95"
       >
+        <BaseButton
+          variant="ghost"
+          size="sm"
+          icon-only
+          :class="
+            snapEnabled
+              ? 'text-brand-600 dark:text-brand-400'
+              : 'text-zinc-400 dark:text-zinc-500'
+          "
+          :title="`${snapLabel} · ${snapHint}`"
+          :aria-pressed="snapEnabled"
+          @click="toggleSnap"
+        >
+          <Magnet class="h-3.5 w-3.5" />
+        </BaseButton>
+        <span class="mx-0.5 h-4 w-px bg-zinc-200 dark:bg-zinc-700" />
         <BaseButton
           variant="ghost"
           size="sm"

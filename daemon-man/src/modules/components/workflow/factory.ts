@@ -10,6 +10,7 @@ import type {
 
 import type { FlowEdgeData, FlowNodeData } from "./types";
 import { DEFAULT_GROUP_HEIGHT, DEFAULT_GROUP_WIDTH } from "./layout";
+import { DELAY_PILL_HEIGHT, DELAY_PILL_WIDTH } from "./delayPill";
 
 /** crypto.randomUUID 的降级实现（与 store 中的 uuid 保持一致的行为）。 */
 export function createNodeId(): string {
@@ -69,11 +70,29 @@ export function createWorkflowNode(
   };
 }
 
-/** draft 中的节点 -> 画布节点（type 直接用 kind，配合自定义节点槽位）。 */
+/** draft 中的节点 -> 画布节点（type 直接用 kind；候选 delay 渲染成连线药丸）。 */
 export function buildFlowNode(
   node: WorkflowNode,
   groupSize?: { width: number; height: number },
+  pill = false,
 ): Node<FlowNodeData> {
+  if (pill && node.kind === "delay") {
+    return {
+      id: node.id,
+      type: "delay-pill",
+      position: { x: node.position.x, y: node.position.y },
+      data: { node },
+      // 药丸锁定在连线上：不可拖动、不可连线，但可选中 / 删除 / 单点执行。
+      draggable: false,
+      connectable: false,
+      selectable: true,
+      style: {
+        width: `${DELAY_PILL_WIDTH}px`,
+        height: `${DELAY_PILL_HEIGHT}px`,
+      },
+    };
+  }
+
   const base: Node<FlowNodeData> = {
     id: node.id,
     type: node.kind,
@@ -83,22 +102,22 @@ export function buildFlowNode(
 
   if (node.kind !== "group") return base;
 
-  // 分组节点只是容器背景层：置底、不可拖拽/连线，整块背景不拦截指针事件，
-  // 只有标题栏单独开启 pointer-events，避免遮挡子节点与画布平移。
+  // 分组节点是可拖动的容器背景：拖动时整组（含嵌套后代）跟随平移。
+  // 子节点在层级与 DOM 顺序上都位于分组之上，所以分组不会遮挡子节点交互。
   const width = groupSize?.width ?? DEFAULT_GROUP_WIDTH;
   const height = groupSize?.height ?? DEFAULT_GROUP_HEIGHT;
   return {
     ...base,
     width,
     height,
-    zIndex: 0,
-    draggable: false,
+    // 置底：保证后创建的分组也不会盖住已有子节点（分组只是背景容器）。
+    zIndex: -1,
+    draggable: true,
     connectable: false,
     selectable: true,
     style: {
       width: `${width}px`,
       height: `${height}px`,
-      pointerEvents: "none",
     },
   };
 }

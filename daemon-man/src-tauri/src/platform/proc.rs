@@ -682,6 +682,176 @@ fn process_pids(name: &str) -> Vec<u32> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// 「已在运行」检测（含浏览器 PWA / Web App）
+// ---------------------------------------------------------------------------
+
+/// 浏览器类可执行文件名（小写、不含 `.exe`）。
+///
+/// 这些「应用」的快捷方式目标通常是浏览器本体，进程名无法区分具体是哪个 PWA，
+/// 只能靠窗口标题（或进程命令行里的 `--app-id=` / `--app=`）判断。
+pub(crate) const BROWSER_PROCESS_NAMES: [&str; 6] =
+    ["chrome", "msedge", "brave", "chromium", "opera", "vivaldi"];
+
+/// 普通浏览器标签窗口的标题后缀（PWA 独立窗口一般不带这些后缀）。
+const BROWSER_TITLE_SUFFIXES: [&str; 6] = [
+    " - google chrome",
+    " - microsoft edge",
+    " - brave",
+    " - chromium",
+    " - opera",
+    " - vivaldi",
+];
+
+/// 是否是已知的浏览器进程名（忽略大小写与 `.exe`）。
+pub(crate) fn is_browser_process_name(name: &str) -> bool {
+    let normalized = normalize_process_name(name);
+    BROWSER_PROCESS_NAMES.contains(&normalized.as_str())
+}
+
+/// 规范化「显示名」：压缩空白 + 小写，便于做标题包含匹配。
+pub(crate) fn normalize_display_name(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// 标题是否看起来像「普通浏览器标签页」窗口（而不是 PWA 独立窗口）。
+///
+/// 普通标签页的标题一般以 ` - Google Chrome` / ` - Microsoft Edge` 等结尾；
+/// PWA（`--app-id=` / `--app=` 启动）的独立窗口标题通常只有应用/页面名。
+/// 命中这里就**不算**「该 PWA 已打开」，避免「只是开了个网页标签」被误判成应用运行。
+pub(crate) fn looks_like_browser_tab_title(title: &str) -> bool {
+    let lower = normalize_display_name(title);
+    if BROWSER_TITLE_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        return true;
+    }
+    // 标签组窗口标题形如 "A, B and 3 more pages - ..."，后缀已被上面覆盖；
+    // 这里再兜底一次不带后缀的变体。
+    lower.contains(" and ") && lower.ends_with(" more pages")
+}
+
+/// 窗口标题与显示名的匹配度：3=完全相同、2=前缀、1=包含、0=不匹配。
+pub(crate) fn window_title_match_score(title: &str, display_name: &str) -> u8 {
+    let display = normalize_display_name(display_name);
+    // 单字符名字匹配噪音太大，直接不匹配。
+    if display.chars().count() < 2 {
+        return 0;
+    }
+    let title = normalize_display_name(title);
+    if title.is_empty() || looks_like_browser_tab_title(&title) {
+        return 0;
+    }
+    if title == display {
+        3
+    } else if title.starts_with(&display) {
+        2
+    } else if title.contains(&display) {
+        1
+    } else {
+        0
+    }
+}
+
+/// 在「属于该浏览器的可见窗口」里找标题匹配 display_name 的那个，返回其 pid。
+fn browser_window_pid(browser_pids: &[u32], display_name: &str) -> Option<u32> {
+    if browser_pids.is_empty() {
+        return None;
+    }
+    let mut best: Option<(u8, u32)> = None;
+    for window in all_titled_windows() {
+        // 窗口必须可见，且所属进程确实是目标浏览器的进程（exe 名校验）。
+        if !window.visible || !browser_pids.contains(&window.pid) {
+            continue;
+        }
+        let score = window_title_match_score(&window.title, display_name);
+        if score == 0 {
+            continue;
+        }
+        if best.is_none_or(|(best_score, _)| score > best_score) {
+            best = Some((score, window.pid));
+        }
+    }
+    best.map(|(_, pid)| pid)
+}
+
+/// 解析启动目标：`.lnk` 先解析出真实 target，其余原样返回（同时展开 `%VAR%`）。
+fn resolve_launch_target(spec: &AppLaunchSpec) -> String {
+    let path = super::registry::expand_env_vars(spec.path.trim().trim_matches('"'));
+    if path.is_empty() {
+        return String::new();
+    }
+    if path.to_ascii_lowercase().ends_with(".lnk") {
+        if let Some(link) = resolve_lnk(&path) {
+            let target = link.target.trim().to_string();
+            if !target.is_empty() {
+                return target;
+            }
+        }
+    }
+    path
+}
+
+/// 判断某个启动配置对应的应用是否已在运行，返回已存在的 pid。
+///
+/// `display_name` 是节点/应用显示名，用于窗口标题匹配（浏览器 PWA / Web App）。
+///
+/// 策略：
+/// 1. 普通应用：沿用进程名检测（`spec.process_name` 优先，否则从解析后的目标 exe 推导）；
+/// 2. `.lnk`：先 `resolve_lnk` 拿 target 再判断；
+/// 3. 浏览器（chrome/msedge/brave/chromium/opera/vivaldi）：浏览器本体的进程名无法区分
+///    具体 PWA，所以只在「属于该浏览器的可见窗口」里按标题匹配 display_name；
+///    匹配不到就认为该 App 没打开（不能因为浏览器本体在跑就跳过启动）；
+/// 4. 非浏览器不做标题匹配，避免误判成别的窗口；
+/// 5. 任何不确定的情况返回 `None`（调用方会正常启动）。
+// 说明：本函数是给 engine launcher 接入用的公开入口；在 engine 切换过来之前，
+// 单编译 crate 会把它（及其内部 helper）判为「未使用」，这里显式放行，避免污染构建告警。
+#[allow(dead_code)]
+pub fn find_running_app(spec: &AppLaunchSpec, display_name: &str) -> Option<u32> {
+    if spec.path.trim().is_empty() {
+        return None;
+    }
+    let target = resolve_launch_target(spec);
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    // URL / shell: 协议类目标无法从进程或窗口可靠判定，交给启动流程。
+    let lower_target = target.to_ascii_lowercase();
+    if lower_target.contains("://") || lower_target.starts_with("shell:") {
+        return None;
+    }
+
+    let exe_stem = process_name_from_path(target);
+    let explicit = spec
+        .process_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let process_name = normalize_process_name(explicit.unwrap_or(&exe_stem));
+    if process_name.is_empty() {
+        return None;
+    }
+
+    // 浏览器判定同时看「目标 exe」与「显式 process_name」，
+    // 因为有些快捷方式会显式指定 processName=chrome。
+    let is_browser = is_browser_process_name(&exe_stem) || is_browser_process_name(&process_name);
+    let pids = process_pids(&process_name);
+
+    if !is_browser {
+        return pids.first().copied();
+    }
+
+    // 浏览器 + 有效显示名 → 用窗口标题识别具体的 PWA/Web App。
+    if normalize_display_name(display_name).chars().count() >= 2 {
+        return browser_window_pid(&pids, display_name);
+    }
+
+    // 没有可用显示名时退回「浏览器本体在跑就算在跑」（与旧行为一致）。
+    pids.first().copied()
+}
+
 /// 列出系统进程。
 pub fn list_processes() -> Vec<ProcessInfo> {
     let mut system = System::new_all();
@@ -1087,6 +1257,94 @@ mod tests {
         assert!(build_environment_block(&[]).is_none());
     }
 
+    #[test]
+    fn browser_process_detection() {
+        for name in ["chrome", "Chrome.EXE", " msedge ", "brave", "chromium", "opera", "vivaldi"] {
+            assert!(is_browser_process_name(name), "{name} 应识别为浏览器");
+        }
+        for name in ["firefox", "chrome_proxy", "msedgewebview2", "explorer", ""] {
+            assert!(!is_browser_process_name(name), "{name} 不应识别为浏览器");
+        }
+    }
+
+    #[test]
+    fn display_name_normalization() {
+        assert_eq!(normalize_display_name("  Gmail  "), "gmail");
+        assert_eq!(normalize_display_name("Visual   Studio   Code"), "visual studio code");
+        assert_eq!(normalize_display_name("网易云音乐"), "网易云音乐");
+        assert_eq!(normalize_display_name("   "), "");
+    }
+
+    #[test]
+    fn browser_tab_title_filter() {
+        // 普通浏览器标签窗口：带浏览器名后缀 → 不算 PWA 已打开
+        assert!(looks_like_browser_tab_title("Gmail - Google Chrome"));
+        assert!(looks_like_browser_tab_title("Inbox - Microsoft Edge"));
+        assert!(looks_like_browser_tab_title("YouTube - Brave"));
+        assert!(looks_like_browser_tab_title("A, B and 3 more pages - Google Chrome"));
+        // PWA 独立窗口
+        assert!(!looks_like_browser_tab_title("Gmail"));
+        assert!(!looks_like_browser_tab_title("Notion – Notes"));
+        assert!(!looks_like_browser_tab_title("Inbox (3) - Gmail"));
+    }
+
+    #[test]
+    fn window_title_match_scoring() {
+        assert_eq!(window_title_match_score("Gmail", "gmail"), 3);
+        assert_eq!(window_title_match_score("Gmail - Inbox", "Gmail"), 2);
+        assert_eq!(window_title_match_score("Inbox - Gmail", "gmail"), 1);
+        assert_eq!(window_title_match_score("Notion", "gmail"), 0);
+        // 单字符显示名不参与匹配
+        assert_eq!(window_title_match_score("Gmail", "g"), 0);
+        // 普通浏览器标签页不参与匹配
+        assert_eq!(window_title_match_score("Gmail - Google Chrome", "Gmail"), 0);
+        assert_eq!(window_title_match_score("", "Gmail"), 0);
+    }
+
+    #[test]
+    fn find_running_app_detects_self_process() {
+        let exe = std::env::current_exe().expect("无法获取当前测试进程路径");
+        let spec = AppLaunchSpec {
+            path: exe.display().to_string(),
+            ..Default::default()
+        };
+        let found = find_running_app(&spec, "");
+        println!("当前测试进程 pid = {}，识别结果 = {found:?}", std::process::id());
+        assert_eq!(found, Some(std::process::id()), "普通应用应通过进程名识别到自身");
+    }
+
+    #[test]
+    fn find_running_app_returns_none_for_urls_and_empty_path() {
+        let url = AppLaunchSpec {
+            path: "https://example.com/app".to_string(),
+            ..Default::default()
+        };
+        assert!(find_running_app(&url, "Example").is_none());
+
+        let shell_target = AppLaunchSpec {
+            path: "shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".to_string(),
+            ..Default::default()
+        };
+        assert!(find_running_app(&shell_target, "计算器").is_none());
+
+        assert!(find_running_app(&AppLaunchSpec::default(), "任意").is_none());
+    }
+
+    #[test]
+    fn find_running_app_browser_needs_title_match() {
+        // 浏览器目标 + 不可能存在的显示名：即使 chrome 正在运行也不能判定为「已运行」。
+        let spec = AppLaunchSpec {
+            path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            find_running_app(&spec, "DaemonMan-Impossible-Window-Title-9f3c1a").is_none(),
+            "浏览器本体在跑不代表某个 PWA 已打开"
+        );
+        // 显示名过短（<2 字符）时退回「浏览器在跑就算在跑」，不会误判 None 以外的值。
+        let _ = find_running_app(&spec, "x");
+    }
+
     /// 冒烟测试：真实环境下列出进程 / 判断是否提权。
     /// 手动运行：`cargo test --lib process_smoke -- --ignored --nocapture`
     #[test]
@@ -1254,5 +1512,160 @@ mod tests {
             .output()
             .ok()?;
         String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    }
+
+    /// 冒烟测试：已运行检测（含浏览器 PWA 快捷方式）。
+    ///
+    /// 只读：不启动任何程序。会扫描开始菜单里的 .lnk，找出目标为浏览器且带
+    /// `--app-id=` / `--app=` 的 PWA 快捷方式，打印它们当前是否被识别为「已打开」。
+    ///
+    /// 手动运行：`cargo test --lib find_running_app_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn find_running_app_smoke() {
+        // 1) 当前测试进程应被识别为「已在运行」。
+        let current_exe = std::env::current_exe().expect("无法获取当前测试进程路径");
+        let self_spec = AppLaunchSpec {
+            path: current_exe.display().to_string(),
+            ..Default::default()
+        };
+        let self_found = find_running_app(&self_spec, "");
+        println!(
+            "自身进程识别：pid = {self_found:?}（当前 = {}）",
+            std::process::id()
+        );
+        assert_eq!(self_found, Some(std::process::id()));
+
+        // 2) 浏览器进程现状。
+        for browser in BROWSER_PROCESS_NAMES {
+            let pids = process_pids(browser);
+            if pids.is_empty() {
+                continue;
+            }
+            let titles: Vec<(u32, Option<String>)> = pids
+                .iter()
+                .map(|pid| (*pid, main_window_title(*pid)))
+                .collect();
+            println!("浏览器 {browser} 正在运行：{titles:?}");
+        }
+
+        // 3) 扫描开始菜单里的 PWA 快捷方式（只读，不启动）。
+        fn scan_lnks(dir: &std::path::Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+            if depth > 3 {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_lnks(&path, depth + 1, out);
+                } else if path
+                    .extension()
+                    .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("lnk"))
+                {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut start_menus: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            start_menus.push(
+                std::path::PathBuf::from(appdata)
+                    .join(r"Microsoft\Windows\Start Menu\Programs"),
+            );
+        }
+        if let Some(program_data) = std::env::var_os("ProgramData") {
+            start_menus.push(
+                std::path::PathBuf::from(program_data)
+                    .join(r"Microsoft\Windows\Start Menu\Programs"),
+            );
+        }
+        if let Some(desktop) = dirs::desktop_dir() {
+            start_menus.push(desktop);
+        }
+
+        let mut lnks: Vec<std::path::PathBuf> = Vec::new();
+        for dir in &start_menus {
+            scan_lnks(dir, 0, &mut lnks);
+        }
+
+        let mut browser_apps = 0usize;
+        for lnk in &lnks {
+            let Some(link) = resolve_lnk(&lnk.display().to_string()) else {
+                continue;
+            };
+            let exe_stem = process_name_from_path(&link.target);
+            if !is_browser_process_name(&exe_stem) {
+                continue;
+            }
+            let args = link.args.unwrap_or_default();
+            if !args.contains("--app-id=") && !args.contains("--app=") {
+                continue;
+            }
+            browser_apps += 1;
+            let display_name = lnk
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let spec = AppLaunchSpec {
+                path: lnk.display().to_string(),
+                args: split_args(&args),
+                ..Default::default()
+            };
+            let found = find_running_app(&spec, &display_name);
+            println!(
+                "PWA 快捷方式「{display_name}」→ target={}，识别 pid = {found:?}",
+                link.target
+            );
+        }
+        // 4) 用真实窗口标题验证标题匹配：PWA 风格标题应命中，普通标签页标题应被过滤。
+        let mut browser_pid_names: std::collections::HashMap<u32, &'static str> =
+            std::collections::HashMap::new();
+        for browser in BROWSER_PROCESS_NAMES {
+            for pid in process_pids(browser) {
+                browser_pid_names.insert(pid, browser);
+            }
+        }
+        for window in all_titled_windows() {
+            let Some(browser) = browser_pid_names.get(&window.pid).copied() else {
+                continue;
+            };
+            if !window.visible {
+                continue;
+            }
+            let display = window
+                .title
+                .split(" - ")
+                .next()
+                .unwrap_or(&window.title)
+                .trim()
+                .to_string();
+            if display.chars().count() < 2 {
+                continue;
+            }
+            let spec = AppLaunchSpec {
+                path: format!("{browser}.exe"),
+                ..Default::default()
+            };
+            let found = find_running_app(&spec, &display);
+            let tab_like = looks_like_browser_tab_title(&window.title);
+            println!(
+                "窗口「{}」（pid={}，{}）→ display「{display}」匹配 pid = {found:?}，普通标签页={tab_like}",
+                window.title, window.pid, browser
+            );
+            if !tab_like {
+                // PWA 风格标题必须能被识别为「已运行」。
+                // （不强制 pid 相等：同一浏览器可能有两个标题相近的窗口。）
+                assert!(
+                    found.is_some(),
+                    "PWA 风格窗口「{}」未被识别为已在运行",
+                    window.title
+                );
+            }
+        }
+        println!("扫描 {} 个 .lnk，其中浏览器 PWA 快捷方式 {browser_apps}。", lnks.len());
     }
 }

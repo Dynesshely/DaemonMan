@@ -21,6 +21,7 @@ import { useWorkflowStore } from "@/modules/stores/workflows";
 
 import { buildAdjacency, computeTopology } from "./graph";
 import { aggregateStatus, buildGroupChildren } from "./layout";
+import { buildDelayLayoutGraph, computeDelayPills } from "./delayPill";
 import {
   edgeConditionLabel,
   nodeKindMeta,
@@ -47,10 +48,21 @@ const adjacency = computed(() => buildAdjacency(nodes.value, edges.value));
 const topology = computed(() => computeTopology(nodes.value, edges.value));
 const layerInfo = topology;
 const groupIndex = computed(() => buildGroupChildren(nodes.value));
+/** 折叠到连线上的延时节点（行内加「连线延时」标记）。 */
+const edgeDelayPills = computed(() =>
+  computeDelayPills(nodes.value, edges.value),
+);
+/** 可见节点连续步骤号：折叠药丸后重新编号（与画布节点徽标一致）。 */
+const stepTopology = computed(() => {
+  const pills = edgeDelayPills.value;
+  if (pills.size === 0) return topology.value;
+  const graph = buildDelayLayoutGraph(nodes.value, edges.value, pills);
+  return computeTopology(graph.nodes, graph.edges);
+});
 const isEmpty = computed(() => nodes.value.length === 0);
 
 function stepOf(nodeId: string): number | null {
-  return topology.value.stepOf.get(nodeId) ?? null;
+  return stepTopology.value.stepOf.get(nodeId) ?? null;
 }
 
 /** 应用节点的真实 exe/.lnk 图标（视图层已批量 ensure）。 */
@@ -199,7 +211,7 @@ const treeRows = computed<TreeRow[]>(() => {
     return !parentId || parentId === node.id || !groupIds.has(parentId);
   });
   const stepKey = (node: WorkflowNode) =>
-    stepOf(node.id) ?? Number.MAX_SAFE_INTEGER;
+    topology.value.stepOf.get(node.id) ?? Number.MAX_SAFE_INTEGER;
   const byTopology = (left: WorkflowNode, right: WorkflowNode) =>
     stepKey(left) - stepKey(right) ||
     (draftIndex.get(left.id) ?? 0) - (draftIndex.get(right.id) ?? 0);
@@ -382,6 +394,13 @@ function indentClass(depth: number): string {
                 :title="nameOf(row.node.id)"
               >
                 {{ nameOf(row.node.id) }}
+              </span>
+              <span
+                v-if="!row.isGroup && edgeDelayPills.has(row.node.id)"
+                class="shrink-0 rounded-full bg-amber-500/15 px-1.5 text-[10px] font-medium text-amber-700 dark:bg-amber-400/20 dark:text-amber-200"
+                :title="t('workflow.edgeDelayHint')"
+              >
+                {{ t("workflow.edgeDelay") }}
               </span>
               <template v-if="row.isGroup">
                 <span

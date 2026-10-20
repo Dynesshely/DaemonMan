@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, provide, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, watch } from "vue";
 import {
   Panel,
   useVueFlow,
@@ -13,10 +13,20 @@ import {
   type Node,
   type NodeChange,
   type NodeDragEvent,
+  type NodeMouseEvent,
   type NodeRemoveChange,
 } from "@vue-flow/core";
 import { Background } from "@vue-flow/additional-components";
-import { GitBranch, LayoutGrid, Maximize2, Minus, Plus } from "lucide-vue-next";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import {
+  GitBranch,
+  LayoutGrid,
+  Maximize2,
+  Minus,
+  Play,
+  Plus,
+} from "lucide-vue-next";
 
 import type {
   NodeKind,
@@ -34,7 +44,15 @@ import { useUiStore } from "@/modules/stores/ui";
 import { useWorkflowStore } from "@/modules/stores/workflows";
 
 import WorkflowEdgeLine from "./edges/WorkflowEdgeLine.vue";
-import { buildFlowEdge, buildFlowNode, createWorkflowNode, edgeIdFor } from "./factory";
+import { runSingleNode } from "./commands";
+import {
+  buildFlowEdge,
+  buildFlowNode,
+  createWorkflowNode,
+  edgeIdFor,
+  fileBaseName,
+  fileExtension,
+} from "./factory";
 import { computeTopology } from "./graph";
 import {
   DEFAULT_GROUP_HEIGHT,
@@ -53,6 +71,7 @@ import {
 import { nodeKindMeta, nodeKindOrder } from "./meta";
 import WorkflowGroupNode from "./nodes/WorkflowGroupNode.vue";
 import WorkflowNodeCard from "./nodes/WorkflowNodeCard.vue";
+import { errorText } from "./shared";
 import { WORKFLOW_STEPS, type WorkflowSelection } from "./types";
 
 const emit = defineEmits<{
@@ -85,6 +104,7 @@ const {
   removeEdges,
   removeNodes,
   removeSelectedElements,
+  screenToFlowCoordinate,
   updateNode,
   viewport,
   zoomIn,
@@ -487,8 +507,188 @@ function syncGroupStructure() {
 let lastDraftId: string | null = null;
 let unmounted = false;
 
+// ---------------------------------------------------------------------------
+// 节点右键菜单（单点执行）
+// ---------------------------------------------------------------------------
+interface NodeContextMenuState {
+  x: number;
+  y: number;
+  nodeId: string;
+}
+
+const contextMenu = ref<NodeContextMenuState | null>(null);
+const menuRef = ref<HTMLElement | null>(null);
+const runningNodeId = ref<string | null>(null);
+
+const menuNode = computed(() => {
+  const id = contextMenu.value?.nodeId;
+  if (!id) return null;
+  return store.draft?.nodes.find((node) => node.id === id) ?? null;
+});
+
+const menuDisabled = computed(
+  () =>
+    !menuNode.value ||
+    menuNode.value.kind === "group" ||
+    runningNodeId.value !== null,
+);
+
+const menuTitle = computed(() =>
+  menuNode.value?.kind === "group"
+    ? t("node.groupHint")
+    : t("workflow.runNodeHint"),
+);
+
+function openNodeContextMenu(event: NodeMouseEvent) {
+  const mouse = event.event as MouseEvent;
+  if (typeof mouse.clientX !== "number" || typeof mouse.clientY !== "number") {
+    return;
+  }
+  mouse.preventDefault();
+  const node = store.draft?.nodes.find((item) => item.id === event.node.id);
+  if (!node) return;
+  contextMenu.value = {
+    x: Math.min(mouse.clientX, Math.max(0, window.innerWidth - 220)),
+    y: Math.min(mouse.clientY, Math.max(0, window.innerHeight - 120)),
+    nodeId: node.id,
+  };
+}
+
+function closeContextMenu() {
+  contextMenu.value = null;
+}
+
+function onWindowPointerDown(event: PointerEvent) {
+  const menu = menuRef.value;
+  if (menu && event.target instanceof Node && menu.contains(event.target)) {
+    return;
+  }
+  closeContextMenu();
+}
+
+function onWindowKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") closeContextMenu();
+}
+
+watch(contextMenu, (menu) => {
+  if (menu) {
+    window.addEventListener("pointerdown", onWindowPointerDown, true);
+    window.addEventListener("keydown", onWindowKeydown);
+  } else {
+    window.removeEventListener("pointerdown", onWindowPointerDown, true);
+    window.removeEventListener("keydown", onWindowKeydown);
+  }
+});
+
+async function runNodeNow() {
+  const menu = contextMenu.value;
+  const current = store.draft;
+  closeContextMenu();
+  if (!menu || !current) return;
+  const node = current.nodes.find((item) => item.id === menu.nodeId);
+  if (!node || node.kind === "group") return;
+  if (runningNodeId.value !== null) return;
+
+  runningNodeId.value = node.id;
+  try {
+    const run = await runSingleNode(current, node.id);
+    store.applyRun(run);
+    ui.notify(
+      "success",
+      t("workflow.runNodeStarted", {
+        name: node.name || t(nodeKindMeta[node.kind].labelKey),
+      }),
+    );
+  } catch (error) {
+    ui.notify("error", t("workflow.runNodeFailed", { error: errorText(error) }));
+  } finally {
+    runningNodeId.value = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 拖放 .lnk / .exe 等文件到画布创建 application 节点
+// ---------------------------------------------------------------------------
+const DROP_EXTENSIONS = new Set(["lnk", "exe", "bat", "cmd", "ps1", "vbs"]);
+let dragUnlisten: UnlistenFn | null = null;
+let dragDisposed = false;
+
+async function handleFileDrop(
+  paths: string[],
+  position: { x: number; y: number },
+) {
+  const current = store.draft;
+  if (!current) return;
+
+  const supported = paths.filter((path) =>
+    DROP_EXTENSIONS.has(fileExtension(path)),
+  );
+  if (supported.length === 0) {
+    if (paths.length > 0) ui.notify("warn", t("workflow.dropUnsupported"));
+    return;
+  }
+
+  // Tauri 给的是相对 webview 左上角的物理像素，先换算成 CSS 像素再交给 Vue Flow。
+  const scale = window.devicePixelRatio || 1;
+  const base = screenToFlowCoordinate({
+    x: position.x / scale,
+    y: position.y / scale,
+  });
+  const dropX = Number.isFinite(base.x) ? base.x : 0;
+  const dropY = Number.isFinite(base.y) ? base.y : 0;
+
+  const created: WorkflowNode[] = [];
+  supported.forEach((path, index) => {
+    const offset = index * 24;
+    const node = createWorkflowNode("application", {
+      x: Math.round(dropX + offset - NODE_WIDTH / 2),
+      y: Math.round(dropY + offset - 34),
+    });
+    node.name = fileBaseName(path);
+    node.app.path = path;
+    node.app.args = [];
+    current.nodes.push(node);
+    created.push(node);
+  });
+
+  addNodes(created.map((node) => buildFlowNode(node)));
+  const last = created[created.length - 1];
+  if (last) {
+    void nextTick(() => {
+      const added = findNode(last.id);
+      if (added) addSelectedNodes([added]);
+    });
+  }
+
+  ui.notify("success", t("workflow.dropCreated", { count: created.length }));
+  if (supported.length < paths.length) {
+    ui.notify("warn", t("workflow.dropUnsupported"));
+  }
+}
+
+onMounted(async () => {
+  try {
+    const unlisten = await getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type !== "drop") return;
+      void handleFileDrop(event.payload.paths, event.payload.position);
+    });
+    if (dragDisposed) {
+      unlisten();
+      return;
+    }
+    dragUnlisten = unlisten;
+  } catch {
+    // 浏览器预览等非 Tauri 环境没有该事件，静默忽略。
+  }
+});
+
 onBeforeUnmount(() => {
   unmounted = true;
+  dragDisposed = true;
+  dragUnlisten?.();
+  dragUnlisten = null;
+  window.removeEventListener("pointerdown", onWindowPointerDown, true);
+  window.removeEventListener("keydown", onWindowKeydown);
 });
 
 /**
@@ -882,6 +1082,7 @@ defineExpose({
       @edges-change="onEdgesChange"
       @node-drag="onNodeDrag"
       @node-drag-stop="onNodeDragStop"
+      @node-context-menu="openNodeContextMenu"
       @nodes-initialized="scheduleGroupGeometry"
     >
       <template #node-application="nodeProps">
@@ -1022,7 +1223,40 @@ defineExpose({
             <GitBranch class="h-7 w-7" />
           </template>
         </EmptyState>
+        <p class="mt-1 text-center text-[11px] text-zinc-400 dark:text-zinc-500">
+          {{ t("workflow.dragHint") }}
+        </p>
       </div>
     </div>
+
+    <!-- 节点右键菜单：单点执行 -->
+    <Teleport to="body">
+      <div
+        v-if="contextMenu"
+        ref="menuRef"
+        class="fixed z-[70] w-52 overflow-hidden rounded-lg border border-zinc-200 bg-white py-1 shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }"
+      >
+        <button
+          type="button"
+          class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs transition"
+          :class="
+            menuDisabled
+              ? 'cursor-not-allowed text-zinc-400 dark:text-zinc-600'
+              : 'text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800'
+          "
+          :disabled="menuDisabled"
+          :title="menuTitle"
+          @click="runNodeNow"
+        >
+          <Play class="h-3.5 w-3.5 shrink-0" />
+          <span class="min-w-0 flex-1 truncate">{{ t("workflow.runNode") }}</span>
+          <span
+            v-if="runningNodeId === contextMenu.nodeId"
+            class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-brand-500"
+          />
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>

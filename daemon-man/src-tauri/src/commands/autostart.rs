@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
+use crate::config;
 use crate::model::{
     now_iso, AppLaunchSpec, AutostartItem, AutostartOverride, AutostartSource, LogLevel, NodeKind,
     ScriptSpec, Workflow, WorkflowNode,
@@ -232,6 +233,8 @@ pub fn take_over_autostart(
 
     workflow.touch();
     let workflow_for_return = workflow.clone();
+    config::save_workflow_file(&workflow)
+        .map_err(|err| format!("保存接管工作流文件失败：{err}"))?;
 
     state
         .mutate_config(|config| {
@@ -706,6 +709,211 @@ pub fn write_autostart_script(
         size: bytes.len() as u64,
         encoding: encoding.to_string(),
     })
+}
+
+/// 临时提权执行的操作请求（写入临时文件交给提权进程）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminAutostartRequest {
+    pub action: String,
+    pub item_id: String,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AdminAutostartResult {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub item: Option<AutostartItem>,
+}
+
+/// 执行需要管理员权限的自启动操作（提权进程与 GUI 共用）。
+fn perform_admin_action(
+    action: &str,
+    item_id: &str,
+    enabled: Option<bool>,
+) -> Result<AutostartItem, String> {
+    match action {
+        "enable" => platform::set_autostart_enabled(item_id, true)
+            .map_err(|err| format!("{err:#}")),
+        "disable" => platform::set_autostart_enabled(item_id, false)
+            .map_err(|err| format!("{err:#}")),
+        "restore" => platform::restore_autostart(item_id).map_err(|err| format!("{err:#}")),
+        "delete" => {
+            let item = platform::scan_autostart()
+                .into_iter()
+                .find(|item| item.id == item_id)
+                .ok_or_else(|| "未找到自启动项（可能已被删除）".to_string())?;
+            platform::delete_autostart(&item).map_err(|err| format!("{err:#}"))?;
+            Ok(item)
+        }
+        other => {
+            let _ = enabled;
+            Err(format!("未知的提权操作：{other}"))
+        }
+    }
+}
+
+/// 提权进程入口：执行请求并把结果写入结果文件。
+/// 由 `lib.rs` 在 `--elevated-autostart` 参数下直接调用，不启动 GUI。
+pub fn run_elevated_request(request_path: &str, result_path: &str) -> i32 {
+    let result = (|| {
+        let text = std::fs::read_to_string(request_path)
+            .map_err(|err| format!("读取提权请求失败：{err}"))?;
+        let request: AdminAutostartRequest =
+            serde_json::from_str(&text).map_err(|err| format!("提权请求格式无效：{err}"))?;
+        perform_admin_action(&request.action, &request.item_id, request.enabled)
+    })();
+
+    let payload = match result {
+        Ok(item) => AdminAutostartResult {
+            ok: true,
+            error: None,
+            item: Some(item),
+        },
+        Err(error) => AdminAutostartResult {
+            ok: false,
+            error: Some(error),
+            item: None,
+        },
+    };
+    if let Ok(text) = serde_json::to_string_pretty(&payload) {
+        let _ = std::fs::write(result_path, text);
+    }
+    if payload.ok {
+        0
+    } else {
+        1
+    }
+}
+
+/// 以管理员身份临时执行自启动操作；GUI 自身保持普通权限。
+///
+/// 普通权限下由当前进程通过 UAC 启动一个 `--elevated-autostart` 子进程执行，
+/// 执行完立即退出；已提权时直接在当前进程执行。
+#[tauri::command]
+pub fn elevate_autostart_op(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    action: String,
+    item_id: String,
+    enabled: Option<bool>,
+) -> Result<AutostartItem, String> {
+    let state = state.inner().clone();
+
+    if platform::is_elevated() {
+        let item = perform_admin_action(&action, &item_id, enabled)?;
+        state.autostart_cache_invalidate();
+        return Ok(item);
+    }
+
+    let dir = crate::config::data_dir();
+    let stamp = chrono::Local::now().format("%Y%m%d%H%M%S%3f");
+    let request_path = dir.join(format!("elevate-{stamp}.request.json"));
+    let result_path = dir.join(format!("elevate-{stamp}.result.json"));
+    let request = AdminAutostartRequest {
+        action: action.clone(),
+        item_id: item_id.clone(),
+        enabled,
+    };
+    std::fs::write(
+        &request_path,
+        serde_json::to_vec(&request).map_err(|err| format!("序列化提权请求失败：{err}"))?,
+    )
+    .map_err(|err| format!("写入提权请求失败：{err}"))?;
+
+    let exe = std::env::current_exe().map_err(|err| format!("获取程序路径失败：{err}"))?;
+    let parameters = format!(
+        "--elevated-autostart \"{}\" \"{}\"",
+        request_path.display(),
+        result_path.display()
+    );
+    let outcome = run_as_admin(&exe, &parameters).and_then(|()| {
+        let text = std::fs::read_to_string(&result_path)
+            .map_err(|err| format!("读取提权结果失败：{err}"))?;
+        let result: AdminAutostartResult =
+            serde_json::from_str(&text).map_err(|err| format!("提权结果格式无效：{err}"))?;
+        if result.ok {
+            result
+                .item
+                .ok_or_else(|| "提权执行完成但没有返回结果".to_string())
+        } else {
+            Err(result.error.unwrap_or_else(|| "提权执行失败".into()))
+        }
+    });
+
+    let _ = std::fs::remove_file(&request_path);
+    let _ = std::fs::remove_file(&result_path);
+
+    let item = outcome?;
+    state.autostart_cache_invalidate();
+    state.log(
+        &app,
+        LogLevel::Success,
+        "autostart",
+        format!(
+            "已以管理员身份执行操作「{action}」：{}",
+            item.name
+        ),
+        Some(item_id),
+    );
+    Ok(item)
+}
+
+/// 通过 UAC 启动提权子进程并等待其退出。
+fn run_as_admin(exe: &std::path::Path, parameters: &str) -> Result<(), String> {
+    use windows::core::{w, HSTRING, PCWSTR};
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    let file = HSTRING::from(exe.as_os_str());
+    let params = HSTRING::from(parameters);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: w!("runas"),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+
+    unsafe {
+        ShellExecuteExW(&mut info).map_err(|err| {
+            let code = err.code().0 as u32;
+            if code & 0xFFFF == 1223 {
+                "已取消管理员授权".to_string()
+            } else {
+                format!("启动管理员进程失败：{err}")
+            }
+        })?;
+    }
+
+    if info.hProcess.is_invalid() {
+        return Err("启动管理员进程失败：未返回进程句柄".into());
+    }
+
+    let wait = unsafe { WaitForSingleObject(info.hProcess, 180_000) };
+    let mut exit_code = 0u32;
+    let code_result = unsafe { GetExitCodeProcess(info.hProcess, &mut exit_code) };
+    unsafe {
+        let _ = CloseHandle(info.hProcess);
+    }
+    if wait != WAIT_OBJECT_0 {
+        return Err("等待管理员进程超时".into());
+    }
+    if code_result.is_err() {
+        return Err("读取管理员进程退出码失败".into());
+    }
+    if exit_code != 0 {
+        return Err(format!("管理员进程执行失败（退出码 {exit_code}）"));
+    }
+    Ok(())
 }
 
 /// 简单的命令行参数切分，支持双引号包裹。

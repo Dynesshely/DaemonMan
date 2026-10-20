@@ -75,6 +75,9 @@ impl Default for AppSettings {
 pub struct AppConfig {
     pub version: u32,
     pub settings: AppSettings,
+    /// 工作流单独存放在 `<data_dir>/workflows/<id>.json`；
+    /// 这里仅作为运行时视图 / IPC 返回值，不会写入 config.json（见 `config::ConfigFile`）。
+    #[serde(default)]
     pub workflows: Vec<Workflow>,
     /// 被 DaemonMan 关闭并接管的自启动项记录，用于恢复
     pub overrides: Vec<AutostartOverride>,

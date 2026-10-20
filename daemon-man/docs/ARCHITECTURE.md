@@ -69,7 +69,11 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 
 配置写入采用「临时文件 + rename」原子替换，旧文件保留为 `config.json.bak`；解析失败会把坏文件备份为 `config.broken-<时间>.json` 并回退默认配置。
 
-配置文件位置为 `%USERPROFILE%\.daemonMan\config.json`。旧版本目录 `~/.daemon-man` 在首次启动时通过 `config::migrate_legacy_data_dir()` 自动迁移（优先整体 rename，失败则逐项复制配置与日志）。
+**工作流单独存储**：`config.json` 只包含 `version / settings / overrides / updatedAt`，每个工作流独立保存为 `workflows/<id>.json`（原子写 + `.bak`）。`AppConfig.workflows` 只是运行时视图，`#[serde(skip_serializing)]` 不写回 config.json；启动时若发现旧配置内嵌 `workflows`，会自动拆分到独立文件并清空字段。工作流保存/删除/复制/接管都会同步写/删对应文件；导出配置时用 `ExportBundle` 把 settings、overrides 与全部工作流打成一个 JSON，导入时先整体替换 `workflows/` 再写 config。
+
+**生产与开发实例共存**：生产数据目录 `~/.daemonMan`，开发构建（未启用 `custom-protocol` feature）使用 `~/.dev-daemonMan`。开发实例首次启动且自身配置不存在时，只读复制生产 `config.json` 与 `workflows/*.json`；单实例插件只在生产构建启用，DaemonMan 自身的开机自启值名在开发实例下为 `DaemonManDev`，避免覆盖生产自启；开发实例还使用独立的 WebView2 用户数据目录（`%LOCALAPPDATA%\com.daemonman.app.dev\EBWebView`），避免与生产实例的 WebView2 profile 互斥。`DAEMONMAN_DATA_DIR` 环境变量可覆盖目录（自动化测试用）。
+
+旧版本目录 `~/.daemon-man` 在首次启动时通过 `config::migrate_legacy_data_dir()` 自动迁移（优先整体 rename，失败则逐项复制配置与日志）。
 
 ## 3. 工作流执行语义
 
@@ -86,6 +90,8 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
    - `script`：`cmd /C <command>`，返回码非 0 可按配置视为失败。
 4. **状态与取消**：任何状态变化都 `state.upsert_run` 并 emit `workflow:run`（payload 为完整 `WorkflowRun`）；取消通过 `state.run_flag(run_id)`（`Arc<AtomicBool>`）协作式生效：未执行的节点标记为 cancelled，已启动的进程不强制结束。
 5. **失败传播**：失败/取消会让 `success` 边的下游节点变为 `skipped`，但 `failure`/`always` 边继续执行，从而支持降级分支。
+6. **单点执行**：`engine::spawn_single_node_run` 校验节点存在且非分组、强制 `enabled=true`，用只含该节点的最小工作流（edges 清空、沿用原 workflow id/name/skip_existing）复用同一执行器，便于调试；不校验整张图，未保存的草稿也能单点运行。节点 id 保持不变，前端按 `run.workflowId + nodeId` 显示状态。
+7. **进程父进程**：普通启动走 `CreateProcessW + STARTUPINFOEXW`，用 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 把父进程指向当前 shell（`GetShellWindow` 所属 explorer），使工作流启动的进程不挂在 DaemonMan 进程树下；属性列表/句柄失败或 `CREATE_BREAKAWAY_FROM_JOB` 不被允许时按「去 breakaway → 普通 CreateProcess」回退。管理员启动仍由 ShellExecuteEx(runas) 处理。
 
 ## 4. 自启动接管
 
@@ -97,6 +103,10 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 | 服务 | SCM 枚举 `SERVICE_AUTO_START` | `ChangeServiceConfigW`（auto/demand） | 需要管理员 |
 
 `AutostartItem.id` 由 `source + scope + locator` 组成，重新扫描保持稳定，命令层据此定位；`overrides` 记录被 DaemonMan 关闭的项，用于「恢复系统自启」和界面上的「已接管」标记。
+
+### 4.1 临时提权
+
+GUI 始终以普通权限运行。需要管理员权限的单个操作（启用/禁用 HKLM 项、服务、系统任务，恢复或删除系统级项）失败时，前端弹确认框，命令层 `elevate_autostart_op` 通过 `ShellExecuteExW(runas)` 启动同一个 exe 的 `--elevated-autostart <request.json> <result.json>` 一次性子进程（无窗口/托盘），子进程执行操作后把结果 JSON 写回并退出，父进程读取结果、失效自启动缓存并刷新界面，自身权限不变。请求只支持 `enable/disable/restore/delete` 四种动作；用户取消 UAC 时错误文案为「已取消管理员授权」。
 
 「接管」流程：批量关闭系统自启（失败项汇总到 `failures`）→ 为目标工作流追加节点（可执行文件存在则用 Application 节点，否则退化为 Script 节点）→ 按顺序串联 success 边 → 标记 `overrides`。整个过程只使用系统官方开关，不删除注册表值或快捷方式。
 

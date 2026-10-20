@@ -108,6 +108,22 @@ export const api = {
   listProcesses: () => invoke<ProcessInfo[]>("list_processes"),
   killProcess: (pid: number) => invoke<void>("kill_process", { pid }),
 
+  /** 单点执行：用当前草稿中的某个节点发起一次调试运行。 */
+  runSingleNode: (workflow: Workflow, nodeId: string) =>
+    invoke<WorkflowRun>("run_single_node", { workflow, nodeId }),
+
+  /** 临时提权执行自启动操作（GUI 仍以普通权限运行）。 */
+  runElevatedAutostart: (
+    action: "enable" | "disable" | "restore" | "delete",
+    itemId: string,
+    enabled?: boolean,
+  ) =>
+    invoke<AutostartItem>("elevate_autostart_op", {
+      action,
+      itemId,
+      enabled: enabled ?? null,
+    }),
+
   // 日志 / 配置导入导出
   getLogs: (limit = 500) => invoke<LogEntry[]>("get_logs", { limit }),
   clearLogs: () => invoke<void>("clear_logs"),

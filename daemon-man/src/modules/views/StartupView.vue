@@ -16,6 +16,7 @@ import {
 import type { AutostartItem, TakeOverResult } from "@/api";
 import { api } from "@/api";
 import PageHeader from "@/modules/components/layout/PageHeader.vue";
+import BaseBadge from "@/modules/components/ui/BaseBadge.vue";
 import BaseButton from "@/modules/components/ui/BaseButton.vue";
 import BaseModal from "@/modules/components/ui/BaseModal.vue";
 import EmptyState from "@/modules/components/ui/EmptyState.vue";
@@ -25,6 +26,11 @@ import ScriptEditModal from "@/modules/components/startup/ScriptEditModal.vue";
 import StartupContextMenu from "@/modules/components/startup/StartupContextMenu.vue";
 import StartupItemRow from "@/modules/components/startup/StartupItemRow.vue";
 import TakeOverModal from "@/modules/components/startup/TakeOverModal.vue";
+import {
+  isAdminCancelled,
+  isPermissionError,
+  type ElevatedAutostartAction,
+} from "@/modules/components/startup/admin";
 import {
   CATEGORY_VALUES,
   LOCATION_VALUES,
@@ -74,9 +80,40 @@ const deleteBusy = ref(false);
 const restoreBusy = ref(false);
 const scriptTarget = ref<AutostartItem | null>(null);
 
+/** 待提权执行的自启动操作（权限失败后弹出确认框）。 */
+interface AdminRequest {
+  action: ElevatedAutostartAction;
+  item: AutostartItem;
+  enabled?: boolean;
+}
+
+const adminRequest = ref<AdminRequest | null>(null);
+const adminBusy = ref(false);
+
+/** 批量接管遇到权限失败时的补充提示（缺少对应 i18n key）。 */
+const ELEVATION_HINT =
+  "部分项目需要管理员权限，可右键逐项操作，并在提示时选择「以管理员身份执行」。";
+
 const actionBusy = computed(
   () => disableBusy.value || deleteBusy.value || restoreBusy.value,
 );
+
+const adminActionLabel = computed(() => {
+  const request = adminRequest.value;
+  if (!request) return "";
+  switch (request.action) {
+    case "enable":
+      return t("startup.enable");
+    case "disable":
+      return t("startup.menu.disable");
+    case "restore":
+      return t("startup.menu.restore");
+    case "delete":
+      return t("startup.menu.delete");
+    default:
+      return "";
+  }
+});
 
 const filters = computed<
   { value: FilterKind; label: string }[]
@@ -302,7 +339,11 @@ async function onToggle(item: AutostartItem, enabled: boolean) {
   try {
     await autostartStore.toggle(item.id, enabled);
   } catch (error) {
-    ui.notify("error", t("startup.toggleFailed", { error: String(error) }));
+    if (isPermissionError(error)) {
+      askElevated(enabled ? "enable" : "disable", item, enabled);
+    } else {
+      ui.notify("error", t("startup.toggleFailed", { error: String(error) }));
+    }
   } finally {
     const done = new Set(pending.value);
     done.delete(item.id);
@@ -347,13 +388,23 @@ async function confirmTakeOver(payload: {
       "success",
       t("startup.takeOverSuccess", { count: result.items.length }),
     );
+    if (result.failures.some((failure) => isPermissionError(failure))) {
+      ui.notify("warn", ELEVATION_HINT);
+    }
     if (result.failures.length === 0 && result.skipped.length === 0) {
       takeOverOpen.value = false;
       takeOverResult.value = null;
       clearSelection();
     }
   } catch (error) {
-    ui.notify("error", t("startup.takeOverFailed", { error: String(error) }));
+    if (isPermissionError(error)) {
+      ui.notify(
+        "error",
+        `${t("startup.takeOverFailed", { error: String(error) })} ${ELEVATION_HINT}`,
+      );
+    } else {
+      ui.notify("error", t("startup.takeOverFailed", { error: String(error) }));
+    }
   } finally {
     takeOverBusy.value = false;
   }
@@ -378,7 +429,12 @@ async function confirmRelease() {
     ui.notify("success", t("startup.releaseSuccess"));
     releaseTarget.value = null;
   } catch (error) {
-    ui.notify("error", t("error.invoke", { error: String(error) }));
+    if (isPermissionError(error)) {
+      releaseTarget.value = null;
+      askElevated("restore", target);
+    } else {
+      ui.notify("error", t("error.invoke", { error: String(error) }));
+    }
   } finally {
     releaseBusy.value = false;
   }
@@ -420,6 +476,62 @@ function closeScriptEditor() {
   scriptTarget.value = null;
 }
 
+/** 权限失败后：登记待提权操作，弹出管理员确认框。 */
+function askElevated(
+  action: ElevatedAutostartAction,
+  item: AutostartItem,
+  enabled?: boolean,
+) {
+  if (adminBusy.value) return;
+  adminRequest.value = { action, item, enabled };
+}
+
+/** 用户放弃提权（含 Esc / 点遮罩关闭）。 */
+function cancelElevated() {
+  if (adminBusy.value) return;
+  const hadRequest = adminRequest.value !== null;
+  adminRequest.value = null;
+  if (hadRequest) {
+    ui.notify("info", t("startup.adminCancelled"));
+  }
+}
+
+/** 确认后由后端启动一次性提权子进程执行，主窗口权限不变。 */
+async function confirmElevated() {
+  const request = adminRequest.value;
+  if (!request || adminBusy.value) return;
+  adminBusy.value = true;
+  let succeeded = false;
+  try {
+    await api.runElevatedAutostart(
+      request.action,
+      request.item.id,
+      request.enabled,
+    );
+    succeeded = true;
+  } catch (error) {
+    adminRequest.value = null;
+    if (isAdminCancelled(error)) {
+      ui.notify("info", t("startup.adminCancelled"));
+    } else {
+      ui.notify("error", t("startup.adminFailed", { error: String(error) }));
+    }
+  } finally {
+    adminBusy.value = false;
+  }
+  if (!succeeded) return;
+
+  adminRequest.value = null;
+  ui.notify("success", t("startup.adminSuccess"));
+  try {
+    await appStore.refreshConfig();
+    await autostartStore.scan(true);
+    syncIcons();
+  } catch (error) {
+    ui.notify("error", t("error.invoke", { error: String(error) }));
+  }
+}
+
 /** 右键「禁用」：先确认，再交给后端（系统开关或备份后移除）。 */
 function askDisable(item: AutostartItem) {
   closeContextMenu();
@@ -444,7 +556,12 @@ async function confirmDisable() {
     ui.notify("success", t("startup.disableSuccess", { name: target.name }));
     disableTarget.value = null;
   } catch (error) {
-    ui.notify("error", t("startup.disableFailed", { error: String(error) }));
+    if (isPermissionError(error)) {
+      disableTarget.value = null;
+      askElevated("disable", target);
+    } else {
+      ui.notify("error", t("startup.disableFailed", { error: String(error) }));
+    }
   } finally {
     disableBusy.value = false;
   }
@@ -463,7 +580,11 @@ async function restoreItem(item: AutostartItem) {
     syncIcons();
     ui.notify("success", t("startup.restoreSuccess", { name: item.name }));
   } catch (error) {
-    ui.notify("error", t("startup.restoreFailed", { error: String(error) }));
+    if (isPermissionError(error)) {
+      askElevated("restore", item);
+    } else {
+      ui.notify("error", t("startup.restoreFailed", { error: String(error) }));
+    }
   } finally {
     restoreBusy.value = false;
   }
@@ -493,7 +614,12 @@ async function confirmDelete() {
     ui.notify("success", t("startup.deleteSuccess", { name: target.name }));
     deleteTarget.value = null;
   } catch (error) {
-    ui.notify("error", t("startup.deleteFailed", { error: String(error) }));
+    if (isPermissionError(error)) {
+      deleteTarget.value = null;
+      askElevated("delete", target);
+    } else {
+      ui.notify("error", t("startup.deleteFailed", { error: String(error) }));
+    }
   } finally {
     deleteBusy.value = false;
   }
@@ -851,6 +977,52 @@ onMounted(async () => {
           @click="confirmDelete"
         >
           {{ t("startup.menu.delete") }}
+        </BaseButton>
+      </template>
+    </BaseModal>
+
+    <!-- 管理员权限确认：权限失败后临时提权重试 -->
+    <BaseModal
+      :open="adminRequest !== null"
+      :title="t('startup.adminRequiredTitle')"
+      size="sm"
+      :closable="!adminBusy"
+      @close="cancelElevated"
+    >
+      <div class="flex flex-col gap-3">
+        <p class="text-xs leading-relaxed text-zinc-600 dark:text-zinc-300">
+          {{ t("startup.adminRequiredDesc") }}
+        </p>
+        <div
+          class="flex flex-wrap items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50/70 px-2.5 py-2 dark:border-zinc-800 dark:bg-zinc-900/40"
+        >
+          <span
+            class="min-w-0 max-w-full truncate text-xs font-medium text-zinc-800 dark:text-zinc-100"
+            :title="adminRequest?.item.name"
+          >
+            {{ adminRequest?.item.name ?? "" }}
+          </span>
+          <BaseBadge v-if="adminActionLabel" variant="warn">
+            {{ adminActionLabel }}
+          </BaseBadge>
+        </div>
+      </div>
+      <template #footer>
+        <BaseButton
+          variant="secondary"
+          size="sm"
+          :disabled="adminBusy"
+          @click="cancelElevated"
+        >
+          {{ t("common.cancel") }}
+        </BaseButton>
+        <BaseButton
+          variant="primary"
+          size="sm"
+          :loading="adminBusy"
+          @click="confirmElevated"
+        >
+          {{ t("startup.adminConfirm") }}
         </BaseButton>
       </template>
     </BaseModal>

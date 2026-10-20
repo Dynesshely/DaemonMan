@@ -37,7 +37,7 @@ DaemonMan 的后端用 Rust（Tauri 2），前端用 Vue 3 + TypeScript + Tailwi
 # 安装依赖
 pnpm install
 
-# 开发模式（前端 HMR + Rust 后端）
+# 开发模式（前端 HMR + Rust 后端；使用 ~/.dev-daemonMan，不写生产配置）
 pnpm tauri dev
 
 # 仅前端类型检查 / 构建
@@ -121,12 +121,16 @@ daemon-man/
 
 ## 数据与配置
 
-- 配置：`%USERPROFILE%\.daemonMan\config.json`（原子写入，保留 `.bak`）
-- 日志：`%USERPROFILE%\.daemonMan\logs\daemon-man.log`
-- 自启动项备份：`%USERPROFILE%\.daemonMan\autostart-backup\`（`index.json` + 文件副本/计划任务 XML；右键禁用或删除时写入，恢复后自动清理）
-- 开机自启：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `DaemonMan` 值（`--autostart` 参数启动，默认隐藏窗口并延迟执行工作流）
+- **生产实例**数据目录：`%USERPROFILE%\.daemonMan\`
+- **开发实例**数据目录：`%USERPROFILE%\.dev-daemonMan\`（`pnpm tauri dev` / 不带 `custom-protocol` 的构建）。开发实例首次启动会只读复制生产配置（`config.json` + `workflows/*.json`），之后互不影响；单实例限制只在生产构建启用，且开发实例使用独立的 WebView2 用户数据目录，因此开发/生产实例可以同时打开。
+- 配置：`<数据目录>\config.json`（设置与自启动接管记录，原子写入，保留 `.bak`）
+- **每个工作流单独存储**：`<数据目录>\workflows\<id>.json`（原子写入，保留 `.bak`）；旧版本内嵌在 `config.json` 的工作流会在首次启动时自动拆分。导出配置时会把所有工作流打包进同一个 JSON，导入时再拆分回文件。
+- 日志：`<数据目录>\logs\daemon-man.log`
+- 自启动项备份：`<数据目录>\autostart-backup\`（`index.json` + 文件副本/计划任务 XML；右键禁用或删除时写入，恢复后自动清理）
+- 开机自启：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `DaemonMan` 值（开发实例为 `DaemonManDev`，`--autostart` 参数启动，默认隐藏窗口并延迟执行工作流）
 - 旧版本使用的 `~/.daemon-man` 目录会在首次启动时自动迁移到 `~/.daemonMan`（配置与日志）。
 - 自启动项开关不删除用户数据：注册表 Run 项通过 `Explorer\StartupApproved\Run` 的启用/禁用标记控制，启动文件夹项通过 `StartupApproved\StartupFolder` 控制，与任务管理器行为一致，可无损恢复。
+- 工作流启动的进程会以当前 shell（explorer）为父进程，不挂在 DaemonMan 进程树下；DaemonMan 崩溃/退出不会影响已启动的进程。
 
 ## 工作流编辑器
 
@@ -135,6 +139,8 @@ daemon-man/
 - **执行线 vs 依赖线**：相邻层且条件为「成功后」的边是执行流（实线 + 品牌色）；跨层、同层、失败/总是依赖画成虚线灰边，便于一眼分辨主执行路径与跳线。
 - **撤销 / 重做**：编辑操作（拖拽、连线、属性修改、自动排列）会进入历史；默认 100 级，可在设置页调整为 1–10000。
 - **开始菜单选择**：点击「启动应用」先打开开始菜单选择器（搜索、图标、当前用户/所有用户），选中后自动填入 `.lnk` 路径与参数；也可手动填写路径。
+- **拖放创建**：把 `.lnk` / `.exe` / `.bat` / `.cmd` / `.ps1` / `.vbs` 从资源管理器拖到画布，按落点快速创建启动节点。
+- **单点执行**：右键任意节点（分组除外）选择「单点执行」，只运行该节点，不校验整张图、不受上下游影响，便于调试；运行状态与日志照常显示。
 
 ## 自启动管理
 
@@ -156,6 +162,8 @@ daemon-man/
 | 删除 | 先备份（注册表值、文件副本或计划任务 XML），再从原位置永久删除；Windows 服务不支持删除（请使用禁用） |
 
 禁用/删除前均需确认；服务与系统级项在普通权限下会返回「需要管理员权限」的明确错误。
+
+**临时提权**：DaemonMan 窗口始终以普通权限运行。当某个操作需要管理员权限时，界面会弹出确认框，确认后通过 UAC 启动一个一次性提权子进程执行该操作（不打开新窗口/托盘），完成后自动刷新列表，主进程权限不变。用户取消 UAC 会提示「已取消管理员授权」。
 
 ## 权限说明
 

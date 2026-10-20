@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, State};
 
+use crate::config;
 use crate::engine::{self, RunRequest};
 use crate::model::{
     now_iso, AppLaunchSpec, LogLevel, NodeKind, RunTrigger, Workflow, WorkflowNode,
@@ -125,6 +126,9 @@ pub fn save_workflow(
     let state = state.inner().clone();
     let workflow = normalize(workflow);
 
+    // 每个工作流独立存成 `workflows/<id>.json`，config.json 只保留设置类数据。
+    config::save_workflow_file(&workflow).map_err(|err| format!("保存工作流文件失败：{err}"))?;
+
     state
         .mutate_config(|config| {
             if let Some(existing) = config.workflow_mut(&workflow.id) {
@@ -152,6 +156,9 @@ pub fn delete_workflow(
     id: String,
 ) -> Result<(), String> {
     let state = state.inner().clone();
+    if let Err(err) = config::delete_workflow_file(&id) {
+        return Err(format!("删除工作流文件失败：{err}"));
+    }
     let removed = state
         .mutate_config(|config| {
             let index = config.workflows.iter().position(|w| w.id == id)?;
@@ -216,6 +223,7 @@ pub fn duplicate_workflow(
     }
     let copy = normalize(copy);
 
+    config::save_workflow_file(&copy).map_err(|err| format!("保存副本失败：{err}"))?;
     state
         .mutate_config(|config| config.workflows.push(copy.clone()))
         .map_err(|err| format!("复制工作流失败：{err}"))?;
@@ -254,6 +262,21 @@ pub fn run_workflow(
             delay: Duration::ZERO,
         },
     );
+    state
+        .run(&run_id)
+        .ok_or_else(|| "创建运行记录失败".to_string())
+}
+
+/// 单点执行：用当前草稿中的某个节点发起一次只含该节点的调试运行。
+#[tauri::command]
+pub fn run_single_node(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    workflow: Workflow,
+    node_id: String,
+) -> Result<WorkflowRun, String> {
+    let state = state.inner().clone();
+    let run_id = engine::spawn_single_node_run(app, state.clone(), workflow, &node_id)?;
     state
         .run(&run_id)
         .ok_or_else(|| "创建运行记录失败".to_string())

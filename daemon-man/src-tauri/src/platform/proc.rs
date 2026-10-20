@@ -2,15 +2,16 @@
 //!
 //! 这里集中了所有「和运行中的程序打交道」的能力：
 //! - 查询进程（sysinfo）与主窗口（EnumWindows）；
-//! - 启动程序（`std::process::Command` + `CREATE_NEW_PROCESS_GROUP`，快捷方式先 COM 解析）；
+//! - 启动程序（`CreateProcessW` + `STARTUPINFOEXW`，父进程设为 explorer/shell，
+//!   让被启动的进程不挂在 DaemonMan 的进程树下；快捷方式先 COM 解析）；
 //! - 提权启动（`ShellExecuteExW` + `runas`）；
 //! - 等待主窗口（异步轮询，可取消）、关闭 / 置前窗口、结束进程。
 //!
 //! 约定：进程名比较一律忽略大小写与 `.exe` 后缀（Windows 上同一名字可能带也可能不带扩展名）。
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::os::windows::process::CommandExt;
+use std::ffi::{OsStr, OsString};
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -18,19 +19,23 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use sysinfo::{ProcessesToUpdate, System};
-use windows::core::{Interface, PCWSTR};
+use windows::core::{Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, FALSE, HANDLE, HWND, LPARAM, TRUE, WPARAM};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Com::{IPersistFile, STGM_READ};
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentProcess, GetProcessId, OpenProcess, OpenProcessToken,
-    CREATE_NEW_PROCESS_GROUP, PROCESS_TERMINATE,
+    AttachThreadInput, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetProcessId,
+    InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken, UpdateProcThreadAttribute,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_CREATE_PROCESS,
+    PROCESS_INFORMATION, PROCESS_TERMINATE, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 use windows::Win32::UI::Shell::{
     ShellExecuteExW, IShellLinkW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow,
+    BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetShellWindow, GetWindow,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
     SetForegroundWindow, ShowWindow, GW_OWNER, SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE,
 };
@@ -254,31 +259,353 @@ fn comspec() -> String {
     std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string())
 }
 
+// ---------------------------------------------------------------------------
+// 启动：CreateProcessW + 父进程属性（shell / explorer）
+// ---------------------------------------------------------------------------
+
+/// 子进程的父进程：shell（explorer）窗口所属进程的句柄。
+///
+/// 通过 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 指定它之后，被启动的进程在进程树里
+/// 挂在 explorer 下而不是 DaemonMan 下；DaemonMan 退出/崩溃不会连带影响这些进程。
+struct ShellParent {
+    handle: HANDLE,
+}
+
+impl ShellParent {
+    /// 打开 shell 进程：`GetShellWindow` → pid → `OpenProcess(PROCESS_CREATE_PROCESS)`。
+    fn open() -> Option<Self> {
+        unsafe {
+            let shell_window = GetShellWindow();
+            if shell_window.is_invalid() {
+                eprintln!("[platform] 找不到 shell 窗口，启动的进程将挂在 DaemonMan 下");
+                return None;
+            }
+            let mut pid = 0u32;
+            if GetWindowThreadProcessId(shell_window, Some(&mut pid)) == 0 || pid == 0 {
+                return None;
+            }
+            // shell 就是自己（几乎不可能）时没有意义。
+            if pid == std::process::id() {
+                return None;
+            }
+            match OpenProcess(PROCESS_CREATE_PROCESS, FALSE, pid) {
+                Ok(handle) => Some(Self { handle }),
+                Err(err) => {
+                    eprintln!(
+                        "[platform] 打开 shell 进程（pid {pid}）失败，启动的进程将挂在 DaemonMan 下：{err}"
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ShellParent {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+/// `PROC_THREAD_ATTRIBUTE_LIST` 的缓冲区。
+///
+/// Windows 要求该结构按指针宽度对齐，所以底层用 `Vec<usize>` 而不是 `Vec<u8>`。
+struct ParentAttributeList {
+    /// 只负责持有缓冲区（`pointer` 指向它），生命周期内不能移动/重分配。
+    _storage: Vec<usize>,
+    pointer: LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+impl ParentAttributeList {
+    /// 初始化属性列表并写入 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`。
+    fn new(parent: &ShellParent) -> Option<Self> {
+        unsafe {
+            let mut size = 0usize;
+            // 第一次调用只用来查询所需字节数（预期返回 ERROR_INSUFFICIENT_BUFFER）。
+            let _ = InitializeProcThreadAttributeList(
+                LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
+                1,
+                0,
+                &mut size,
+            );
+            if size == 0 {
+                eprintln!("[platform] 查询进程属性列表大小失败，将回退普通启动");
+                return None;
+            }
+            let words = size.div_ceil(std::mem::size_of::<usize>());
+            let mut storage = vec![0usize; words];
+            let pointer = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
+            if let Err(err) = InitializeProcThreadAttributeList(pointer, 1, 0, &mut size) {
+                eprintln!("[platform] 初始化进程属性列表失败，将回退普通启动：{err}");
+                return None;
+            }
+            let list = Self {
+                _storage: storage,
+                pointer,
+            };
+            let parent_value: *const HANDLE = &parent.handle;
+            if let Err(err) = UpdateProcThreadAttribute(
+                pointer,
+                0,
+                PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize,
+                Some(parent_value as *const core::ffi::c_void),
+                std::mem::size_of::<HANDLE>(),
+                None,
+                None,
+            ) {
+                eprintln!("[platform] 设置父进程属性失败，将回退普通启动：{err}");
+                return None;
+            }
+            Some(list)
+        }
+    }
+}
+
+impl Drop for ParentAttributeList {
+    fn drop(&mut self) {
+        if !self.pointer.is_invalid() {
+            unsafe { DeleteProcThreadAttributeList(self.pointer) };
+        }
+    }
+}
+
+/// 启动可执行文件：父进程优先设为 shell，失败时逐级回退。
+///
+/// 回退顺序：
+/// 1. shell 父进程 + `CREATE_BREAKAWAY_FROM_JOB`（DaemonMan 自身在 job 里时也能脱离）；
+/// 2. shell 父进程（job 限制了 breakaway 的情况）；
+/// 3. 普通 `CreateProcessW`（父进程 = DaemonMan，保证功能可用）。
 fn spawn_executable(exe: &str, args: &[String], spec: &AppLaunchSpec) -> Result<u32> {
-    let mut command = std::process::Command::new(exe);
-    command.args(args);
+    let working_dir = resolve_working_dir(exe, spec).map(|dir| to_wide(&dir));
+    let environment = build_environment_block(&spec.env);
 
-    if let Some(dir) = spec.working_dir.as_deref().filter(|dir| !dir.trim().is_empty()) {
-        command.current_dir(dir);
-    } else if let Some(parent) = Path::new(exe).parent() {
-        if parent.is_dir() {
-            command.current_dir(parent);
+    if let Some(parent) = ShellParent::open() {
+        if let Some(list) = ParentAttributeList::new(&parent) {
+            match create_process(
+                exe,
+                args,
+                working_dir.as_deref(),
+                environment.as_deref(),
+                Some(&list),
+                true,
+            ) {
+                Ok(pid) => return Ok(pid),
+                Err(err) => eprintln!(
+                    "[platform] 以 shell 为父进程 + BREAKAWAY 启动失败，去掉 BREAKAWAY 重试：{err:#}"
+                ),
+            }
+            if let Ok(pid) = create_process(
+                exe,
+                args,
+                working_dir.as_deref(),
+                environment.as_deref(),
+                Some(&list),
+                false,
+            ) {
+                return Ok(pid);
+            }
         }
     }
 
-    for env in &spec.env {
-        if !env.key.trim().is_empty() {
-            command.env(&env.key, &env.value);
-        }
+    create_process(
+        exe,
+        args,
+        working_dir.as_deref(),
+        environment.as_deref(),
+        None,
+        false,
+    )
+    .with_context(|| format!("启动程序失败：{exe}"))
+}
+
+/// 工作目录：优先 spec 指定，否则用目标 exe 所在目录（存在时）。
+fn resolve_working_dir(exe: &str, spec: &AppLaunchSpec) -> Option<String> {
+    if let Some(dir) = spec
+        .working_dir
+        .as_deref()
+        .filter(|dir| !dir.trim().is_empty())
+    {
+        return Some(dir.to_string());
+    }
+    let parent = Path::new(exe).parent()?;
+    if parent.is_dir() {
+        Some(parent.display().to_string())
+    } else {
+        None
+    }
+}
+
+/// 调一次 `CreateProcessW`；`parent` 为 None 时不使用 `EXTENDED_STARTUPINFO_PRESENT`。
+fn create_process(
+    exe: &str,
+    args: &[String],
+    working_dir: Option<&[u16]>,
+    environment: Option<&[u16]>,
+    parent: Option<&ParentAttributeList>,
+    breakaway: bool,
+) -> Result<u32> {
+    // CreateProcessW 可能就地修改命令行缓冲区，每次尝试都必须用新的缓冲。
+    let mut command_line: Vec<u16> = build_command_line(exe, args)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = if parent.is_some() {
+        std::mem::size_of::<STARTUPINFOEXW>() as u32
+    } else {
+        std::mem::size_of::<STARTUPINFOW>() as u32
+    };
+    if let Some(list) = parent {
+        startup.lpAttributeList = list.pointer;
     }
 
-    // 独立进程组：Ctrl+C 之类不会连带影响 DaemonMan。
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP.0);
+    let mut flags = CREATE_NEW_PROCESS_GROUP;
+    if parent.is_some() {
+        flags |= EXTENDED_STARTUPINFO_PRESENT;
+    }
+    if environment.is_some() {
+        flags |= CREATE_UNICODE_ENVIRONMENT;
+    }
+    if breakaway {
+        flags |= CREATE_BREAKAWAY_FROM_JOB;
+    }
 
-    let child = command
-        .spawn()
-        .with_context(|| format!("启动程序失败：{exe}"))?;
-    Ok(child.id())
+    let mut process_info = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            // lpApplicationName 传 NULL，只用命令行：这样带参数的 .exe 与 cmd /C 都走同一条路径。
+            PCWSTR::null(),
+            PWSTR(command_line.as_mut_ptr()),
+            None,
+            None,
+            FALSE,
+            flags,
+            environment.map(|block| block.as_ptr() as *const core::ffi::c_void),
+            working_dir.map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr())),
+            &startup.StartupInfo,
+            &mut process_info,
+        )
+        .context("CreateProcessW 调用失败")?;
+    }
+
+    // 只保留 pid：进程/线程句柄立刻关闭，进程本身继续运行。
+    unsafe {
+        let _ = CloseHandle(process_info.hThread);
+        let _ = CloseHandle(process_info.hProcess);
+    }
+    Ok(process_info.dwProcessId)
+}
+
+/// 命令行：`"<exe>" arg1 arg2 ...`。
+pub(crate) fn build_command_line(exe: &str, args: &[String]) -> String {
+    let mut command_line = String::with_capacity(exe.len() + 8);
+    command_line.push('"');
+    command_line.push_str(exe);
+    command_line.push('"');
+    for arg in args {
+        command_line.push(' ');
+        command_line.push_str(&escape_win_arg(arg));
+    }
+    command_line
+}
+
+/// 按 Windows argv 规则转义单个参数（只在必要时加引号）。
+pub(crate) fn escape_win_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let chars: Vec<char> = arg.chars().collect();
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => {
+                // 连续反斜杠只在「后面是引号 / 字符串结尾」时才需要加倍。
+                let mut count = 0;
+                while index < chars.len() && chars[index] == '\\' {
+                    count += 1;
+                    index += 1;
+                }
+                if index == chars.len() {
+                    for _ in 0..count * 2 {
+                        out.push('\\');
+                    }
+                } else if chars[index] == '"' {
+                    for _ in 0..count * 2 + 1 {
+                        out.push('\\');
+                    }
+                    out.push('"');
+                    index += 1;
+                } else {
+                    for _ in 0..count {
+                        out.push('\\');
+                    }
+                }
+            }
+            '"' => {
+                out.push('\\');
+                out.push('"');
+                index += 1;
+            }
+            other => {
+                out.push(other);
+                index += 1;
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 构造 Unicode 环境块（`KEY=VALUE\0...\0\0`）。
+///
+/// `CreateProcessW` 不能像 `Command::env` 那样「继承 + 追加覆盖」，所以先复制当前进程环境，
+/// 再应用 spec 里的覆盖，最后按不区分大小写排序（Windows 要求）。
+/// 返回 `None` 表示没有额外环境变量，直接继承父进程环境（`lpEnvironment = NULL`）。
+pub(crate) fn build_environment_block(overrides: &[crate::model::EnvVar]) -> Option<Vec<u16>> {
+    if overrides.is_empty() {
+        return None;
+    }
+    let mut entries: Vec<(String, OsString, OsString)> = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        // `=C:` 这类「每驱动器当前目录」变量由系统管理，不放进环境块。
+        if key.to_string_lossy().starts_with('=') {
+            continue;
+        }
+        entries.push((key.to_string_lossy().to_uppercase(), key, value));
+    }
+    for env in overrides {
+        if env.key.trim().is_empty() {
+            continue;
+        }
+        let upper = env.key.to_uppercase();
+        entries.retain(|(existing, _, _)| *existing != upper);
+        entries.push((upper, OsString::from(&env.key), OsString::from(&env.value)));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut block: Vec<u16> = Vec::new();
+    for (_, key, value) in entries {
+        for unit in key.as_os_str().encode_wide() {
+            block.push(unit);
+        }
+        block.push(b'=' as u16);
+        for unit in value.as_os_str().encode_wide() {
+            block.push(unit);
+        }
+        block.push(0);
+    }
+    block.push(0);
+    Some(block)
 }
 
 /// ShellExecuteExW 启动（用于提权 / URL / 文档）。返回 pid，拿不到时返回 0。
@@ -677,6 +1004,89 @@ mod tests {
         assert_eq!(from_wide_buffer(&buffer), "ab");
     }
 
+    #[test]
+    fn escape_win_arg_cases() {
+        // 不需要引号的原样返回
+        assert_eq!(escape_win_arg("simple"), "simple");
+        assert_eq!(escape_win_arg(r"a\b\c"), r"a\b\c");
+        // 含空格 → 加引号
+        assert_eq!(
+            escape_win_arg(r"C:\Program Files\App\app.exe"),
+            r#""C:\Program Files\App\app.exe""#
+        );
+        // 空参数要保留成一个空字符串
+        assert_eq!(escape_win_arg(""), r#""""#);
+        // 内嵌引号 → 反斜杠转义
+        assert_eq!(escape_win_arg(r#"say "hi""#), r#""say \"hi\"""#);
+        // 引号前的反斜杠要加倍，结尾反斜杠也要加倍
+        assert_eq!(escape_win_arg(r#"a\b c\"d"#), r#""a\b c\\\"d""#);
+        assert_eq!(escape_win_arg("dir with space\\"), r#""dir with space\\""#);
+    }
+
+    #[test]
+    fn build_command_line_quotes_exe_and_args() {
+        assert_eq!(
+            build_command_line(
+                r"C:\Windows\System32\notepad.exe",
+                &["--x".to_string(), "hello world".to_string()]
+            ),
+            r#""C:\Windows\System32\notepad.exe" --x "hello world""#
+        );
+        assert_eq!(
+            build_command_line(r"C:\Program Files\App\app.exe", &[]),
+            r#""C:\Program Files\App\app.exe""#
+        );
+    }
+
+    #[test]
+    fn environment_block_applies_overrides() {
+        let overrides = vec![
+            crate::model::EnvVar {
+                key: "DAEMONMAN_SMOKE".to_string(),
+                value: "1".to_string(),
+            },
+            // 与 PATH 大小写不同，应该覆盖而不是新增第二份
+            crate::model::EnvVar {
+                key: "path".to_string(),
+                value: r"C:\daemonman-custom".to_string(),
+            },
+        ];
+        let block = build_environment_block(&overrides).expect("有覆盖时应生成环境块");
+
+        let mut entries: Vec<(String, String)> = Vec::new();
+        let mut start = 0usize;
+        for index in 0..block.len() {
+            if block[index] != 0 {
+                continue;
+            }
+            if index == start {
+                break; // 双 NUL 结尾
+            }
+            let text = String::from_utf16_lossy(&block[start..index]);
+            if let Some((key, value)) = text.split_once('=') {
+                entries.push((key.to_uppercase(), value.to_string()));
+            }
+            start = index + 1;
+        }
+        assert!(entries.contains(&("DAEMONMAN_SMOKE".to_string(), "1".to_string())));
+        assert!(entries.contains(&(
+            "PATH".to_string(),
+            r"C:\daemonman-custom".to_string()
+        )));
+        assert_eq!(
+            entries.iter().filter(|(key, _)| key == "PATH").count(),
+            1,
+            "环境变量名不区分大小写，覆盖后不应出现两份 PATH"
+        );
+        // 以双 NUL 结尾，且不出现 `=C:` 这类隐藏变量
+        assert_eq!(block.last(), Some(&0u16));
+        assert_eq!(block.get(block.len().saturating_sub(2)), Some(&0u16));
+        assert!(!entries.iter().any(|(key, _)| key.starts_with('=')));
+
+        // 没有覆盖时直接继承父进程环境
+        assert!(build_environment_block(&[]).is_none());
+    }
+
     /// 冒烟测试：真实环境下列出进程 / 判断是否提权。
     /// 手动运行：`cargo test --lib process_smoke -- --ignored --nocapture`
     #[test]
@@ -762,5 +1172,87 @@ mod tests {
             kill_process(pid).expect("兜底结束 mstsc 失败");
         }
         assert!(!is_process_running("mstsc"), "最终不应残留 mstsc 进程");
+    }
+
+    /// 冒烟测试：验证普通启动的子进程父进程是 shell（explorer）而不是 DaemonMan。
+    ///
+    /// 手动运行：`cargo test --lib launch_parent_smoke -- --ignored --nocapture`
+    /// （会短暂启动 mstsc 再结束它；用 GUI 进程是为了保证查询父进程时它仍然存活）
+    #[test]
+    #[ignore]
+    fn launch_parent_smoke() {
+        let shell_pid = unsafe {
+            let shell = GetShellWindow();
+            let mut pid = 0u32;
+            if !shell.is_invalid() {
+                GetWindowThreadProcessId(shell, Some(&mut pid));
+            }
+            (pid != 0).then_some(pid)
+        };
+        println!("当前 shell(explorer) pid = {shell_pid:?}，DaemonMan 测试进程 pid = {}", std::process::id());
+
+        let spec = AppLaunchSpec {
+            path: r"C:\Windows\System32\mstsc.exe".to_string(),
+            ..Default::default()
+        };
+        let pid = launch_app(&spec).expect("启动 mstsc 失败");
+        println!("启动的 mstsc pid = {pid}");
+        assert!(pid > 0, "CreateProcessW 应返回有效 pid");
+
+        // 父进程 PID：sysinfo 的 parent() 只有在刷新 parent 信息后才有值，
+        // 这里用 new_all()（refresh everything）并等待 cmd 真正起来；仍取不到则用 CIM 兜底。
+        let child = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new_all();
+        let mut parent_pid = None;
+        for _ in 0..20 {
+            system.refresh_all();
+            parent_pid = system
+                .process(child)
+                .and_then(|process| process.parent())
+                .map(|parent| parent.as_u32());
+            if parent_pid.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!(
+            "子进程 {pid} 的父进程 pid = {parent_pid:?}（当前进程 = {}）",
+            std::process::id()
+        );
+        if parent_pid.is_none() {
+            parent_pid = parent_pid_via_cim(pid);
+            println!("改用 Get-CimInstance 查询父进程 = {parent_pid:?}");
+        }
+
+        assert_ne!(
+            parent_pid,
+            Some(std::process::id()),
+            "父进程不应是 DaemonMan"
+        );
+        if let Some(shell_pid) = shell_pid {
+            assert_eq!(
+                parent_pid,
+                Some(shell_pid),
+                "父进程应为 shell(explorer) 进程；若失败请检查 GetShellWindow/OpenProcess 回退日志"
+            );
+        } else {
+            println!("未取到 shell pid（可能无交互桌面），只断言父进程不是 DaemonMan");
+        }
+
+        // 清理：直接结束 mstsc（未建立连接，结束无副作用）。
+        let _ = kill_process(pid);
+        println!("已结束 mstsc");
+    }
+
+    /// 用 CIM 查询某个进程的父进程 pid（sysinfo 取不到时的兜底，只在冒烟测试里用）。
+    fn parent_pid_via_cim(pid: u32) -> Option<u32> {
+        let script = format!(
+            "(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').ParentProcessId"
+        );
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
     }
 }

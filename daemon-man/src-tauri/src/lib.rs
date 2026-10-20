@@ -21,6 +21,8 @@ use crate::state::AppState;
 fn run_selftest() {
     let state = AppState::new();
     println!("config: {}", state.config_path.display());
+    println!("data_dir: {}", config::data_dir().display());
+    println!("dev_instance: {}", config::is_dev());
     println!("elevated: {}", platform::is_elevated());
     println!("self_autostart: {}", platform::is_self_autostart_enabled());
 
@@ -74,18 +76,44 @@ pub fn run() {
         return;
     }
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            tray::show_main(app);
-            let state = app.state::<Arc<AppState>>().inner().clone();
-            state.log(
-                app,
-                LogLevel::Info,
-                "core",
-                "检测到另一个 DaemonMan 实例，已切换到已有窗口",
-                None,
-            );
-        }))
+    // 提权子进程：执行一次性管理员操作后退出，不创建窗口/托盘。
+    if let Some(index) = args.iter().position(|arg| arg == "--elevated-autostart") {
+        match (args.get(index + 1), args.get(index + 2)) {
+            (Some(request), Some(result)) => {
+                std::process::exit(commands::autostart::run_elevated_request(request, result))
+            }
+            _ => {
+                eprintln!("用法：DaemonMan.exe --elevated-autostart <request.json> <result.json>");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // 单实例插件只在生产构建启用：开发实例要能和正在运行的生产实例同时打开。
+    // 同时给开发实例单独的 WebView2 用户数据目录，否则两个进程共用 WebView2 profile 会启动失败
+    // （0x8007139F 组或资源状态不正确）。
+    if config::is_dev() {
+        if let Some(local) = dirs::data_local_dir() {
+            let folder = local.join("com.daemonman.app.dev").join("EBWebView");
+            let _ = std::fs::create_dir_all(&folder);
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &folder);
+        }
+    }
+    let builder = tauri::Builder::default();
+    #[cfg(feature = "custom-protocol")]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        tray::show_main(app);
+        let state = app.state::<Arc<AppState>>().inner().clone();
+        state.log(
+            app,
+            LogLevel::Info,
+            "core",
+            "检测到另一个 DaemonMan 实例，已切换到已有窗口",
+            None,
+        );
+    }));
+
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(
@@ -140,6 +168,10 @@ pub fn run() {
             // - 登录自启：默认隐藏到托盘，除非用户关闭了「启动时最小化到托盘」。
             let should_show = !launched_by_autostart || !config.settings.start_minimized;
             if let Some(window) = app.get_webview_window("main") {
+                // 开发实例与生产实例可能同时在运行，标题里标出来避免混淆。
+                if config::is_dev() {
+                    let _ = window.set_title("DaemonMan (Dev)");
+                }
                 if should_show {
                     let _ = window.show();
                     let _ = window.set_focus();
@@ -207,6 +239,7 @@ pub fn run() {
             commands::workflow::duplicate_workflow,
             commands::workflow::validate_workflow,
             commands::workflow::run_workflow,
+            commands::workflow::run_single_node,
             commands::workflow::run_all_enabled,
             commands::workflow::cancel_run,
             commands::workflow::get_recent_runs,
@@ -218,6 +251,7 @@ pub fn run() {
             commands::autostart::disable_autostart_item,
             commands::autostart::restore_autostart_item,
             commands::autostart::delete_autostart_item,
+            commands::autostart::elevate_autostart_op,
             commands::autostart::reveal_autostart_item,
             commands::autostart::read_autostart_script,
             commands::autostart::write_autostart_script,

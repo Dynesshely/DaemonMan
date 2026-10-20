@@ -282,6 +282,67 @@ pub fn spawn_workflow_run(
     run_id
 }
 
+/// 只运行工作流里的某一个节点（编辑器「单点执行」调试）。
+///
+/// 与 [`spawn_workflow_run`] 的区别：
+/// - **不校验整张图**（未保存的草稿也能单点执行），只要求节点存在且不是分组节点；
+/// - 节点会被复制并强制 `enabled = true`（即使它在工作流里被禁用，也允许单独调试）；
+/// - 构造只含该节点的最小工作流（`edges` 为空，`id` / `name` / `skip_existing_processes`
+///   等沿用原工作流），所以 `run.workflow_id` 仍是原工作流 id、节点 id 保持不变，
+///   前端继续用 `workflow:run` 事件按 nodeId 更新状态；
+/// - 走与完整运行完全相同的执行管线（Manual 触发、并发/取消/超时语义一致、
+///   完整 `workflow:run` 事件与 `log:entry` 日志，run 进入运行历史）。
+///
+/// 返回创建出的运行 id（与 [`spawn_workflow_run`] 对齐，调用方可用 `state.run(&run_id)`
+/// 取回完整 [`WorkflowRun`]）；节点不存在或为分组节点时返回中文 `Err`。
+pub fn spawn_single_node_run(
+    app: AppHandle,
+    state: Arc<AppState>,
+    workflow: Workflow,
+    node_id: &str,
+) -> Result<String, String> {
+    let node = resolve_single_node(&workflow, node_id)?;
+    let mini = build_single_node_workflow(&workflow, node);
+
+    Ok(spawn_workflow_run(
+        app,
+        state,
+        mini,
+        RunRequest {
+            trigger: RunTrigger::Manual,
+            delay: Duration::ZERO,
+        },
+    ))
+}
+
+/// 单点执行的目标节点：必须存在且不是分组节点。
+fn resolve_single_node<'a>(
+    workflow: &'a Workflow,
+    node_id: &str,
+) -> Result<&'a WorkflowNode, String> {
+    let node = workflow
+        .nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .ok_or_else(|| format!("节点不存在：{node_id}"))?;
+    if node.kind == NodeKind::Group {
+        return Err("分组节点不支持单点执行".to_string());
+    }
+    Ok(node)
+}
+
+/// 构造「只含一个节点」的最小工作流：节点克隆后强制 `enabled = true`，
+/// `edges` 清空，其余字段沿用原工作流。
+fn build_single_node_workflow(workflow: &Workflow, node: &WorkflowNode) -> Workflow {
+    let mut single = node.clone();
+    single.enabled = true;
+    Workflow {
+        nodes: vec![single],
+        edges: Vec::new(),
+        ..workflow.clone()
+    }
+}
+
 fn build_initial_run(workflow: &Workflow, run_id: &str, trigger: RunTrigger) -> WorkflowRun {
     let name = if workflow.name.trim().is_empty() {
         "未命名工作流".to_string()
@@ -1375,6 +1436,53 @@ mod tests {
             target: target.to_string(),
             condition,
         }
+    }
+
+    #[test]
+    fn single_node_workflow_keeps_identity_and_forces_enabled() {
+        let mut target = node("b");
+        target.enabled = false;
+        let workflow = Workflow {
+            id: "wf-7".to_string(),
+            name: "原工作流".to_string(),
+            skip_existing_processes: false,
+            nodes: vec![node("a"), target],
+            edges: vec![edge("a", "b", EdgeCondition::Success)],
+            ..Default::default()
+        };
+
+        let mini = build_single_node_workflow(&workflow, &workflow.nodes[1]);
+
+        // 只保留目标节点，节点 id 不变（前端按 nodeId 对状态）。
+        assert_eq!(mini.nodes.len(), 1);
+        assert_eq!(mini.nodes[0].id, "b");
+        // 调试时即使原节点被禁用也要能单独跑。
+        assert!(mini.nodes[0].enabled);
+        // 不带任何连线：单点执行不需要整图依赖。
+        assert!(mini.edges.is_empty());
+        // 身份沿用原工作流，run.workflow_id 才不会变。
+        assert_eq!(mini.id, "wf-7");
+        assert_eq!(mini.name, "原工作流");
+        assert!(!mini.skip_existing_processes);
+    }
+
+    #[test]
+    fn single_node_run_rejects_unknown_and_group_nodes() {
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![node("a"), group_node("g")],
+            ..Default::default()
+        };
+
+        let ok = resolve_single_node(&workflow, "a").expect("普通节点应可单点执行");
+        assert_eq!(ok.id, "a");
+
+        let missing = resolve_single_node(&workflow, "missing").unwrap_err();
+        assert!(missing.contains("节点不存在"), "实际：{missing}");
+
+        let group = resolve_single_node(&workflow, "g").unwrap_err();
+        assert!(group.contains("分组节点"), "实际：{group}");
     }
 
     #[test]

@@ -135,3 +135,17 @@ export function buildFlowEdge(
 export function edgeIdFor(source: string, target: string): string {
   return `edge-${source}-${target}`;
 }
+
+/** 文件扩展名（小写，不带点）；没有扩展名返回空串。 */
+export function fileExtension(path: string): string {
+  const name = path.split(/[\\/]/).pop() ?? "";
+  const dot = name.lastIndexOf(".");
+  return dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+}
+
+/** 去掉扩展名的文件名（用于拖放建节点的默认名称）。 */
+export function fileBaseName(path: string): string {
+  const name = path.split(/[\\/]/).pop() ?? path;
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(0, dot) : name;
+}

@@ -32,8 +32,14 @@ const RUN_WOW: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 /// WOW6432Node（32 位视图）下的 RunOnce 键。
 const RUN_ONCE_WOW: &str = r"Software\Microsoft\Windows\CurrentVersion\RunOnce";
 
-/// DaemonMan 自身在 HKCU Run 中使用的值名。
-const SELF_VALUE_NAME: &str = "DaemonMan";
+/// DaemonMan 自身在 HKCU Run 中使用的值名（开发实例用独立值名，避免覆盖生产自启）。
+fn self_value_name() -> &'static str {
+    if crate::config::is_dev() {
+        "DaemonManDev"
+    } else {
+        "DaemonMan"
+    }
+}
 
 /// 一个注册表自启动「位置」：由 (来源, 视图) 唯一确定。
 #[derive(Debug, Clone, Copy)]
@@ -189,7 +195,7 @@ fn scan_location(loc: &Location) -> Result<Vec<AutostartItem>> {
             true
         };
 
-        let is_self = value_name.eq_ignore_ascii_case(SELF_VALUE_NAME)
+        let is_self = value_name.eq_ignore_ascii_case(self_value_name())
             || executable
                 .as_deref()
                 .is_some_and(super::proc::is_current_exe);
@@ -404,14 +410,15 @@ pub(crate) fn clear_disabled_state(
 }
 
 /// DaemonMan 自身是否已注册开机自启。
-pub fn is_self_enabled() -> bool {    let Ok(key) = startup_approved::open(Hive::CurrentUser, RUN, false) else {
+pub fn is_self_enabled() -> bool {
+    let Ok(key) = startup_approved::open(Hive::CurrentUser, RUN, false) else {
         return false;
     };
-    if key.get_value::<String, _>(SELF_VALUE_NAME).is_err() {
+    if key.get_value::<String, _>(self_value_name()).is_err() {
         return false;
     }
     // 存在 Run 值还不够：可能被任务管理器/StartupApproved 关掉了。
-    startup_approved::read_enabled(Hive::CurrentUser, APPROVED_RUN, SELF_VALUE_NAME).unwrap_or(true)
+    startup_approved::read_enabled(Hive::CurrentUser, APPROVED_RUN, self_value_name()).unwrap_or(true)
 }
 
 /// 注册 / 取消 DaemonMan 自身的开机自启。
@@ -425,21 +432,21 @@ pub fn set_self_enabled(enabled: bool) -> Result<()> {
         let (key, _) = hkcu
             .create_subkey(RUN)
             .context("打开 HKCU 的 Run 键失败")?;
-        key.set_value(SELF_VALUE_NAME, &command)
+        key.set_value(self_value_name(), &command)
             .context("写入 DaemonMan 自启动注册表值失败")?;
         // 若这个值以前被禁用过（StartupApproved 里是 0x03），必须一起改回启用，
         // 否则写 Run 值也不会生效。
-        startup_approved::write_enabled(Hive::CurrentUser, APPROVED_RUN, SELF_VALUE_NAME, true)
+        startup_approved::write_enabled(Hive::CurrentUser, APPROVED_RUN, self_value_name(), true)
             .context("启用 DaemonMan 自启动的 StartupApproved 状态失败")?;
     } else {
         if let Ok(key) = hkcu.open_subkey_with_flags(RUN, KEY_SET_VALUE) {
-            match key.delete_value(SELF_VALUE_NAME) {
+            match key.delete_value(self_value_name()) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err).context("删除 DaemonMan 自启动注册表值失败"),
             }
         }
-        startup_approved::delete_value(Hive::CurrentUser, APPROVED_RUN, SELF_VALUE_NAME)?;
+        startup_approved::delete_value(Hive::CurrentUser, APPROVED_RUN, self_value_name())?;
     }
     Ok(())
 }

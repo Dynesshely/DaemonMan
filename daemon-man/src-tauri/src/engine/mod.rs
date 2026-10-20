@@ -7,5 +7,5 @@ pub mod executor;
 pub mod graph;
 pub mod launcher;
 
-pub use executor::{spawn_workflow_run, RunRequest};
+pub use executor::{spawn_single_node_run, spawn_workflow_run, RunRequest};
 pub use graph::validate;

@@ -64,12 +64,28 @@ pub fn import_config(
 ) -> Result<AppConfig, String> {
     let state = state.inner().clone();
     let text = std::fs::read_to_string(&path).map_err(|err| format!("读取配置失败：{err}"))?;
-    let mut config: AppConfig =
+    let bundle: crate::config::ExportBundle =
         serde_json::from_str(&text).map_err(|err| format!("配置格式无效：{err}"))?;
-    config.version = crate::model::CONFIG_VERSION;
-    let snapshot = config.clone();
+
+    // 工作流文件与 config.json 分开导入：先整体替换 workflows/，再写配置。
+    crate::config::write_all_workflows(&bundle.workflows)
+        .map_err(|err| format!("写入工作流文件失败：{err}"))?;
+
+    let mut settings = bundle.settings;
+    settings.language = if matches!(settings.language.as_str(), "zh-CN" | "en") {
+        settings.language
+    } else {
+        "zh-CN".into()
+    };
+    let overrides = bundle.overrides;
+    let workflows = bundle.workflows;
     state
-        .mutate_config(|current| *current = snapshot.clone())
+        .mutate_config(|current| {
+            current.settings = settings.clone();
+            current.overrides = overrides.clone();
+            current.workflows = workflows.clone();
+            current.version = crate::model::CONFIG_VERSION;
+        })
         .map_err(|err| format!("保存配置失败：{err}"))?;
     state.autostart_cache_invalidate();
     state.log(

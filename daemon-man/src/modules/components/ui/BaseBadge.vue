@@ -25,6 +25,8 @@ const variantClasses: Record<BadgeVariant, string> = {
   info: "bg-sky-50 text-sky-700 ring-sky-200 dark:bg-sky-500/15 dark:text-sky-300 dark:ring-sky-500/30",
   running:
     "bg-brand-50 text-brand-700 ring-brand-200 dark:bg-brand-500/15 dark:text-brand-300 dark:ring-brand-500/30",
+  skipped:
+    "bg-teal-50 text-teal-700 ring-teal-200 dark:bg-teal-500/15 dark:text-teal-300 dark:ring-teal-500/30",
 };
 
 const dotClasses: Record<BadgeVariant, string> = {
@@ -35,6 +37,7 @@ const dotClasses: Record<BadgeVariant, string> = {
   danger: "bg-red-500",
   info: "bg-sky-500",
   running: "bg-brand-500",
+  skipped: "bg-teal-500",
 };
 
 const classes = computed(() => [

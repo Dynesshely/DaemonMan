@@ -9,6 +9,7 @@ import type {
   LegacyImportResult,
   LogEntry,
   ProcessInfo,
+  ScriptContent,
   SystemInfo,
   TakeOverResult,
   Workflow,
@@ -83,6 +84,22 @@ export const api = {
   /** 批量提取文件图标（PNG data URL）。 */
   getFileIcons: (paths: string[], size = 32) =>
     invoke<FileIcon[]>("get_file_icons", { paths, size }),
+
+  /** 右键「在资源管理器中显示」。 */
+  revealAutostartItem: (itemId: string) =>
+    invoke<string>("reveal_autostart_item", { itemId }),
+
+  /** 右键「编辑启动内容」：读取脚本文件。 */
+  readAutostartScript: (itemId: string) =>
+    invoke<ScriptContent>("read_autostart_script", { itemId }),
+
+  /** 右键「编辑启动内容」：保存脚本（自动备份，保持读取时的编码）。 */
+  writeAutostartScript: (itemId: string, content: string, encoding?: string) =>
+    invoke<ScriptContent>("write_autostart_script", {
+      itemId,
+      content,
+      encoding: encoding ?? null,
+    }),
 
   // 进程
   listProcesses: () => invoke<ProcessInfo[]>("list_processes"),

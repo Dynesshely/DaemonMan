@@ -7,7 +7,8 @@ export type BadgeVariant =
   | "warn"
   | "danger"
   | "info"
-  | "running";
+  | "running"
+  | "skipped";
 
 export function runStatusVariant(status: RunStatus): BadgeVariant {
   switch (status) {
@@ -36,6 +37,8 @@ export function nodeStatusVariant(status: NodeStatus): BadgeVariant {
       return "warn";
     case "waiting":
       return "info";
+    case "skipped-existing":
+      return "skipped";
     case "skipped":
       return "neutral";
     default:

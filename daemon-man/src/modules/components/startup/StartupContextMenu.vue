@@ -1,9 +1,16 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { useRoute } from "vue-router";
-import { Ban, RotateCcw, Trash2 } from "lucide-vue-next";
+import {
+  Ban,
+  FilePenLine,
+  FolderSearch,
+  RotateCcw,
+  Trash2,
+} from "lucide-vue-next";
 
 import type { AutostartItem } from "@/api";
+import { canEditScript, canRevealItem } from "@/modules/components/startup/script";
 import { useI18n } from "@/modules/locales";
 
 const props = withDefaults(
@@ -21,6 +28,8 @@ const emit = defineEmits<{
   close: [];
   disable: [item: AutostartItem];
   restore: [item: AutostartItem];
+  reveal: [item: AutostartItem];
+  edit: [item: AutostartItem];
   delete: [item: AutostartItem];
 }>();
 
@@ -53,6 +62,14 @@ const deleteDisabled = computed(
   () => props.busy || !item.value?.canDelete || item.value?.isSelf === true,
 );
 
+/** 在资源管理器中显示：有可执行文件路径或属于启动文件夹项。 */
+const revealDisabled = computed(
+  () => props.busy || !canRevealItem(item.value),
+);
+
+/** 编辑启动内容：扩展名命中白名单的文本脚本。 */
+const editDisabled = computed(() => props.busy || !canEditScript(item.value));
+
 const disableTitle = computed(() =>
   item.value?.isSelf ? t("startup.selfItem") : t("startup.menu.disable"),
 );
@@ -60,6 +77,22 @@ const disableTitle = computed(() =>
 const restoreTitle = computed(() =>
   item.value?.isSelf ? t("startup.selfItem") : t("startup.menu.restore"),
 );
+
+const revealTitle = computed(() => {
+  const current = item.value;
+  if (!current) return "";
+  if (current.removed) return t("startup.removedDetail");
+  if (!canRevealItem(current)) return "该启动项没有可定位的文件";
+  return t("startup.menu.reveal");
+});
+
+const editTitle = computed(() => {
+  const current = item.value;
+  if (!current) return "";
+  if (current.removed) return t("startup.removedDetail");
+  if (!canEditScript(current)) return t("startup.editNotEditable");
+  return t("startup.menu.editScript");
+});
 
 const deleteTitle = computed(() => {
   if (item.value?.isSelf) return t("startup.selfItem");
@@ -223,6 +256,38 @@ onBeforeUnmount(unbind);
               class="h-3.5 w-3.5 shrink-0 text-zinc-400 dark:text-zinc-500"
             />
             <span class="truncate">{{ t("startup.menu.restore") }}</span>
+          </button>
+        </div>
+
+        <div class="my-1 h-px bg-zinc-200/80 dark:bg-zinc-800" />
+
+        <div class="p-1">
+          <button
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-zinc-700 outline-none transition hover:bg-zinc-100 focus-visible:bg-zinc-100 focus-visible:ring-2 focus-visible:ring-brand-500/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent dark:text-zinc-200 dark:hover:bg-zinc-800 dark:focus-visible:bg-zinc-800 dark:disabled:hover:bg-transparent"
+            :disabled="revealDisabled"
+            :title="revealTitle"
+            @click="emit('reveal', item)"
+          >
+            <FolderSearch
+              class="h-3.5 w-3.5 shrink-0 text-zinc-400 dark:text-zinc-500"
+            />
+            <span class="truncate">{{ t("startup.menu.reveal") }}</span>
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-zinc-700 outline-none transition hover:bg-zinc-100 focus-visible:bg-zinc-100 focus-visible:ring-2 focus-visible:ring-brand-500/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent dark:text-zinc-200 dark:hover:bg-zinc-800 dark:focus-visible:bg-zinc-800 dark:disabled:hover:bg-transparent"
+            :disabled="editDisabled"
+            :title="editTitle"
+            @click="emit('edit', item)"
+          >
+            <FilePenLine
+              class="h-3.5 w-3.5 shrink-0 text-zinc-400 dark:text-zinc-500"
+            />
+            <span class="truncate">{{ t("startup.menu.editScript") }}</span>
           </button>
         </div>
 

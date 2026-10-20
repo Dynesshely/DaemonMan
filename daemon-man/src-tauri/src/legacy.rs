@@ -120,12 +120,13 @@ impl Builder {
         }
     }
 
-    fn push_delay(&mut self, latency: u64) -> String {
+    fn push_delay(&mut self, latency: u64, parent_id: Option<String>) -> String {
         self.push_node(WorkflowNode {
             name: format!("等待 {latency} ms"),
             kind: NodeKind::Delay,
             delay_ms: latency,
             note: "旧版分组内的 launch latency".into(),
+            parent_id,
             ..Default::default()
         })
     }
@@ -152,12 +153,41 @@ impl Builder {
     ///
     /// 旧版语义：任何条目（包括 `type: "program"`）都可以再有 `launchApps` 子项；
     /// 程序先启动，然后按 `options.launchOrder` 启动子项。
-    fn build_item(&mut self, item: &LegacyItem) -> (Vec<String>, Vec<String>) {
+    /// 分组会生成一个 `Group` 节点（仅展示），子项的 `parent_id` 指向它。
+    fn build_item(
+        &mut self,
+        item: &LegacyItem,
+        parent_id: Option<String>,
+    ) -> (Vec<String>, Vec<String>) {
         let is_group = item.kind.as_deref() == Some("group");
         let kind = if is_group { "group" } else { "program" };
         let key = Self::item_key(kind, &item.name);
 
-        // 1) 程序自身先成为一个 Application 节点。
+        let ordered = item
+            .options
+            .launch_order
+            .as_deref()
+            .map(|value| value != "parallel")
+            .unwrap_or(true);
+        let latency = item.options.latency.unwrap_or(0);
+
+        // 分组：创建一个只用于展示结构的 Group 节点。
+        let group_id = if is_group {
+            let node = WorkflowNode {
+                name: item.name.clone(),
+                kind: NodeKind::Group,
+                group_parallel: !ordered,
+                parent_id: parent_id.clone(),
+                note: "旧版 ProgressManager 分组".into(),
+                ..Default::default()
+            };
+            Some(self.push_node(node))
+        } else {
+            None
+        };
+        let child_parent = group_id.clone().or_else(|| parent_id.clone());
+
+        // 程序自身先成为一个 Application 节点。
         let own_entry: Option<String> = if is_group {
             None
         } else {
@@ -170,6 +200,7 @@ impl Builder {
             let node = WorkflowNode {
                 name: item.name.clone(),
                 kind: NodeKind::Application,
+                parent_id: parent_id.clone(),
                 app: AppLaunchSpec {
                     path: item.path.clone().unwrap_or_default(),
                     skip_if_running: true,
@@ -187,19 +218,11 @@ impl Builder {
             Some(self.push_node(node))
         };
 
-        // 2) 子项。
+        // 子项（程序带子项时，子项与程序同属一个分组）。
         let mut spans = Vec::new();
         for child in &item.launch_apps {
-            spans.push(self.build_item(child));
+            spans.push(self.build_item(child, child_parent.clone()));
         }
-
-        let ordered = item
-            .options
-            .launch_order
-            .as_deref()
-            .map(|value| value != "parallel")
-            .unwrap_or(true);
-        let latency = item.options.latency.unwrap_or(0);
 
         let (entry, exited) = if spans.is_empty() {
             match own_entry.as_ref() {
@@ -225,7 +248,7 @@ impl Builder {
                     continue;
                 }
                 if latency > 0 {
-                    let delay = self.push_delay(latency);
+                    let delay = self.push_delay(latency, child_parent.clone());
                     self.connect_all(&from, std::slice::from_ref(&delay));
                     self.connect_all(std::slice::from_ref(&delay), &to);
                 } else {
@@ -330,7 +353,7 @@ fn convert_parsed(legacy: LegacyConfig, source: &str) -> Result<Converted> {
     for (column, item) in legacy.launch_apps.iter().enumerate() {
         builder.column = column;
         builder.row = 0.0;
-        builder.build_item(item);
+        builder.build_item(item, None);
     }
     let converted = builder.finish();
 
@@ -424,8 +447,21 @@ mod tests {
         let converted = convert_parsed(legacy, "test").unwrap();
         let workflow = converted.workflow;
 
-        // 8 个程序节点 + 1 个 latency 延时节点（IM Apps 有 2 个子项 → 中间 1 个 delay）
-        assert_eq!(workflow.nodes.len(), 9, "nodes: {:?}", workflow.nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+        // 8 个程序节点 + 1 个 latency 延时节点 + 3 个分组节点
+        assert_eq!(workflow.nodes.len(), 12, "nodes: {:?}", workflow.nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+        assert_eq!(
+            workflow.nodes.iter().filter(|n| n.kind == NodeKind::Group).count(),
+            3
+        );
+        // 子项应挂在分组节点下
+        let network_group = workflow
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Group && n.name == "Network Proxy Apps")
+            .unwrap();
+        let clash = workflow.nodes.iter().find(|n| n.name == "Clash Verge").unwrap();
+        assert_eq!(clash.parent_id.as_deref(), Some(network_group.id.as_str()));
+        assert!(workflow.skip_existing_processes);
         assert_eq!(
             workflow.nodes.iter().filter(|n| n.kind == NodeKind::Application).count(),
             8

@@ -5,20 +5,23 @@ import { FolderOpen, Play, Trash2 } from "lucide-vue-next";
 
 import { api } from "@/api";
 import type { WorkflowNode } from "@/api";
-import BaseBadge from "@/modules/components/ui/BaseBadge.vue";
 import BaseButton from "@/modules/components/ui/BaseButton.vue";
 import FormField from "@/modules/components/ui/FormField.vue";
-import { inputClass, textareaClass } from "@/modules/components/ui/form";
+import {
+  inputClass,
+  selectClass,
+  textareaClass,
+} from "@/modules/components/ui/form";
 import { useI18n } from "@/modules/locales";
 import { useUiStore } from "@/modules/stores/ui";
 import { useWorkflowStore } from "@/modules/stores/workflows";
 import { formatDuration } from "@/modules/utils/format";
-import { nodeStatusVariant } from "@/modules/utils/status";
 
 import { nodeKindMeta } from "./meta";
 import NumberField from "./NumberField.vue";
 import { errorText, fieldGroupClass, sectionLabelClass } from "./shared";
 import ToggleRow from "./ToggleRow.vue";
+import WorkflowStatusBadge from "./WorkflowStatusBadge.vue";
 
 const props = defineProps<{ node: WorkflowNode }>();
 const emit = defineEmits<{ delete: [] }>();
@@ -106,6 +109,36 @@ const runDuration = computed(() => {
   return formatDuration(Math.max(0, (finished - started) / 1000));
 });
 
+/** 可选的「所属分组」：排除自己以及自己的后代（避免形成环）。 */
+const groupOptions = computed(() => {
+  const draft = store.draft;
+  if (!draft) return [];
+  const groups = draft.nodes.filter((node) => node.kind === "group");
+  if (props.node.kind !== "group") return groups;
+
+  const forbidden = new Set<string>([props.node.id]);
+  const collect = (groupId: string) => {
+    for (const node of draft.nodes) {
+      if (node.parentId !== groupId || forbidden.has(node.id)) continue;
+      forbidden.add(node.id);
+      collect(node.id);
+    }
+  };
+  collect(props.node.id);
+  return groups.filter((group) => !forbidden.has(group.id));
+});
+
+const childCount = computed(
+  () =>
+    store.draft?.nodes.filter((node) => node.parentId === props.node.id).length ??
+    0,
+);
+
+function onParentChange(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  props.node.parentId = value ? value : null;
+}
+
 async function browsePath() {
   try {
     const selected = await open({
@@ -184,13 +217,7 @@ async function testLaunch() {
     <div v-if="runState" :class="fieldGroupClass" class="space-y-1.5">
       <div class="flex items-center justify-between gap-2">
         <span :class="sectionLabelClass">{{ t("overview.lastRun") }}</span>
-        <BaseBadge
-          :variant="nodeStatusVariant(runState.status)"
-          dot
-          :pulse="runState.status === 'running'"
-        >
-          {{ t(`status.${runState.status}`) }}
-        </BaseBadge>
+        <WorkflowStatusBadge :status="runState.status" />
       </div>
       <p
         v-if="runState.message"
@@ -215,6 +242,21 @@ async function testLaunch() {
       :label="t('node.enabled')"
       :hint="props.node.enabled ? t('node.enabledHint') : t('workflow.disabledNode')"
     />
+
+    <!-- 所属分组（分组节点也可以嵌套到另一个分组里） -->
+    <FormField :label="t('node.parentGroup')">
+      <select
+        :value="props.node.parentId ?? ''"
+        :class="selectClass"
+        class="text-xs!"
+        @change="onParentChange"
+      >
+        <option value="">{{ t("node.parentGroupNone") }}</option>
+        <option v-for="group in groupOptions" :key="group.id" :value="group.id">
+          {{ group.name || t("node.kind.group") }}
+        </option>
+      </select>
+    </FormField>
 
     <!-- 类型专属字段 -->
     <div class="space-y-3 border-t border-zinc-200/80 pt-3 dark:border-zinc-800/80">
@@ -305,7 +347,7 @@ async function testLaunch() {
         />
       </template>
 
-      <template v-else>
+      <template v-else-if="props.node.kind === 'script'">
         <FormField :label="t('node.scriptCommand')" :hint="t('node.scriptCommandHint')">
           <textarea v-model="props.node.script.command" :class="textareaClass" rows="3" spellcheck="false" />
         </FormField>
@@ -321,6 +363,26 @@ async function testLaunch() {
           v-model="props.node.script.failOnNonzero"
           :label="t('node.scriptFailOnNonzero')"
         />
+      </template>
+
+      <template v-else>
+        <p class="text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-400">
+          {{ t("node.groupHint") }}
+        </p>
+        <ToggleRow
+          v-model="props.node.groupParallel"
+          :label="t('node.groupParallel')"
+          :hint="t('node.groupParallelHint')"
+        />
+        <div
+          :class="fieldGroupClass"
+          class="flex items-center justify-between gap-2 text-[11px] text-zinc-500 dark:text-zinc-400"
+        >
+          <span>{{ t("common.count") }}</span>
+          <span class="tabular">
+            {{ t("workflow.nodeCount", { count: childCount }) }}
+          </span>
+        </div>
       </template>
     </div>
 

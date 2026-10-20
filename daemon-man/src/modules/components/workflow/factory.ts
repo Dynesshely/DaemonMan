@@ -9,6 +9,7 @@ import type {
 } from "@/api";
 
 import type { FlowEdgeData, FlowNodeData } from "./types";
+import { DEFAULT_GROUP_HEIGHT, DEFAULT_GROUP_WIDTH } from "./layout";
 
 /** crypto.randomUUID 的降级实现（与 store 中的 uuid 保持一致的行为）。 */
 export function createNodeId(): string {
@@ -63,16 +64,42 @@ export function createWorkflowNode(
       failOnNonzero: true,
     },
     note: "",
+    parentId: null,
+    groupParallel: false,
   };
 }
 
-/** draft 中的节点 -> 画布节点（type 直接用 kind，配合四个自定义节点槽位）。 */
-export function buildFlowNode(node: WorkflowNode): Node<FlowNodeData> {
-  return {
+/** draft 中的节点 -> 画布节点（type 直接用 kind，配合自定义节点槽位）。 */
+export function buildFlowNode(
+  node: WorkflowNode,
+  groupSize?: { width: number; height: number },
+): Node<FlowNodeData> {
+  const base: Node<FlowNodeData> = {
     id: node.id,
     type: node.kind,
     position: { x: node.position.x, y: node.position.y },
     data: { node },
+  };
+
+  if (node.kind !== "group") return base;
+
+  // 分组节点只是容器背景层：置底、不可拖拽/连线，整块背景不拦截指针事件，
+  // 只有标题栏单独开启 pointer-events，避免遮挡子节点与画布平移。
+  const width = groupSize?.width ?? DEFAULT_GROUP_WIDTH;
+  const height = groupSize?.height ?? DEFAULT_GROUP_HEIGHT;
+  return {
+    ...base,
+    width,
+    height,
+    zIndex: 0,
+    draggable: false,
+    connectable: false,
+    selectable: true,
+    style: {
+      width: `${width}px`,
+      height: `${height}px`,
+      pointerEvents: "none",
+    },
   };
 }
 

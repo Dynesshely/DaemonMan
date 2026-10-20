@@ -58,6 +58,27 @@ fn normalize(mut workflow: Workflow) -> Workflow {
         true
     });
 
+    let group_ids: HashSet<String> = workflow
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Group)
+        .map(|node| node.id.clone())
+        .collect();
+    for node in workflow.nodes.iter_mut() {
+        // 分组节点不参与执行，不能套娃到自身；子节点的 parent 必须指向存在的分组。
+        let invalid_parent = node
+            .parent_id
+            .as_ref()
+            .is_some_and(|parent| !group_ids.contains(parent) || parent == &node.id);
+        if invalid_parent {
+            node.parent_id = None;
+        }
+        if node.kind == NodeKind::Group {
+            node.enabled = true;
+            node.app = AppLaunchSpec::default();
+        }
+    }
+
     workflow.touch();
     workflow
 }
@@ -84,6 +105,7 @@ fn default_node_name(node: &WorkflowNode) -> String {
             }
         }
         NodeKind::Script => "执行命令".into(),
+        NodeKind::Group => "新分组".into(),
     }
 }
 
@@ -176,6 +198,12 @@ pub fn duplicate_workflow(
         let new_id = uuid::Uuid::new_v4().to_string();
         id_map.insert(node.id.clone(), new_id.clone());
         node.id = new_id;
+    }
+    // 分组归属也要跟着重映射到新 id。
+    for node in copy.nodes.iter_mut() {
+        if let Some(parent) = node.parent_id.clone() {
+            node.parent_id = id_map.get(&parent).cloned();
+        }
     }
     for edge in copy.edges.iter_mut() {
         edge.id = uuid::Uuid::new_v4().to_string();

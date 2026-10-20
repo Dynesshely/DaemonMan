@@ -6,6 +6,14 @@
 //! - 全部入边都放行后节点才可执行；没有入边的节点在运行开始时并行启动；
 //! - 只要有入边被确定永远无法满足（例如上游成功但要求 failure 边），节点立即跳过。
 //!
+//! 两类节点完全不参与执行：`NodeKind::Group`（只用于展示，`build_plan` 与
+//! `build_initial_run` 都会排除，涉及它的连线在依赖判定中被忽略）；`enabled == false`
+//! 的节点会被跳过（对下游算成功）。
+//!
+//! 「已运行则跳过」是两级开关：`workflow.skip_existing_processes && node.app.skip_if_running`
+//! （见 [`skip_existing_enabled`]）。生效且进程确实在运行时，节点状态是
+//! [`NodeStatus::SkippedExisting`]，对下游等同成功；工作流级开关关闭时一定会真正启动。
+//!
 //! 并发由 `settings.max_concurrency` 控制（`tokio::sync::Semaphore`）；每个节点整体包裹在
 //! `tokio::time::timeout` 中，但超时值按节点类型计算（见 [`effective_timeout`]），避免
 //! 「延迟 30s+」「等待进程 60s」这类本身有明确时长的节点被全局默认值误判失败；
@@ -65,11 +73,13 @@ pub enum UpstreamOutcome {
 }
 
 /// 节点执行的内部结果，比 [`NodeStatus`] 多一层调度语义：
+/// - `SkippedExisting` 表示进程已在运行而跳过启动，对下游等同于成功；
 /// - `Disabled` 表示节点被用户禁用，对下游等同于成功（不阻断流程）；
 /// - `Skipped` 表示因为依赖条件不满足而跳过，对下游等同于失败（继续沿失败边传播）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeOutcome {
     Success,
+    SkippedExisting,
     Failed,
     Skipped,
     Disabled,
@@ -79,7 +89,9 @@ pub enum NodeOutcome {
 impl NodeOutcome {
     pub fn upstream(self) -> UpstreamOutcome {
         match self {
-            NodeOutcome::Success | NodeOutcome::Disabled => UpstreamOutcome::Success,
+            NodeOutcome::Success | NodeOutcome::SkippedExisting | NodeOutcome::Disabled => {
+                UpstreamOutcome::Success
+            }
             NodeOutcome::Failed | NodeOutcome::Skipped | NodeOutcome::Cancelled => {
                 UpstreamOutcome::Failed
             }
@@ -104,6 +116,13 @@ pub enum Readiness {
     Waiting,
     /// 可以确定某条入边永远无法满足，节点应跳过（消息说明原因）。
     Blocked(String),
+}
+
+/// 是否启用「已运行则跳过」：工作流级开关与节点级开关同时为真。
+///
+/// 工作流级开关为 false 时，无论节点如何配置都必须真正执行启动。
+pub fn skip_existing_enabled(workflow_skip: bool, node_skip: bool) -> bool {
+    workflow_skip && node_skip
 }
 
 /// 单条入边是否放行。
@@ -154,6 +173,7 @@ pub fn evaluate_readiness(
 fn describe_outcome(outcome: NodeOutcome) -> &'static str {
     match outcome {
         NodeOutcome::Success => "执行成功",
+        NodeOutcome::SkippedExisting => "已在运行，跳过启动",
         NodeOutcome::Failed => "执行失败",
         NodeOutcome::Skipped => "被跳过",
         NodeOutcome::Disabled => "已禁用",
@@ -280,6 +300,10 @@ fn build_initial_run(workflow: &Workflow, run_id: &str, trigger: RunTrigger) -> 
         nodes: HashMap::new(),
     };
     for node in &workflow.nodes {
+        // 分组节点只用于展示，不进入运行状态表。
+        if node.kind == NodeKind::Group {
+            continue;
+        }
         run.nodes.insert(
             node.id.clone(),
             NodeRunState {
@@ -448,13 +472,27 @@ struct PlannedNode {
 }
 
 fn build_plan(workflow: &Workflow) -> Vec<PlannedNode> {
+    // 分组节点不参与依赖：以它为上游的连线在依赖判定里必须被忽略，
+    // 否则下游会一直等待一个永远不会产生的 outcome。
+    let group_ids: HashSet<&str> = workflow
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Group)
+        .map(|node| node.id.as_str())
+        .collect();
+
     workflow
         .nodes
         .iter()
+        // 分组节点不执行、不参与调度。
+        .filter(|node| node.kind != NodeKind::Group)
         .map(|node| {
             let mut seen: HashSet<(String, EdgeCondition)> = HashSet::new();
             let mut incoming = Vec::new();
             for edge in workflow.edges.iter().filter(|edge| edge.target == node.id) {
+                if group_ids.contains(edge.source.as_str()) {
+                    continue;
+                }
                 if !seen.insert((edge.source.clone(), edge.condition)) {
                     continue;
                 }
@@ -497,9 +535,12 @@ async fn run_task(
     let disabled_ids: HashSet<String> = workflow
         .nodes
         .iter()
-        .filter(|node| !node.enabled)
+        .filter(|node| !node.enabled && node.kind != NodeKind::Group)
         .map(|node| node.id.clone())
         .collect();
+
+    // 工作流级「跳过已存在进程」开关：与节点级开关按逻辑与合并后传给 launcher。
+    let skip_existing_processes = workflow.skip_existing_processes;
 
     state.log(
         &app,
@@ -509,7 +550,11 @@ async fn run_task(
         Some(format!(
             "runId={run_id}，触发={:?}，节点={}",
             request.trigger,
-            workflow.nodes.len()
+            workflow
+                .nodes
+                .iter()
+                .filter(|node| node.kind != NodeKind::Group)
+                .count()
         )),
     );
 
@@ -542,6 +587,20 @@ async fn run_task(
     let node_timeout_ms = settings.default_node_timeout_ms;
 
     let planned = build_plan(&workflow);
+    if planned.is_empty() {
+        // 只有分组节点的极端情况（workflow.nodes 里全是 Group）。
+        sink.finish(RunStatus::Success, "工作流只有分组节点，无需执行");
+        state.log(
+            &app,
+            LogLevel::Success,
+            "workflow",
+            format!("工作流「{workflow_name}」执行完成（只有分组节点）"),
+            Some(format!("runId={run_id}")),
+        );
+        state.release_run_flag(&run_id);
+        return;
+    }
+
     let mut outcomes: HashMap<String, NodeOutcome> = HashMap::new();
     let mut settled: HashSet<String> = HashSet::new();
     let mut dispatched: HashSet<String> = HashSet::new();
@@ -634,6 +693,7 @@ async fn run_task(
                             &node,
                             &task_cancel,
                             node_timeout_ms,
+                            skip_existing_processes,
                         )
                         .await
                         {
@@ -642,12 +702,17 @@ async fn run_task(
                                 pid,
                                 already_running,
                             } => {
-                                task_sink.node_finished(
-                                    &node_id,
-                                    NodeStatus::Success,
-                                    message.clone(),
-                                    pid,
+                                // 已在运行 → SkippedExisting（界面独特颜色），对下游算成功。
+                                let (status, outcome) = if already_running {
+                                    (NodeStatus::SkippedExisting, NodeOutcome::SkippedExisting)
+                                } else {
+                                    (NodeStatus::Success, NodeOutcome::Success)
+                                };
+                                debug_assert!(
+                                    status.is_success(),
+                                    "SkippedExisting 与 Success 都属于成功终态"
                                 );
+                                task_sink.node_finished(&node_id, status, message.clone(), pid);
                                 task_state.log(
                                     &task_app,
                                     if already_running {
@@ -659,7 +724,7 @@ async fn run_task(
                                     format!("节点「{}」完成", graph::node_label(&node)),
                                     Some(format!("{message}（run {task_run}）")),
                                 );
-                                NodeOutcome::Success
+                                outcome
                             }
                             NodeExec::Failed { message } => {
                                 task_sink.node_finished(
@@ -838,9 +903,12 @@ fn timeout_buffer_ms(expected_ms: u64) -> u64 {
 /// - `Delay`：`delay_ms + 缓冲`（缓冲 = `max(5s, delay_ms / 10)`）；
 /// - `Wait`：`wait.timeout_ms + 缓冲` 与 `default_node_timeout_ms` 取较大者；
 ///   自身 `timeout_ms` 为 0（不设限）时退回 `default_node_timeout_ms`；
-/// - `Script`：`script.timeout_ms + 5s`；脚本自身不限时退回 `default_node_timeout_ms`。
+/// - `Script`：`script.timeout_ms + 5s`；脚本自身不限时退回 `default_node_timeout_ms`；
+/// - `Group`：分组节点不执行，始终返回 0。
 pub fn effective_timeout(node: &WorkflowNode, default_node_timeout_ms: u64) -> u64 {
     match node.kind {
+        // 分组节点不参与执行，不存在超时；返回 0 只是让函数对全部 kind 有定义。
+        NodeKind::Group => 0,
         NodeKind::Application => {
             if default_node_timeout_ms == 0 {
                 0
@@ -890,9 +958,10 @@ async fn run_node_with_timeout(
     node: &WorkflowNode,
     cancel: &Arc<AtomicBool>,
     node_timeout_ms: u64,
+    skip_existing_processes: bool,
 ) -> NodeExec {
     let effective = effective_timeout(node, node_timeout_ms);
-    let execution = execute_node(node, cancel);
+    let execution = execute_node(node, cancel, skip_existing_processes);
 
     // 0 表示不限制：不包 timeout。
     if effective == 0 {
@@ -913,24 +982,43 @@ async fn run_node_with_timeout(
     }
 }
 
-async fn execute_node(node: &WorkflowNode, cancel: &Arc<AtomicBool>) -> NodeExec {
+async fn execute_node(
+    node: &WorkflowNode,
+    cancel: &Arc<AtomicBool>,
+    skip_existing_processes: bool,
+) -> NodeExec {
     match node.kind {
-        NodeKind::Application => match launcher::launch_spec(&node.app, cancel).await {
-            Ok(outcome) => NodeExec::Success {
-                message: outcome.message,
-                pid: outcome.pid,
-                already_running: outcome.already_running,
-            },
-            Err(err) => {
-                if is_cancelled(cancel) {
-                    NodeExec::Cancelled
-                } else {
-                    NodeExec::Failed {
-                        message: err.to_string(),
+        // 分组节点不进入调度（`build_plan` 与 `build_initial_run` 都已排除），
+        // 这里是穷尽 match 的防御分支：真被送进来也按「不执行、不阻断下游」处理。
+        NodeKind::Group => {
+            debug_assert!(false, "分组节点不应进入执行调度");
+            NodeExec::Success {
+                message: "分组节点不参与执行，已忽略".to_string(),
+                pid: None,
+                already_running: false,
+            }
+        }
+        NodeKind::Application => {
+            // 工作流级开关关闭时，无论节点怎么配置都真正执行启动。
+            let skip_existing =
+                skip_existing_enabled(skip_existing_processes, node.app.skip_if_running);
+            match launcher::launch_spec(&node.app, cancel, skip_existing).await {
+                Ok(outcome) => NodeExec::Success {
+                    message: outcome.message,
+                    pid: outcome.pid,
+                    already_running: outcome.already_running,
+                },
+                Err(err) => {
+                    if is_cancelled(cancel) {
+                        NodeExec::Cancelled
+                    } else {
+                        NodeExec::Failed {
+                            message: err.to_string(),
+                        }
                     }
                 }
             }
-        },
+        }
         NodeKind::Delay => execute_delay(node, cancel).await,
         NodeKind::Wait => execute_wait(node, cancel).await,
         NodeKind::Script => execute_script(&node.script, cancel).await,
@@ -1158,12 +1246,46 @@ mod tests {
     #[test]
     fn outcome_mapping_matches_scheduling_semantics() {
         assert_eq!(NodeOutcome::Success.upstream(), UpstreamOutcome::Success);
+        // 已在运行跳过启动 → 对下游等同成功
+        assert_eq!(
+            NodeOutcome::SkippedExisting.upstream(),
+            UpstreamOutcome::Success
+        );
         // 禁用节点不阻断流程
         assert_eq!(NodeOutcome::Disabled.upstream(), UpstreamOutcome::Success);
         assert_eq!(NodeOutcome::Failed.upstream(), UpstreamOutcome::Failed);
         // 被跳过的节点继续沿失败方向传播
         assert_eq!(NodeOutcome::Skipped.upstream(), UpstreamOutcome::Failed);
         assert_eq!(NodeOutcome::Cancelled.upstream(), UpstreamOutcome::Failed);
+    }
+
+    #[test]
+    fn skipped_existing_satisfies_success_edge_only() {
+        let upstream = NodeOutcome::SkippedExisting.upstream();
+        assert!(edge_allows(EdgeCondition::Success, upstream));
+        assert!(!edge_allows(EdgeCondition::Failure, upstream));
+        assert!(edge_allows(EdgeCondition::Always, upstream));
+        // 与 model 的语义判断保持一致
+        assert!(NodeStatus::SkippedExisting.is_success());
+    }
+
+    #[test]
+    fn readiness_ready_after_skipped_existing_upstream() {
+        let edges = vec![incoming("a", EdgeCondition::Success)];
+        let result = evaluate_readiness(
+            &edges,
+            &outcomes(&[("a", NodeOutcome::SkippedExisting)]),
+        );
+        assert_eq!(result, Readiness::Ready);
+    }
+
+    #[test]
+    fn skip_existing_requires_both_switches() {
+        assert!(skip_existing_enabled(true, true));
+        // 工作流级开关关闭 → 绝不跳过
+        assert!(!skip_existing_enabled(false, true));
+        assert!(!skip_existing_enabled(true, false));
+        assert!(!skip_existing_enabled(false, false));
     }
 
     #[test]
@@ -1237,6 +1359,15 @@ mod tests {
         }
     }
 
+    fn group_node(id: &str) -> WorkflowNode {
+        WorkflowNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: NodeKind::Group,
+            ..Default::default()
+        }
+    }
+
     fn edge(source: &str, target: &str, condition: EdgeCondition) -> WorkflowEdge {
         WorkflowEdge {
             id: format!("{source}->{target}"),
@@ -1273,6 +1404,41 @@ mod tests {
         };
         let run = build_initial_run(&workflow, "run-2", RunTrigger::Startup);
         assert_eq!(run.workflow_name, "未命名工作流");
+    }
+
+    #[test]
+    fn initial_run_excludes_group_nodes() {
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![node("a"), group_node("g"), node("b")],
+            ..Default::default()
+        };
+        let run = build_initial_run(&workflow, "run-3", RunTrigger::Manual);
+        // 分组节点不进入运行状态表。
+        assert_eq!(run.nodes.len(), 2);
+        assert!(!run.nodes.contains_key("g"));
+        assert!(run.nodes.contains_key("a") && run.nodes.contains_key("b"));
+    }
+
+    #[test]
+    fn plan_excludes_group_nodes() {
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![node("a"), group_node("g"), node("b")],
+            edges: vec![
+                edge("a", "g", EdgeCondition::Success),
+                edge("g", "b", EdgeCondition::Success),
+            ],
+            ..Default::default()
+        };
+        let plan = build_plan(&workflow);
+        assert_eq!(plan.len(), 2);
+        assert!(plan.iter().all(|p| p.node.kind != NodeKind::Group));
+        // 指向分组节点的连线不会变成依赖（连线在 graph 校验层已被忽略）。
+        let b = plan.iter().find(|p| p.node.id == "b").unwrap();
+        assert!(b.incoming.is_empty());
     }
 
     #[test]

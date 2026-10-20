@@ -197,7 +197,13 @@ function onDeleteNode() {
   if (canvas) {
     canvas.removeNodeById(id);
   } else if (store.draft) {
-    // 文本视图下画布是卸载的，直接从 draft 删除。
+    // 文本视图下画布是卸载的，直接从 draft 删除；删除分组只解绑子项。
+    const target = store.draft.nodes.find((node) => node.id === id);
+    if (target?.kind === "group") {
+      for (const node of store.draft.nodes) {
+        if (node.parentId === id) node.parentId = null;
+      }
+    }
     store.draft.nodes = store.draft.nodes.filter((node) => node.id !== id);
     store.draft.edges = store.draft.edges.filter(
       (edge) => edge.source !== id && edge.target !== id,

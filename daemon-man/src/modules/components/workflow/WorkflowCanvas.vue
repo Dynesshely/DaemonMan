@@ -18,7 +18,13 @@ import {
 import { Background } from "@vue-flow/additional-components";
 import { GitBranch, LayoutGrid, Maximize2, Minus, Plus } from "lucide-vue-next";
 
-import type { NodeKind, NodePosition, Workflow, WorkflowEdge } from "@/api";
+import type {
+  NodeKind,
+  NodePosition,
+  Workflow,
+  WorkflowEdge,
+  WorkflowNode,
+} from "@/api";
 import BaseButton from "@/modules/components/ui/BaseButton.vue";
 import EmptyState from "@/modules/components/ui/EmptyState.vue";
 import { useI18n } from "@/modules/locales";
@@ -28,7 +34,22 @@ import { useWorkflowStore } from "@/modules/stores/workflows";
 
 import WorkflowEdgeLine from "./edges/WorkflowEdgeLine.vue";
 import { buildFlowEdge, buildFlowNode, createWorkflowNode, edgeIdFor } from "./factory";
+import {
+  DEFAULT_GROUP_HEIGHT,
+  DEFAULT_GROUP_WIDTH,
+  GROUP_HEADER,
+  GROUP_PADDING,
+  NODE_HEIGHT,
+  NODE_WIDTH,
+  PARALLEL_COLUMNS,
+  PARALLEL_GAP_X,
+  PARALLEL_GAP_Y,
+  SEQUENTIAL_GAP_Y,
+  computeAutoLayout,
+  computeGroupSizes,
+} from "./layout";
 import { nodeKindMeta, nodeKindOrder } from "./meta";
+import WorkflowGroupNode from "./nodes/WorkflowGroupNode.vue";
 import WorkflowNodeCard from "./nodes/WorkflowNodeCard.vue";
 import type { WorkflowSelection } from "./types";
 
@@ -79,6 +100,332 @@ const gridColor = computed(() => (theme.isDark ? "#27272a" : "#e4e4e7"));
 /** 固定引用，避免每次渲染都生成新对象 / 数组导致 Vue Flow 重复应用 props。 */
 const DEFAULT_VIEWPORT = { zoom: 1 };
 const DELETE_KEYS = ["Delete", "Backspace"];
+
+interface GroupBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** 分组容器的最新边界（由子节点位置/尺寸推导）。 */
+const groupBoxes = ref<Map<string, GroupBox>>(new Map());
+
+/** 上一次的结构快照，用于识别「子项被加入/移出分组」「并行开关变化」。 */
+const lastGroupSignature = new Map<string, string>();
+const lastParentOf = new Map<string, string | null>();
+
+let geometryFrame = 0;
+
+function flowPositionOf(node: WorkflowNode): NodePosition {
+  const flow = findNode(node.id);
+  return flow
+    ? { x: flow.position.x, y: flow.position.y }
+    : { x: node.position.x, y: node.position.y };
+}
+
+function measuredSizeOf(node: WorkflowNode): { width: number; height: number } {
+  const flow = findNode(node.id);
+  const width = flow?.dimensions?.width ?? 0;
+  const height = flow?.dimensions?.height ?? 0;
+  return {
+    width: width > 0 ? width : NODE_WIDTH,
+    height: height > 0 ? height : NODE_HEIGHT,
+  };
+}
+
+/** 依据子节点（含嵌套分组）实际位置计算所有分组容器的边界。 */
+function computeGroupBoxes(): Map<string, GroupBox> {
+  const draft = store.draft;
+  const result = new Map<string, GroupBox>();
+  if (!draft) return result;
+
+  const groups = draft.nodes.filter((node) => node.kind === "group");
+  const groupIds = new Set(groups.map((group) => group.id));
+  const childrenOf = new Map<string, WorkflowNode[]>();
+  for (const node of draft.nodes) {
+    const parentId = node.parentId;
+    if (!parentId || parentId === node.id || !groupIds.has(parentId)) continue;
+    const bucket = childrenOf.get(parentId);
+    if (bucket) bucket.push(node);
+    else childrenOf.set(parentId, [node]);
+  }
+
+  const resolving = new Set<string>();
+
+  function resolve(group: WorkflowNode): GroupBox {
+    const cached = result.get(group.id);
+    if (cached) return cached;
+    const stored: GroupBox = {
+      x: Math.round(group.position.x),
+      y: Math.round(group.position.y),
+      width: DEFAULT_GROUP_WIDTH,
+      height: DEFAULT_GROUP_HEIGHT,
+    };
+    // parentId 成环（非法结构）时停止递归，避免死循环。
+    if (resolving.has(group.id)) return stored;
+    resolving.add(group.id);
+
+    const children = childrenOf.get(group.id) ?? [];
+    if (children.length === 0) {
+      resolving.delete(group.id);
+      result.set(group.id, stored);
+      return stored;
+    }
+
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+
+    for (const child of children) {
+      const box =
+        child.kind === "group"
+          ? resolve(child)
+          : (() => {
+              const position = flowPositionOf(child);
+              const size = measuredSizeOf(child);
+              return {
+                x: position.x,
+                y: position.y,
+                width: size.width,
+                height: size.height,
+              };
+            })();
+      minX = Math.min(minX, box.x);
+      minY = Math.min(minY, box.y);
+      maxX = Math.max(maxX, box.x + box.width);
+      maxY = Math.max(maxY, box.y + box.height);
+    }
+
+    const box: GroupBox = {
+      x: Math.round(minX - GROUP_PADDING),
+      y: Math.round(minY - GROUP_HEADER - GROUP_PADDING),
+      width: Math.round(maxX - minX + GROUP_PADDING * 2),
+      height: Math.round(maxY - minY + GROUP_HEADER + GROUP_PADDING * 2),
+    };
+    resolving.delete(group.id);
+    result.set(group.id, box);
+    return box;
+  }
+
+  for (const group of groups) resolve(group);
+  return result;
+}
+
+/** 把分组边界同步到 Vue Flow 节点（位置 / 尺寸，仅 store，不写 draft）。 */
+function updateGroupGeometry() {
+  const draft = store.draft;
+  if (!draft) return;
+  const boxes = computeGroupBoxes();
+  groupBoxes.value = boxes;
+
+  for (const group of draft.nodes) {
+    if (group.kind !== "group") continue;
+    const box = boxes.get(group.id);
+    if (!box) continue;
+    const current = findNode(group.id);
+    const unchanged =
+      current &&
+      Math.round(current.position.x) === box.x &&
+      Math.round(current.position.y) === box.y &&
+      Math.round(current.dimensions.width) === box.width &&
+      Math.round(current.dimensions.height) === box.height;
+    if (unchanged) continue;
+    updateNode(group.id, {
+      position: { x: box.x, y: box.y },
+      width: box.width,
+      height: box.height,
+      style: {
+        width: `${box.width}px`,
+        height: `${box.height}px`,
+        pointerEvents: "none",
+      },
+    });
+  }
+}
+
+/** 把分组边界回写到 draft（拖动结束 / 自动排列 / 结构变化后调用）。 */
+function persistGroupPositions() {
+  const draft = store.draft;
+  if (!draft) return;
+  for (const group of draft.nodes) {
+    if (group.kind !== "group") continue;
+    const box = groupBoxes.value.get(group.id);
+    if (!box) continue;
+    if (
+      Math.round(group.position.x) === box.x &&
+      Math.round(group.position.y) === box.y
+    ) {
+      continue;
+    }
+    group.position = { x: box.x, y: box.y };
+  }
+}
+
+/** 拖动子节点等高频场景：按帧合并，避免每个 mousemove 都写 store。 */
+function scheduleGroupGeometry() {
+  if (unmounted || geometryFrame) return;
+  geometryFrame = window.requestAnimationFrame(() => {
+    geometryFrame = 0;
+    if (unmounted) return;
+    updateGroupGeometry();
+  });
+}
+
+/** 在分组现有边界内重新摆放其直接子项（顺序纵向 / 并行三列网格），嵌套分组递归处理。 */
+function layoutChildrenOf(
+  group: WorkflowNode,
+  origin?: { x: number; y: number },
+) {
+  const draft = store.draft;
+  if (!draft) return;
+  const box = origin ?? groupBoxes.value.get(group.id);
+  const left = box?.x ?? Math.round(group.position.x);
+  const top = box?.y ?? Math.round(group.position.y);
+  const children = draft.nodes.filter((node) => node.parentId === group.id);
+  const groupSizes = computeGroupSizes(draft.nodes);
+
+  const sizeOf = (child: WorkflowNode) => {
+    if (child.kind === "group") {
+      return (
+        groupSizes.get(child.id) ?? {
+          width: DEFAULT_GROUP_WIDTH,
+          height: DEFAULT_GROUP_HEIGHT,
+        }
+      );
+    }
+    const measured = findNode(child.id)?.dimensions;
+    return {
+      width: measured?.width && measured.width > 0 ? measured.width : NODE_WIDTH,
+      height:
+        measured?.height && measured.height > 0 ? measured.height : NODE_HEIGHT,
+    };
+  };
+
+  let cellWidth = NODE_WIDTH;
+  let cellHeight = NODE_HEIGHT;
+  for (const child of children) {
+    const size = sizeOf(child);
+    cellWidth = Math.max(cellWidth, size.width);
+    cellHeight = Math.max(cellHeight, size.height);
+  }
+
+  let offsetY = 0;
+  children.forEach((child, index) => {
+    const size = sizeOf(child);
+    const position: NodePosition = group.groupParallel
+      ? {
+          x:
+            left +
+            GROUP_PADDING +
+            (index % PARALLEL_COLUMNS) * (cellWidth + PARALLEL_GAP_X),
+          y:
+            top +
+            GROUP_HEADER +
+            GROUP_PADDING +
+            Math.floor(index / PARALLEL_COLUMNS) * (cellHeight + PARALLEL_GAP_Y),
+        }
+      : {
+          x: left + GROUP_PADDING,
+          y: top + GROUP_HEADER + GROUP_PADDING + offsetY,
+        };
+    if (!group.groupParallel) {
+      offsetY += size.height + SEQUENTIAL_GAP_Y;
+    }
+    if (child.position.x !== position.x || child.position.y !== position.y) {
+      child.position = position;
+    }
+    updateNode(child.id, { position });
+  });
+
+  // 嵌套分组：子分组的内部节点跟随新位置重排（否则会留在旧坐标导致容器异常膨大）。
+  for (const child of children) {
+    if (child.kind !== "group") continue;
+    layoutChildrenOf(child, {
+      x: Math.round(child.position.x),
+      y: Math.round(child.position.y),
+    });
+  }
+}
+
+/**
+ * 载入/切换工作流时建立结构快照（不做任何 draft 写入，避免一打开就变成「未保存」），
+ * 只把派生出的分组边界同步到画布。
+ */
+function primeGroupState() {
+  const draft = store.draft;
+  if (!draft) return;
+
+  lastGroupSignature.clear();
+  lastParentOf.clear();
+
+  const groups = draft.nodes.filter((node) => node.kind === "group");
+  const groupIds = new Set(groups.map((group) => group.id));
+  for (const group of groups) {
+    const children = draft.nodes.filter((node) => node.parentId === group.id);
+    lastGroupSignature.set(
+      group.id,
+      `${group.groupParallel ? "p" : "s"}:${children
+        .map((child) => child.id)
+        .join(",")}`,
+    );
+  }
+  for (const node of draft.nodes) {
+    const parent =
+      node.parentId && node.parentId !== node.id && groupIds.has(node.parentId)
+        ? node.parentId
+        : null;
+    lastParentOf.set(node.id, parent);
+  }
+
+  updateGroupGeometry();
+}
+
+/**
+ * 结构变化（增删节点、切换分组归属、并行开关）后：
+ * 1. 新加入分组的节点 / 并行开关变化的组，在组内重新摆位；
+ * 2. 重算并持久化分组边界。
+ */
+function syncGroupStructure() {
+  const draft = store.draft;
+  if (!draft) return;
+
+  const groups = draft.nodes.filter((node) => node.kind === "group");
+  const groupIds = new Set(groups.map((group) => group.id));
+
+  for (const group of groups) {
+    const children = draft.nodes.filter((node) => node.parentId === group.id);
+    const signature = `${group.groupParallel ? "p" : "s"}:${children
+      .map((child) => child.id)
+      .join(",")}`;
+    const prev = lastGroupSignature.get(group.id);
+    if (prev !== undefined && prev !== signature) {
+      layoutChildrenOf(group);
+    }
+    lastGroupSignature.set(group.id, signature);
+  }
+  for (const id of Array.from(lastGroupSignature.keys())) {
+    if (!groupIds.has(id)) lastGroupSignature.delete(id);
+  }
+
+  for (const node of draft.nodes) {
+    const prev = lastParentOf.get(node.id) ?? null;
+    const next =
+      node.parentId && node.parentId !== node.id && groupIds.has(node.parentId)
+        ? node.parentId
+        : null;
+    lastParentOf.set(node.id, next);
+    if (prev === next) continue;
+    if (next) {
+      const group = draft.nodes.find((item) => item.id === next);
+      if (group) layoutChildrenOf(group);
+    }
+  }
+
+  updateGroupGeometry();
+  persistGroupPositions();
+}
 
 /** 上一次重建时的 draft id，用于判断是否需要 fitView。 */
 let lastDraftId: string | null = null;
@@ -148,7 +495,20 @@ function rebuildFromDraft(next: Workflow | null) {
   const selectedNodeIds = getSelectedNodes.value.map((node) => node.id);
   const selectedEdgeIds = getSelectedEdges.value.map((edge) => edge.id);
 
-  flowNodes.value = next.nodes.map((node) => buildFlowNode(node));
+  lastGroupSignature.clear();
+  lastParentOf.clear();
+  groupBoxes.value = new Map();
+
+  // 分组节点必须先创建并带上尺寸：Vue Flow 需要量测到尺寸才会显示节点，
+  // 若是 0×0 就会一直 visibility:hidden，容器背景不可见。
+  const initialBoxes = computeGroupBoxes();
+  const orderedNodes = [
+    ...next.nodes.filter((node) => node.kind === "group"),
+    ...next.nodes.filter((node) => node.kind !== "group"),
+  ];
+  flowNodes.value = orderedNodes.map((node) =>
+    buildFlowNode(node, initialBoxes.get(node.id)),
+  );
   flowEdges.value = next.edges.map((edge) => buildFlowEdge(edge, theme.isDark));
 
   void nextTick(() => {
@@ -166,6 +526,10 @@ function rebuildFromDraft(next: Workflow | null) {
       addSelectedEdges(edges);
     }
 
+    // 建立结构快照 + 计算分组容器边界（首次量测后还会再刷新一次）。
+    primeGroupState();
+    scheduleGroupGeometry();
+
     if (idChanged && next.nodes.length > 0) {
       fitWhenReady();
     }
@@ -177,17 +541,28 @@ function rebuildFromDraft(next: Workflow | null) {
 // 字段级编辑通过 data.node 引用直接反映，不需要重建画布（也就不会打断拖拽）。
 watch(() => store.draft, (next) => rebuildFromDraft(next), { immediate: true });
 
-// 节点类型切换：kind 就是画布节点 type，直接就地更新 store 中的节点。
+// 节点类型切换：kind 就是画布节点 type，直接就地更新 store 中的节点；
+// 同时检测分组归属 / 并行开关变化，触发组内重排与容器边界重算。
 watch(
-  () => (store.draft?.nodes ?? []).map((node) => `${node.id}:${node.kind}`).join("|"),
+  () =>
+    (store.draft?.nodes ?? [])
+      .map(
+        (node) =>
+          `${node.id}:${node.kind}:${node.parentId ?? "-"}:${
+            node.kind === "group" ? (node.groupParallel ? "p" : "s") : ""
+          }`,
+      )
+      .join("|"),
   () => {
-    if (!store.draft) return;
-    for (const node of store.draft.nodes) {
+    const draft = store.draft;
+    if (!draft) return;
+    for (const node of draft.nodes) {
       const current = findNode(node.id);
       if (current && current.type !== node.kind) {
         updateNode(node.id, { type: node.kind });
       }
     }
+    syncGroupStructure();
   },
 );
 
@@ -240,10 +615,14 @@ function onNodesChange(changes: NodeChange[]) {
     .filter((change): change is NodeRemoveChange => change.type === "remove")
     .map((change) => change.id);
   if (removedIds.length === 0) return;
+  // 删除分组时只解绑子项，不连带删除子节点。
+  removedIds.forEach((id) => unbindGroupChildren(id));
   current.nodes = current.nodes.filter((node) => !removedIds.includes(node.id));
   current.edges = current.edges.filter(
     (edge) => !removedIds.includes(edge.source) && !removedIds.includes(edge.target),
   );
+  scheduleGroupGeometry();
+  void nextTick(() => persistGroupPositions());
 }
 
 function onEdgesChange(changes: EdgeChange[]) {
@@ -256,17 +635,27 @@ function onEdgesChange(changes: EdgeChange[]) {
   current.edges = current.edges.filter((edge) => !removedIds.includes(edge.id));
 }
 
+/** 拖动过程中：分组容器边界跟随子节点实时变化（按帧节流）。 */
+function onNodeDrag(event: NodeDragEvent) {
+  if (event.nodes.some((node) => node.type !== "group")) {
+    scheduleGroupGeometry();
+  }
+}
+
 function onNodeDragStop(event: NodeDragEvent) {
   const current = store.draft;
   if (!current) return;
   for (const dragged of event.nodes) {
     const node = current.nodes.find((item) => item.id === dragged.id);
     if (!node) continue;
+    if (node.kind === "group") continue;
     node.position = {
       x: Math.round(dragged.position.x),
       y: Math.round(dragged.position.y),
     };
   }
+  updateGroupGeometry();
+  persistGroupPositions();
 }
 
 /** 新节点落在视口中心附近，并按已有节点数量做一点错位。 */
@@ -289,24 +678,45 @@ function addNode(kind: NodeKind) {
   const meta = nodeKindMeta[kind];
   const node = createWorkflowNode(kind, nextNodePosition());
   const index = current.nodes.filter((item) => item.kind === kind).length + 1;
-  node.name = `${t(meta.labelKey)} ${index}`;
+  node.name =
+    kind === "group" ? `新分组 ${index}` : `${t(meta.labelKey)} ${index}`;
   current.nodes.push(node);
   addNodes(buildFlowNode(node));
+  if (kind === "group") {
+    scheduleGroupGeometry();
+    void nextTick(() => persistGroupPositions());
+  }
   void nextTick(() => {
     const added = findNode(node.id);
     if (added) addSelectedNodes([added]);
   });
 }
 
+/** 删除分组时把直接子项的 parentId 置空（子节点保留）。 */
+function unbindGroupChildren(groupId: string) {
+  const current = store.draft;
+  if (!current) return;
+  const group = current.nodes.find((node) => node.id === groupId);
+  if (!group || group.kind !== "group") return;
+  for (const node of current.nodes) {
+    if (node.parentId === groupId) node.parentId = null;
+  }
+  lastGroupSignature.delete(groupId);
+}
+
 function removeNodeById(id: string) {
   const current = store.draft;
   if (current) {
+    unbindGroupChildren(id);
     current.nodes = current.nodes.filter((node) => node.id !== id);
     current.edges = current.edges.filter(
       (edge) => edge.source !== id && edge.target !== id,
     );
+    lastParentOf.delete(id);
   }
   removeNodes([id]);
+  scheduleGroupGeometry();
+  void nextTick(() => persistGroupPositions());
 }
 
 function removeEdgeById(id: string) {
@@ -317,57 +727,23 @@ function removeEdgeById(id: string) {
   removeEdges([id]);
 }
 
-/** 简单分层布局：按入边拓扑层级排布，列间距 280、行间距 120。 */
+/** 分组感知自动排列：未分组节点按执行层分列，顺序分组纵排、并行分组三列紧凑网格。 */
 function autoLayout() {
   const current = store.draft;
   if (!current || current.nodes.length === 0) return;
 
-  const nodeIds = new Set(current.nodes.map((node) => node.id));
-  const indegree = new Map<string, number>();
-  current.nodes.forEach((node) => indegree.set(node.id, 0));
-  current.edges.forEach((edge) => {
-    if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) return;
-    indegree.set(edge.target, (indegree.get(edge.target) ?? 0) + 1);
-  });
-
-  const levels = new Map<string, number>();
-  const remaining = new Map(indegree);
-  const queue = current.nodes
-    .filter((node) => (indegree.get(node.id) ?? 0) === 0)
-    .map((node) => node.id);
-  queue.forEach((id) => levels.set(id, 0));
-
-  while (queue.length > 0) {
-    const id = queue.shift() as string;
-    const level = levels.get(id) ?? 0;
-    for (const edge of current.edges) {
-      if (edge.source !== id || !nodeIds.has(edge.target)) continue;
-      levels.set(edge.target, Math.max(levels.get(edge.target) ?? 0, level + 1));
-      const left = (remaining.get(edge.target) ?? 1) - 1;
-      remaining.set(edge.target, left);
-      if (left <= 0) queue.push(edge.target);
-    }
-  }
-
-  const maxLevel = Math.max(0, ...Array.from(levels.values()));
-  current.nodes.forEach((node) => {
-    if (!levels.has(node.id)) levels.set(node.id, maxLevel + 1);
-  });
-
-  const columnCounts = new Map<number, number>();
+  const positions = computeAutoLayout(current.nodes, current.edges);
   for (const node of current.nodes) {
-    const level = levels.get(node.id) ?? 0;
-    const indexInColumn = columnCounts.get(level) ?? 0;
-    columnCounts.set(level, indexInColumn + 1);
-    const position: NodePosition = {
-      x: 80 + level * 280,
-      y: 60 + indexInColumn * 120,
-    };
+    const position = positions.get(node.id);
+    if (!position) continue;
     node.position = position;
     updateNode(node.id, { position });
   }
 
   void nextTick(() => {
+    // 分组容器以子节点实际位置为准，这里再收敛一次并持久化。
+    updateGroupGeometry();
+    persistGroupPositions();
     fitWhenReady(2);
   });
 }
@@ -391,13 +767,16 @@ defineExpose({ addNode, removeNodeById, removeEdgeById, autoLayout, fitViewToCon
       :delete-key-code="DELETE_KEYS"
       :zoom-on-double-click="false"
       :elevate-edges-on-select="true"
+      :elevate-nodes-on-select="false"
       :edges-updatable="false"
       :default-marker-color="theme.isDark ? '#818cf8' : '#6366f1'"
       @init="onInit"
       @connect="onConnect"
       @nodes-change="onNodesChange"
       @edges-change="onEdgesChange"
+      @node-drag="onNodeDrag"
       @node-drag-stop="onNodeDragStop"
+      @nodes-initialized="scheduleGroupGeometry"
     >
       <template #node-application="nodeProps">
         <WorkflowNodeCard v-bind="nodeProps" />
@@ -410,6 +789,9 @@ defineExpose({ addNode, removeNodeById, removeEdgeById, autoLayout, fitViewToCon
       </template>
       <template #node-script="nodeProps">
         <WorkflowNodeCard v-bind="nodeProps" />
+      </template>
+      <template #node-group="nodeProps">
+        <WorkflowGroupNode v-bind="nodeProps" />
       </template>
       <template #edge-workflow="edgeProps">
         <WorkflowEdgeLine v-bind="edgeProps" />
@@ -432,12 +814,17 @@ defineExpose({ addNode, removeNodeById, removeEdgeById, autoLayout, fitViewToCon
             v-for="kind in nodeKindOrder"
             :key="kind"
             type="button"
-            class="flex flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-1.5 text-left transition hover:border-zinc-200 hover:bg-zinc-50 dark:hover:border-zinc-700 dark:hover:bg-zinc-800/60"
+            class="flex gap-1.5 rounded-lg border border-transparent px-1.5 py-1.5 text-left transition hover:border-zinc-200 hover:bg-zinc-50 dark:hover:border-zinc-700 dark:hover:bg-zinc-800/60"
+            :class="
+              kind === 'group'
+                ? 'col-span-2 items-center border-dashed border-teal-300/70 dark:border-teal-500/30'
+                : 'flex-col items-start'
+            "
             :title="t(nodeKindMeta[kind].hintKey)"
             @click="addNode(kind)"
           >
             <span
-              class="flex h-6 w-6 items-center justify-center rounded-md"
+              class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md"
               :class="nodeKindMeta[kind].iconClass"
             >
               <component :is="nodeKindMeta[kind].icon" class="h-3.5 w-3.5" />

@@ -28,14 +28,27 @@ fn label_of(workflow: &Workflow, id: &str) -> String {
 /// 校验工作流结构，返回错误/警告以及（无环时的）拓扑顺序。
 ///
 /// - `ok` 只在没有任何 error 时为 true；warning 不影响 `ok`。
-/// - `order` 是拓扑序的节点 id；存在重复 id 或环时只包含能够确定顺序的部分。
+/// - `order` 是拓扑序的节点 id（不含分组节点）；存在重复 id 或环时只包含能够确定顺序的部分。
+/// - 分组节点（[`NodeKind::Group`]）只用于展示，不参与执行与依赖关系：不要求 `app.path`，
+///   涉及它的连线会被忽略并给出一条 warning。
 pub fn validate(workflow: &Workflow) -> WorkflowValidation {
     let mut validation = WorkflowValidation::default();
+
+    // 可执行节点：分组节点不进入依赖图。
+    let graph_nodes: Vec<&WorkflowNode> = workflow
+        .nodes
+        .iter()
+        .filter(|node| node.kind != NodeKind::Group)
+        .collect();
 
     if workflow.nodes.is_empty() {
         validation
             .warnings
             .push("工作流没有任何节点，运行时将直接完成".to_string());
+    } else if graph_nodes.is_empty() {
+        validation
+            .warnings
+            .push("工作流只有分组节点，运行时不会有任何动作".to_string());
     }
 
     // -- 节点 id ------------------------------------------------------------
@@ -70,7 +83,8 @@ pub fn validate(workflow: &Workflow) -> WorkflowValidation {
                 .errors
                 .push(format!("应用节点「{}」未设置启动路径", node_label(node)));
         }
-        if !node.enabled {
+        // 分组节点不执行，禁用没有意义，不产生 warning。
+        if !node.enabled && node.kind != NodeKind::Group {
             validation.warnings.push(format!(
                 "节点「{}」已禁用，执行时会被跳过",
                 node_label(node)
@@ -80,10 +94,19 @@ pub fn validate(workflow: &Workflow) -> WorkflowValidation {
 
     // -- 连线 ---------------------------------------------------------------
     let known_ids: HashSet<&str> = workflow.nodes.iter().map(|n| n.id.as_str()).collect();
+    let graph_ids: HashSet<&str> = graph_nodes.iter().map(|n| n.id.as_str()).collect();
+    let group_ids: HashSet<&str> = workflow
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Group)
+        .map(|node| node.id.as_str())
+        .collect();
+
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
-    let mut indegree: HashMap<&str, usize> =
-        known_ids.iter().map(|id| (*id, 0usize)).collect();
+    let mut indegree: HashMap<&str, usize> = graph_ids.iter().map(|id| (*id, 0usize)).collect();
     let mut seen_pairs: HashSet<(&str, &str)> = HashSet::new();
+    // 与分组节点相连的边不进入依赖图，只为每个分组节点留一条 warning。
+    let mut group_edges: HashSet<&str> = HashSet::new();
 
     for edge in &workflow.edges {
         let source_known = known_ids.contains(edge.source.as_str());
@@ -101,6 +124,20 @@ pub fn validate(workflow: &Workflow) -> WorkflowValidation {
                 "连线引用了不存在的节点：{}",
                 missing.join("、")
             ));
+            continue;
+        }
+
+        // 分组节点只用于展示：涉及它的连线一律忽略（并警告）。
+        let mut touches_group = false;
+        if group_ids.contains(edge.source.as_str()) {
+            group_edges.insert(edge.source.as_str());
+            touches_group = true;
+        }
+        if group_ids.contains(edge.target.as_str()) {
+            group_edges.insert(edge.target.as_str());
+            touches_group = true;
+        }
+        if touches_group {
             continue;
         }
 
@@ -123,12 +160,20 @@ pub fn validate(workflow: &Workflow) -> WorkflowValidation {
         *indegree.entry(edge.target.as_str()).or_insert(0) += 1;
     }
 
+    let mut group_edge_ids: Vec<&str> = group_edges.into_iter().collect();
+    group_edge_ids.sort_unstable();
+    for id in group_edge_ids {
+        validation.warnings.push(format!(
+            "分组节点「{}」不参与执行，它的连线会被忽略",
+            label_of(workflow, id)
+        ));
+    }
+
     // -- 拓扑排序 / 环检测 ---------------------------------------------------
     // 重复 id 会让图本身无法解释，此时不给出拓扑序。
     if duplicated.is_empty() {
         let mut order: Vec<String> = Vec::new();
-        let mut queue: VecDeque<&str> = workflow
-            .nodes
+        let mut queue: VecDeque<&str> = graph_nodes
             .iter()
             .filter(|node| indegree.get(node.id.as_str()).copied().unwrap_or(0) == 0)
             .map(|node| node.id.as_str())
@@ -148,10 +193,9 @@ pub fn validate(workflow: &Workflow) -> WorkflowValidation {
             }
         }
 
-        if order.len() < workflow.nodes.len() {
+        if order.len() < graph_nodes.len() {
             let ordered: HashSet<&str> = order.iter().map(|id| id.as_str()).collect();
-            let remaining: Vec<&str> = workflow
-                .nodes
+            let remaining: Vec<&str> = graph_nodes
                 .iter()
                 .filter(|node| !ordered.contains(node.id.as_str()))
                 .map(|node| node.id.as_str())
@@ -223,22 +267,28 @@ fn dfs_cycle<'a>(
 
 /// 计算「并行层级」：同一层的节点之间没有依赖，可以并行启动。
 ///
+/// 分组节点不参与依赖图，因此不会出现在任何层级里；涉及分组节点的连线被忽略。
 /// 忽略引用不存在节点的连线；存在环时只返回能够排出的层级。
 ///
 /// 目前调度器采用「动态放行」，运行时并不需要预先分层；这个函数用于并行度预览
 /// 与单元测试（`#[allow(dead_code)]` 仅因非测试构建暂时没有调用方）。
 #[allow(dead_code)]
 pub fn levels(workflow: &Workflow) -> Vec<Vec<String>> {
-    let known_ids: HashSet<&str> = workflow.nodes.iter().map(|n| n.id.as_str()).collect();
+    let graph_nodes: Vec<&WorkflowNode> = workflow
+        .nodes
+        .iter()
+        .filter(|node| node.kind != NodeKind::Group)
+        .collect();
+    let graph_ids: HashSet<&str> = graph_nodes.iter().map(|n| n.id.as_str()).collect();
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
-    let mut indegree: HashMap<&str, usize> = known_ids.iter().map(|id| (*id, 0usize)).collect();
+    let mut indegree: HashMap<&str, usize> = graph_ids.iter().map(|id| (*id, 0usize)).collect();
     let mut seen_pairs: HashSet<(&str, &str)> = HashSet::new();
 
     for edge in &workflow.edges {
         if edge.source == edge.target {
             continue;
         }
-        if !known_ids.contains(edge.source.as_str()) || !known_ids.contains(edge.target.as_str()) {
+        if !graph_ids.contains(edge.source.as_str()) || !graph_ids.contains(edge.target.as_str()) {
             continue;
         }
         if !seen_pairs.insert((edge.source.as_str(), edge.target.as_str())) {
@@ -251,8 +301,7 @@ pub fn levels(workflow: &Workflow) -> Vec<Vec<String>> {
         *indegree.entry(edge.target.as_str()).or_insert(0) += 1;
     }
 
-    let mut current: Vec<&str> = workflow
-        .nodes
+    let mut current: Vec<&str> = graph_nodes
         .iter()
         .filter(|node| indegree.get(node.id.as_str()).copied().unwrap_or(0) == 0)
         .map(|node| node.id.as_str())
@@ -305,6 +354,15 @@ mod tests {
                 path: path.to_string(),
                 ..Default::default()
             },
+            ..Default::default()
+        }
+    }
+
+    fn group_node(id: &str) -> WorkflowNode {
+        WorkflowNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: NodeKind::Group,
             ..Default::default()
         }
     }
@@ -481,5 +539,57 @@ mod tests {
         assert!(!groups.is_empty());
         assert_eq!(groups[0], vec!["a".to_string()]);
         assert_eq!(groups[1], vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn group_node_does_not_require_path() {
+        let wf = workflow(vec![group_node("g")], Vec::new());
+        let validation = validate(&wf);
+        assert!(validation.ok, "errors: {:?}", validation.errors);
+        assert!(validation.errors.is_empty());
+        // 只有分组节点 → 运行时没有可执行动作。
+        assert!(validation
+            .warnings
+            .iter()
+            .any(|w| w.contains("只有分组节点")));
+        assert!(validation.order.is_empty());
+    }
+
+    #[test]
+    fn group_edges_warn_and_are_ignored() {
+        let wf = workflow(
+            vec![group_node("g"), node("a"), node("b")],
+            vec![edge("a", "g"), edge("g", "b")],
+        );
+        let validation = validate(&wf);
+        assert!(validation.ok, "errors: {:?}", validation.errors);
+        // 同一分组节点的多条连线只给一条 warning。
+        assert_eq!(
+            validation
+                .warnings
+                .iter()
+                .filter(|w| w.contains("连线会被忽略"))
+                .count(),
+            1
+        );
+        // 拓扑序只含可执行节点。
+        assert_eq!(validation.order.len(), 2);
+        assert!(validation.order.contains(&"a".to_string()));
+        assert!(validation.order.contains(&"b".to_string()));
+        assert!(!validation.order.contains(&"g".to_string()));
+    }
+
+    #[test]
+    fn group_nodes_are_excluded_from_levels() {
+        let wf = workflow(
+            vec![group_node("g"), node("a"), node("b")],
+            vec![edge("a", "g"), edge("g", "b")],
+        );
+        let groups = levels(&wf);
+        // 分组连线被忽略 → a、b 没有依赖，落在同一层。
+        assert_eq!(groups.len(), 1, "levels: {groups:?}");
+        let mut level = groups[0].clone();
+        level.sort();
+        assert_eq!(level, vec!["a".to_string(), "b".to_string()]);
     }
 }

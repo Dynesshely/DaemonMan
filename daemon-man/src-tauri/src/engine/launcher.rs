@@ -1,6 +1,8 @@
 //! 「启动应用」节点的实现。
 //!
 //! 负责：已运行则跳过、启动、启动后缓冲、等待主窗口、关闭启动画面、置前窗口。
+//! 「已运行则跳过」由调用方传入**有效开关**（`workflow.skip_existing_processes
+//! && spec.skip_if_running`），为 false 时必定真正启动。
 //! 所有分支都会给出中文 `message`，失败时返回带上下文的 `Err`。
 
 use std::sync::atomic::AtomicBool;
@@ -20,8 +22,17 @@ pub struct LaunchOutcome {
     pub message: String,
 }
 
-/// 执行一次应用启动，处理「已运行则跳过」、等待窗口、关闭启动画面等选项。
-pub async fn launch_spec(spec: &AppLaunchSpec, cancel: &Arc<AtomicBool>) -> Result<LaunchOutcome> {
+/// 执行一次应用启动。
+///
+/// `skip_existing` 是**有效**的「已运行则跳过」开关：调用方负责把
+/// `workflow.skip_existing_processes && spec.skip_if_running` 合进来
+/// （见 [`crate::engine::executor::skip_existing_enabled`]）。为 false 时即使进程
+/// 已在运行也必须真正启动。
+pub async fn launch_spec(
+    spec: &AppLaunchSpec,
+    cancel: &Arc<AtomicBool>,
+    skip_existing: bool,
+) -> Result<LaunchOutcome> {
     if spec.path.trim().is_empty() {
         bail!("启动路径为空，无法启动");
     }
@@ -29,8 +40,13 @@ pub async fn launch_spec(spec: &AppLaunchSpec, cancel: &Arc<AtomicBool>) -> Resu
     let process_name = resolve_process_name(spec);
 
     // 1. 已经在运行则跳过（默认行为，避免重复拉起常驻程序）。
-    if spec.skip_if_running && !process_name.is_empty() && platform::is_process_running(&process_name)
-    {
+    //    只有「有效开关为真」时才去查进程，避免无谓的枚举开销。
+    let is_running = if skip_existing && !process_name.is_empty() {
+        platform::is_process_running(&process_name)
+    } else {
+        false
+    };
+    if should_skip(skip_existing, &process_name, is_running) {
         return Ok(LaunchOutcome {
             pid: None,
             already_running: true,
@@ -110,6 +126,14 @@ pub async fn launch_spec(spec: &AppLaunchSpec, cancel: &Arc<AtomicBool>) -> Resu
     })
 }
 
+/// 是否因为「已在运行」而跳过启动。
+///
+/// 三个条件同时成立才跳过：有效开关为真、进程名可推导、进程确实在运行。
+/// 工作流级开关关闭时 `skip_existing` 为 false，这里必然是 false。
+fn should_skip(skip_existing: bool, process_name: &str, is_running: bool) -> bool {
+    skip_existing && !process_name.trim().is_empty() && is_running
+}
+
 /// 进程名：优先使用显式的 `process_name`，否则从启动路径推导（不含 .exe）。
 pub fn resolve_process_name(spec: &AppLaunchSpec) -> String {
     match spec
@@ -151,5 +175,14 @@ mod tests {
     fn process_name_is_empty_for_empty_path() {
         let spec = AppLaunchSpec::default();
         assert!(resolve_process_name(&spec).is_empty());
+    }
+
+    #[test]
+    fn should_skip_requires_effective_switch() {
+        // 工作流级开关为 false 时即使进程在跑也绝不跳过。
+        assert!(!should_skip(false, "WeChat", true));
+        assert!(should_skip(true, "WeChat", true));
+        assert!(!should_skip(true, "WeChat", false));
+        assert!(!should_skip(true, "   ", true));
     }
 }

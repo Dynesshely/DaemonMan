@@ -150,7 +150,16 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 
 `WorkflowsView` 提供两种视图，共享同一 `draft`、保存/校验/运行与实时状态：
 
-- 节点视图：Vue Flow 画布（拖拽、连线、自动排列、属性检查器、运行监控）。
-- 文本视图：`WorkflowTextView.vue` + `graph.ts` 的 Kahn 分层算法。表格展示序号、执行层、类型、名称、目标/参数、上游依赖（含条件）、下游数、运行状态；另有「执行分层」区块。行点击联动右侧属性面板；切换视图保留选中节点。
+- 节点视图：Vue Flow 画布（拖拽、连线、自动排列、属性检查器、运行监控）。分组节点（`kind=group`，`parentId` 指向它）作为容器背景层渲染；顺序分组子项纵向排列，并行分组（`groupParallel=true`）用紧凑三列网格。
+- 文本视图：`WorkflowTextView.vue` + `graph.ts` 的 Kahn 分层算法与 parentId 树。分组行显示树线/并行徽标/子项数，子节点缩进；每行保留状态、类型、目标/参数、上游依赖（含条件）。行点击联动右侧属性面板；切换视图保留选中节点。
+
+## 10. 跳过已存在进程
+
+`Workflow.skip_existing_processes`（默认 true）是工作流级开关。执行时对 Application 节点计算
+`effective = workflow.skip_existing_processes && node.app.skip_if_running`；若进程已在运行，节点直接置为
+`NodeStatus::SkippedExisting`（serde `skipped-existing`，界面 teal 色标记），并在依赖语义上视为成功
+（success 边继续放行）。该节点不执行启动，也不写入 pid。
+
+分组节点（`kind=group`）只用于展示：不进入 `run.nodes`、不参与调度与拓扑层级，校验时也不要求 path。
 
 

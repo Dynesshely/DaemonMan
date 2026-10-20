@@ -1,4 +1,10 @@
-import { AppWindow, Hourglass, SquareTerminal, Timer } from "lucide-vue-next";
+import {
+  AppWindow,
+  Boxes,
+  Hourglass,
+  SquareTerminal,
+  Timer,
+} from "lucide-vue-next";
 
 import type { EdgeCondition, NodeKind, NodeStatus } from "@/api";
 
@@ -10,6 +16,7 @@ export const nodeKindOrder: NodeKind[] = [
   "delay",
   "wait",
   "script",
+  "group",
 ];
 
 export const nodeKindMeta: Record<NodeKind, NodeKindMeta> = {
@@ -48,6 +55,14 @@ export const nodeKindMeta: Record<NodeKind, NodeKindMeta> = {
     iconClass:
       "bg-violet-50 text-violet-600 dark:bg-violet-500/15 dark:text-violet-300",
   },
+  group: {
+    kind: "group",
+    icon: Boxes,
+    labelKey: "node.kind.group",
+    addLabelKey: "workflow.addGroup",
+    hintKey: "workflow.addGroupHint",
+    iconClass: "bg-teal-50 text-teal-600 dark:bg-teal-500/15 dark:text-teal-300",
+  },
 };
 
 /** 运行状态 -> 节点卡片边框色。 */
@@ -58,6 +73,7 @@ export const nodeStatusBorder: Record<NodeStatus, string> = {
   success: "border-emerald-500/80 dark:border-emerald-400/70",
   failed: "border-red-500/85 dark:border-red-400/75",
   skipped: "border-zinc-300 dark:border-zinc-700",
+  "skipped-existing": "border-teal-500/80 dark:border-teal-400/70",
   cancelled: "border-amber-500/85 dark:border-amber-400/75",
 };
 
@@ -69,6 +85,7 @@ export const nodeStatusDot: Record<NodeStatus, string> = {
   success: "bg-emerald-500",
   failed: "bg-red-500",
   skipped: "bg-zinc-400 dark:bg-zinc-500",
+  "skipped-existing": "bg-teal-500",
   cancelled: "bg-amber-500",
 };
 
@@ -80,6 +97,7 @@ export const nodeStatusText: Record<NodeStatus, string> = {
   success: "text-emerald-600 dark:text-emerald-400",
   failed: "text-red-600 dark:text-red-400",
   skipped: "text-zinc-400 dark:text-zinc-500",
+  "skipped-existing": "text-teal-600 dark:text-teal-400",
   cancelled: "text-amber-600 dark:text-amber-400",
 };
 

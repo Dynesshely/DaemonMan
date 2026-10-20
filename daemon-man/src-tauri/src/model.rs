@@ -100,7 +100,7 @@ impl AppConfig {
 // 工作流
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Workflow {
     pub id: String,
@@ -112,6 +112,24 @@ pub struct Workflow {
     pub updated_at: String,
     pub nodes: Vec<WorkflowNode>,
     pub edges: Vec<WorkflowEdge>,
+    /// 工作流级「跳过已存在进程」：开启时，已在运行的应用节点会被跳过（标记为已运行跳过）
+    pub skip_existing_processes: bool,
+}
+
+impl Default for Workflow {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            description: String::new(),
+            enabled: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            skip_existing_processes: true,
+        }
+    }
 }
 
 impl Workflow {
@@ -126,6 +144,7 @@ impl Workflow {
             updated_at: now,
             nodes: Vec::new(),
             edges: Vec::new(),
+            skip_existing_processes: true,
         }
     }
 
@@ -150,6 +169,8 @@ pub enum NodeKind {
     Wait,
     /// 执行一条 shell 命令
     Script,
+    /// 分组节点：只用于展示结构，不参与执行
+    Group,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -272,6 +293,10 @@ pub struct WorkflowNode {
     pub wait: WaitSpec,
     pub script: ScriptSpec,
     pub note: String,
+    /// 所属分组节点 id（仅用于展示与排版；执行顺序仍由 edges 决定）
+    pub parent_id: Option<String>,
+    /// 分组节点：子项是否并行（用于紧凑排版与文本视图标记）
+    pub group_parallel: bool,
 }
 
 impl Default for WorkflowNode {
@@ -287,6 +312,8 @@ impl Default for WorkflowNode {
             wait: WaitSpec::default(),
             script: ScriptSpec::default(),
             note: String::new(),
+            parent_id: None,
+            group_parallel: false,
         }
     }
 }
@@ -347,6 +374,9 @@ pub enum NodeStatus {
     Failed,
     Skipped,
     Cancelled,
+    /// 因进程已在运行而跳过（视为成功，但界面用独特颜色标记）
+    #[serde(rename = "skipped-existing")]
+    SkippedExisting,
 }
 
 impl NodeStatus {
@@ -357,7 +387,13 @@ impl NodeStatus {
                 | NodeStatus::Failed
                 | NodeStatus::Skipped
                 | NodeStatus::Cancelled
+                | NodeStatus::SkippedExisting
         )
+    }
+
+    /// 对依赖条件而言是否算「成功」。
+    pub fn is_success(self) -> bool {
+        matches!(self, NodeStatus::Success | NodeStatus::SkippedExisting)
     }
 }
 

@@ -21,6 +21,7 @@ import BaseModal from "@/modules/components/ui/BaseModal.vue";
 import EmptyState from "@/modules/components/ui/EmptyState.vue";
 import SectionCard from "@/modules/components/ui/SectionCard.vue";
 import FilterTabs from "@/modules/components/startup/FilterTabs.vue";
+import ScriptEditModal from "@/modules/components/startup/ScriptEditModal.vue";
 import StartupContextMenu from "@/modules/components/startup/StartupContextMenu.vue";
 import StartupItemRow from "@/modules/components/startup/StartupItemRow.vue";
 import TakeOverModal from "@/modules/components/startup/TakeOverModal.vue";
@@ -71,6 +72,7 @@ const disableBusy = ref(false);
 const deleteTarget = ref<AutostartItem | null>(null);
 const deleteBusy = ref(false);
 const restoreBusy = ref(false);
+const scriptTarget = ref<AutostartItem | null>(null);
 
 const actionBusy = computed(
   () => disableBusy.value || deleteBusy.value || restoreBusy.value,
@@ -398,6 +400,26 @@ function closeContextMenu() {
   contextTarget.value = null;
 }
 
+/** 右键「在资源管理器中显示」：交给后端选中文件。 */
+async function revealItem(item: AutostartItem) {
+  closeContextMenu();
+  try {
+    await api.revealAutostartItem(item.id);
+  } catch (error) {
+    ui.notify("error", t("startup.revealFailed", { error: String(error) }));
+  }
+}
+
+/** 右键「编辑启动内容」：打开内置脚本编辑器。 */
+function editScript(item: AutostartItem) {
+  closeContextMenu();
+  scriptTarget.value = item;
+}
+
+function closeScriptEditor() {
+  scriptTarget.value = null;
+}
+
 /** 右键「禁用」：先确认，再交给后端（系统开关或备份后移除）。 */
 function askDisable(item: AutostartItem) {
   closeContextMenu();
@@ -716,7 +738,15 @@ onMounted(async () => {
       @close="closeContextMenu"
       @disable="askDisable"
       @restore="restoreItem"
+      @reveal="revealItem"
+      @edit="editScript"
       @delete="askDelete"
+    />
+
+    <ScriptEditModal
+      :open="scriptTarget !== null"
+      :item="scriptTarget"
+      @close="closeScriptEditor"
     />
 
     <TakeOverModal

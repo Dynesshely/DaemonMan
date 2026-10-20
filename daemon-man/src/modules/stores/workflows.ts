@@ -87,6 +87,7 @@ export const useWorkflowStore = defineStore("workflows", () => {
       updatedAt: now,
       nodes: [],
       edges: [],
+      skipExistingProcesses: true,
     };
     suppressDirty = true;
     draft.value = workflow;

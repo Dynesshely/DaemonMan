@@ -3,7 +3,7 @@
  * 修改任一侧都必须同步另一侧（serde 使用 camelCase）。
  */
 
-export type NodeKind = "application" | "delay" | "wait" | "script";
+export type NodeKind = "application" | "delay" | "wait" | "script" | "group";
 export type EdgeCondition = "success" | "failure" | "always";
 export type RunStatus = "running" | "success" | "failed" | "cancelled";
 export type NodeStatus =
@@ -13,7 +13,8 @@ export type NodeStatus =
   | "success"
   | "failed"
   | "skipped"
-  | "cancelled";
+  | "cancelled"
+  | "skipped-existing";
 export type RunTrigger = "manual" | "startup" | "tray";
 export type AutostartSource =
   | "registry-run"
@@ -97,6 +98,10 @@ export interface WorkflowNode {
   wait: WaitSpec;
   script: ScriptSpec;
   note: string;
+  /** 所属分组节点 id（仅用于展示与排版） */
+  parentId: string | null;
+  /** 分组节点：子项是否并行（紧凑排版） */
+  groupParallel: boolean;
 }
 
 export interface WorkflowEdge {
@@ -115,6 +120,8 @@ export interface Workflow {
   updatedAt: string;
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
+  /** 工作流级「跳过已存在进程」 */
+  skipExistingProcesses: boolean;
 }
 
 export interface WorkflowValidation {
@@ -185,6 +192,15 @@ export interface AutostartOverride {
 export interface FileIcon {
   path: string;
   dataUrl: string | null;
+}
+
+/** 启动脚本内容（右键编辑启动项）。 */
+export interface ScriptContent {
+  path: string;
+  content: string;
+  size: number;
+  /** utf-8 | utf-8-bom | gb18030 */
+  encoding: string;
 }
 
 export interface TakeOverResult {

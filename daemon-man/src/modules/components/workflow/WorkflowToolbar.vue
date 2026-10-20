@@ -74,6 +74,18 @@ const progress = computed(() => {
       {{ t("workflow.enabledOnStartup") }}
     </label>
 
+    <label
+      class="flex shrink-0 cursor-pointer items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400"
+      :title="t('workflow.skipExistingHint')"
+    >
+      <ToggleSwitch
+        :model-value="props.draft.skipExistingProcesses"
+        size="sm"
+        @update:model-value="props.draft.skipExistingProcesses = $event"
+      />
+      {{ t("workflow.skipExisting") }}
+    </label>
+
     <div class="flex shrink-0 items-center gap-1.5">
       <BaseBadge v-if="store.draftDirty" variant="warn" dot>
         {{ t("workflow.unsaved") }}

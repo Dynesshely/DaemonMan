@@ -12,7 +12,12 @@ use anyhow::{Context, Result};
 use crate::model::{now_iso, AppConfig, CONFIG_VERSION};
 
 /// 当前数据目录：`~/.daemonMan`。
+///
+/// 设置 `DAEMONMAN_DATA_DIR` 环境变量可覆盖（用于开发/自动化测试隔离真实配置）。
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("DAEMONMAN_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".daemonMan")
@@ -27,6 +32,10 @@ pub fn legacy_data_dir() -> PathBuf {
 
 /// 若新目录不存在而旧目录存在，则把旧数据整体迁移过来（配置 + 日志）。
 pub fn migrate_legacy_data_dir() {
+    // 显式指定数据目录时不自动迁移，避免测试污染真实配置。
+    if std::env::var_os("DAEMONMAN_DATA_DIR").is_some() {
+        return;
+    }
     let new_dir = data_dir();
     let old_dir = legacy_data_dir();
     if new_dir.exists() || !old_dir.exists() {

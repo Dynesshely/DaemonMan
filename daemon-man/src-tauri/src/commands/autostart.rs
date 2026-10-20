@@ -6,8 +6,8 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::model::{
-    now_iso, AppLaunchSpec, AutostartItem, AutostartOverride, LogLevel, NodeKind, ScriptSpec,
-    Workflow, WorkflowNode,
+    now_iso, AppLaunchSpec, AutostartItem, AutostartOverride, AutostartSource, LogLevel, NodeKind,
+    ScriptSpec, Workflow, WorkflowNode,
 };
 use crate::platform;
 use crate::state::AppState;
@@ -431,6 +431,281 @@ pub fn delete_autostart_item(
         Some(item_id),
     );
     Ok(())
+}
+
+/// 可在内置编辑器中打开的脚本类扩展名。
+const EDITABLE_EXTENSIONS: &[&str] = &[
+    "bat", "cmd", "ps1", "vbs", "vbe", "js", "jse", "wsf", "reg", "txt", "ini", "sh", "py",
+];
+const MAX_SCRIPT_BYTES: u64 = 512 * 1024;
+
+/// 启动脚本内容（用于右键「编辑启动内容」）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptContent {
+    pub path: String,
+    pub content: String,
+    pub size: u64,
+    /// `utf-8` / `utf-8-bom` / `gb18030`
+    pub encoding: String,
+}
+
+fn is_editable_script(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_lowercase())
+        .is_some_and(|extension| EDITABLE_EXTENSIONS.contains(&extension.as_str()))
+}
+
+/// 解析可编辑的脚本路径：启动文件夹的 locator 文件优先，其次是可执行文件。
+fn editable_script_path(item: &AutostartItem) -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<&str> = vec![item.locator.as_str()];
+    if let Some(executable) = item.executable.as_deref() {
+        if !candidates.contains(&executable) {
+            candidates.push(executable);
+        }
+    }
+    candidates.into_iter().find_map(|candidate| {
+        if candidate.trim().is_empty() {
+            return None;
+        }
+        let path = std::path::Path::new(candidate);
+        if path.is_file() && is_editable_script(path) {
+            Some(path.to_path_buf())
+        } else {
+            None
+        }
+    })
+}
+
+/// 识别脚本编码：BOM → UTF-8；UTF-16 BOM → UTF-16；纯 ASCII 的批处理类文件按 GB18030（中文 Windows 的 cmd 默认代码页）；
+/// 其余能按 UTF-8 解码就是 UTF-8，否则按 GB18030。
+fn decode_script(path: &std::path::Path, bytes: &[u8]) -> (String, &'static str) {
+    if let Some(without_bom) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        if let Ok(text) = std::str::from_utf8(without_bom) {
+            return (text.to_string(), "utf-8-bom");
+        }
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = rest
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        return (String::from_utf16_lossy(&units), "utf-16le");
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = rest
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair))
+            .collect();
+        return (String::from_utf16_lossy(&units), "utf-16be");
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_lowercase())
+        .unwrap_or_default();
+    let legacy_script = matches!(
+        extension.as_str(),
+        "bat" | "cmd" | "vbs" | "vbe" | "reg" | "ini"
+    );
+
+    match std::str::from_utf8(bytes) {
+        Ok(text) if legacy_script && bytes.is_ascii() => (text.to_string(), "gb18030"),
+        Ok(text) => (text.to_string(), "utf-8"),
+        Err(_) => {
+            let (decoded, _, _) = encoding_rs::GB18030.decode(bytes);
+            (decoded.to_string(), "gb18030")
+        }
+    }
+}
+
+fn encode_script(content: &str, encoding: &str) -> Vec<u8> {
+    match encoding {
+        "utf-8-bom" => {
+            let mut bytes = vec![0xEF, 0xBB, 0xBF];
+            bytes.extend_from_slice(content.as_bytes());
+            bytes
+        }
+        "utf-16le" => {
+            let mut bytes = vec![0xFF, 0xFE];
+            for unit in content.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes
+        }
+        "utf-16be" => {
+            let mut bytes = vec![0xFE, 0xFF];
+            for unit in content.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+            bytes
+        }
+        "gb18030" => {
+            let (bytes, _, _) = encoding_rs::GB18030.encode(content);
+            bytes.to_vec()
+        }
+        _ => content.as_bytes().to_vec(),
+    }
+}
+
+fn find_autostart_item(
+    state: &AppState,
+    item_id: &str,
+) -> Result<AutostartItem, String> {
+    state
+        .autostart_cached(true)
+        .into_iter()
+        .find(|item| item.id == item_id)
+        .ok_or_else(|| "未找到自启动项（可能已被移除）".to_string())
+}
+
+/// 右键「在资源管理器中显示」：定位可执行文件或启动文件夹里的脚本文件。
+#[tauri::command]
+pub fn reveal_autostart_item(
+    state: State<'_, Arc<AppState>>,
+    item_id: String,
+) -> Result<String, String> {
+    let state = state.inner().clone();
+    let item = find_autostart_item(&state, &item_id)?;
+
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(executable) = item.executable.clone() {
+        candidates.push(executable);
+    }
+    if item.source == AutostartSource::StartupFolder {
+        candidates.push(item.locator.clone());
+    }
+
+    let target = candidates
+        .into_iter()
+        .find(|candidate| !candidate.trim().is_empty() && std::path::Path::new(candidate).exists());
+
+    match target {
+        Some(path) => {
+            std::process::Command::new("explorer")
+                .arg(format!("/select,{path}"))
+                .spawn()
+                .map_err(|error| format!("打开资源管理器失败：{error}"))?;
+            Ok(path)
+        }
+        None => {
+            // 文件不存在时，退一步打开它的父目录（如果父目录存在）。
+            if let Some(parent) = item
+                .executable
+                .as_deref()
+                .and_then(|executable| std::path::Path::new(executable).parent())
+                .filter(|parent| parent.exists())
+            {
+                std::process::Command::new("explorer")
+                    .arg(parent)
+                    .spawn()
+                    .map_err(|error| format!("打开资源管理器失败：{error}"))?;
+                return Ok(parent.display().to_string());
+            }
+            Err("该启动项没有可定位的文件".into())
+        }
+    }
+}
+
+/// 右键「编辑启动内容」：读取脚本文件（自动识别 UTF-8 / GBK）。
+#[tauri::command]
+pub fn read_autostart_script(
+    state: State<'_, Arc<AppState>>,
+    item_id: String,
+) -> Result<ScriptContent, String> {
+    let state = state.inner().clone();
+    let item = find_autostart_item(&state, &item_id)?;
+    let path = editable_script_path(&item).ok_or_else(|| {
+        "该启动项不是可编辑的脚本文件（支持 .bat/.cmd/.ps1/.vbs/.js/.reg/.txt 等）".to_string()
+    })?;
+
+    let bytes = std::fs::read(&path).map_err(|error| format!("读取脚本失败：{error}"))?;
+    if bytes.len() as u64 > MAX_SCRIPT_BYTES {
+        return Err(format!(
+            "脚本超过 {} KB，无法在编辑器打开",
+            MAX_SCRIPT_BYTES / 1024
+        ));
+    }
+    let (content, encoding) = decode_script(&path, &bytes);
+    Ok(ScriptContent {
+        path: path.display().to_string(),
+        content,
+        size: bytes.len() as u64,
+        encoding: encoding.to_string(),
+    })
+}
+
+/// 右键「编辑启动内容」：保存脚本（写前自动备份为 `<文件名>.daemonman.bak`，保持原编码）。
+#[tauri::command]
+pub fn write_autostart_script(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    item_id: String,
+    content: String,
+    encoding: Option<String>,
+) -> Result<ScriptContent, String> {
+    let state = state.inner().clone();
+    let item = find_autostart_item(&state, &item_id)?;
+    let path = editable_script_path(&item)
+        .ok_or_else(|| "该启动项不是可编辑的脚本文件".to_string())?;
+
+    if content.len() as u64 > MAX_SCRIPT_BYTES {
+        return Err(format!(
+            "内容超过 {} KB，无法保存",
+            MAX_SCRIPT_BYTES / 1024
+        ));
+    }
+
+    let original_bytes =
+        std::fs::read(&path).map_err(|error| format!("读取原脚本失败：{error}"))?;
+    let detected = decode_script(&path, &original_bytes).1;
+    // 前端会带回来读取时的编码；参数缺省/非法时回退到自动检测，避免把 GBK 批处理写成 UTF-8。
+    let encoding = match encoding.as_deref() {
+        Some(value)
+            if matches!(
+                value,
+                "utf-8" | "utf-8-bom" | "gb18030" | "utf-16le" | "utf-16be"
+            ) =>
+        {
+            value
+        }
+        _ => detected,
+    };
+
+    // 备份到 DaemonMan 的配置目录，避免在启动文件夹里留下 .bak 文件。
+    crate::config::ensure_dirs().map_err(|error| format!("创建备份目录失败：{error}"))?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("script");
+    let backup = crate::config::backup_dir().join(format!("script-{stamp}-{file_name}.bak"));
+    std::fs::copy(&path, &backup)
+        .map_err(|error| format!("备份原脚本失败（已中止保存）：{error}"))?;
+
+    let bytes = encode_script(&content, encoding);
+    std::fs::write(&path, &bytes).map_err(|error| format!("写入脚本失败：{error}"))?;
+
+    state.log(
+        &app,
+        LogLevel::Info,
+        "autostart",
+        format!("已编辑启动脚本「{}」", path.display()),
+        Some(format!("原文件备份：{}", backup.display())),
+    );
+
+    Ok(ScriptContent {
+        path: path.display().to_string(),
+        content,
+        size: bytes.len() as u64,
+        encoding: encoding.to_string(),
+    })
 }
 
 /// 简单的命令行参数切分，支持双引号包裹。

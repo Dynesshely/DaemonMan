@@ -17,7 +17,7 @@ export type NodeStatus =
 export type RunTrigger = "manual" | "startup" | "tray";
 export type AutostartSource =
   | "registry-run"
-  | "registry-runonce"
+  | "registry-run-once"
   | "startup-folder"
   | "scheduled-task"
   | "service";
@@ -164,6 +164,8 @@ export interface AutostartItem {
   scope: string;
   locator: string;
   detail: string | null;
+  /** 仅前端使用：该行来自「备份后移除」的 override 记录，不在系统扫描结果中。 */
+  removed?: boolean;
 }
 
 export interface AutostartOverride {
@@ -173,6 +175,10 @@ export interface AutostartOverride {
   disabledAt: string;
   /** native = 系统开关禁用；removed = 备份后从原位置移除 */
   mode: string;
+  /** 原始作用域（user / machine…），用于「备份后移除」行继续参与位置筛选。 */
+  scope: string;
+  /** 原始启动命令，用于「已移除」行的展示与搜索。 */
+  command: string;
 }
 
 /** 批量图标提取结果。 */

@@ -59,6 +59,8 @@ pub fn set_autostart_enabled(
             source: item.source,
             disabled_at: now_iso(),
             mode: "native".into(),
+            scope: item.scope.clone(),
+            command: item.command.clone(),
         };
         state
             .mutate_config(|config| {
@@ -214,6 +216,8 @@ pub fn take_over_autostart(
             source: item.source,
             disabled_at: now_iso(),
             mode: "native".into(),
+            scope: item.scope.clone(),
+            command: item.command.clone(),
         });
         success_ids.push(item.id.clone());
     }
@@ -329,6 +333,8 @@ pub fn disable_autostart_item(
         source: item.source,
         disabled_at: now_iso(),
         mode: mode.to_string(),
+        scope: item.scope.clone(),
+        command: item.command.clone(),
     };
     state
         .mutate_config(|config| {

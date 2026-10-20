@@ -87,9 +87,56 @@ const filters = computed<
 
 const keyword = computed(() => search.value.trim().toLowerCase());
 
+const SOURCE_LABEL_KEYS: Record<AutostartItem["source"], string> = {
+  "registry-run": "startup.source.registry-run",
+  "registry-run-once": "startup.source.registry-run-once",
+  "startup-folder": "startup.source.startup-folder",
+  "scheduled-task": "startup.source.scheduled-task",
+  service: "startup.source.service",
+};
+
+function sourceLabelOf(source: AutostartItem["source"]) {
+  return t(SOURCE_LABEL_KEYS[source] ?? "startup.source.registry-run");
+}
+
+/**
+ * 「备份后移除」的项不在系统扫描结果里，但从 overrides 里补一行「已移除」，
+ * 这样仍能通过右键菜单恢复。
+ */
+const removedItems = computed<AutostartItem[]>(() => {
+  const present = new Set(autostartStore.items.map((item) => item.id));
+  const overrides = appStore.config?.overrides ?? [];
+  return overrides
+    .filter((override) => override.mode === "removed" && !present.has(override.id))
+    .map((override) => ({
+      id: override.id,
+      name: override.name,
+      source: override.source,
+      sourceLabel: sourceLabelOf(override.source),
+      command: override.command || "",
+      executable: null,
+      args: null,
+      enabled: false,
+      toggleSupported: false,
+      canDelete: false,
+      requiresAdmin: false,
+      isSelf: false,
+      takenOver: true,
+      scope: override.scope || "user",
+      locator: "",
+      detail: t("startup.removedDetail"),
+      removed: true,
+    }));
+});
+
+const allItems = computed<AutostartItem[]>(() => [
+  ...autostartStore.items,
+  ...removedItems.value,
+]);
+
 const filtered = computed<AutostartItem[]>(() => {
   const words = keyword.value.split(/\s+/).filter(Boolean);
-  return autostartStore.items.filter((item) => {
+  return allItems.value.filter((item) => {
     if (filter.value === "enabled" && !item.enabled) return false;
     if (filter.value === "disabled" && item.enabled) return false;
     if (filter.value === "takenOver" && !item.takenOver) return false;
@@ -238,7 +285,7 @@ async function rescan() {
 
 /** 扫描结果变化后补齐行内图标（去重、批量、失败静默）。 */
 function syncIcons() {
-  const paths = autostartStore.items
+  const paths = allItems.value
     .map((item) => item.executable)
     .filter((path): path is string => Boolean(path));
   if (paths.length > 0) {
@@ -325,6 +372,7 @@ async function confirmRelease() {
   releaseBusy.value = true;
   try {
     await autostartStore.release(target.id);
+    await appStore.refreshConfig();
     ui.notify("success", t("startup.releaseSuccess"));
     releaseTarget.value = null;
   } catch (error) {
@@ -368,6 +416,7 @@ async function confirmDisable() {
   disableBusy.value = true;
   try {
     await api.disableAutostartItem(target.id);
+    await appStore.refreshConfig();
     await autostartStore.scan(true);
     syncIcons();
     ui.notify("success", t("startup.disableSuccess", { name: target.name }));
@@ -387,6 +436,7 @@ async function restoreItem(item: AutostartItem) {
   restoreBusy.value = true;
   try {
     await api.restoreAutostartItem(item.id);
+    await appStore.refreshConfig();
     await autostartStore.scan(true);
     syncIcons();
     ui.notify("success", t("startup.restoreSuccess", { name: item.name }));
@@ -415,6 +465,7 @@ async function confirmDelete() {
   deleteBusy.value = true;
   try {
     await api.deleteAutostartItem(target.id);
+    await appStore.refreshConfig();
     await autostartStore.scan(true);
     syncIcons();
     ui.notify("success", t("startup.deleteSuccess", { name: target.name }));

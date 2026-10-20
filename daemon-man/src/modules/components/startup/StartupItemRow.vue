@@ -54,14 +54,16 @@ const badges = computed<{ label: string; variant: BadgeVariant }[]>(() => {
   if (props.item.isSelf) {
     list.push({ label: t("startup.selfItem"), variant: "info" });
   }
-  if (props.item.takenOver) {
+  if (props.item.removed) {
+    list.push({ label: t("startup.removedBadge"), variant: "warn" });
+  } else if (props.item.takenOver) {
     list.push({ label: t("startup.takenOver"), variant: "accent" });
   } else if (props.item.enabled) {
     list.push({ label: t("startup.enabled"), variant: "success" });
   } else {
     list.push({ label: t("startup.disabled"), variant: "neutral" });
   }
-  if (!props.item.toggleSupported) {
+  if (!props.item.toggleSupported && !props.item.removed) {
     list.push({ label: t("startup.unsupported"), variant: "warn" });
   }
   if (props.item.requiresAdmin) {

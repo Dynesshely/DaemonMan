@@ -28,7 +28,7 @@ export const LOCATION_VALUES: LocationFilter[] = ["all", "user", "machine"];
 export function categoryOf(item: AutostartItem): AutostartCategory {
   switch (item.source) {
     case "registry-run":
-    case "registry-runonce":
+    case "registry-run-once":
       return "registry";
     case "startup-folder":
       return "startup-folder";
@@ -52,7 +52,7 @@ export function locationOf(item: AutostartItem): AutostartLocation {
   const scope = (item.scope ?? "").toLowerCase();
   switch (item.source) {
     case "registry-run":
-    case "registry-runonce":
+    case "registry-run-once":
       return scope.includes("machine") ? "machine" : "user";
     case "startup-folder":
       return scope === "machine" ? "machine" : "user";

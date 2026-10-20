@@ -531,6 +531,10 @@ pub struct AutostartOverride {
     pub disabled_at: String,
     /// 禁用方式：`native`（系统开关）或 `removed`（备份后从原位置移除）
     pub mode: String,
+    /// 原始作用域（user / machine…），供前端展示「已移除」项的位置
+    pub scope: String,
+    /// 原始启动命令，供前端展示与搜索
+    pub command: String,
 }
 
 impl Default for AutostartOverride {
@@ -541,6 +545,8 @@ impl Default for AutostartOverride {
             source: AutostartSource::RegistryRun,
             disabled_at: now_iso(),
             mode: "native".into(),
+            scope: String::new(),
+            command: String::new(),
         }
     }
 }

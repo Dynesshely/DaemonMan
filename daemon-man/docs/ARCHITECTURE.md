@@ -142,7 +142,7 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 - 图标：`platform::icon::file_icon_data_url` 用 `IShellItemImageFactory` 取 shell 图标（`.exe`/`.lnk`/`.bat` 一致），HBITMAP → 32bpp DIB → RGBA → PNG → base64 data URL；`SHGetFileInfoW` 兜底；进程内按（小写路径, 尺寸）缓存。命令层 `get_file_icons` 批量返回，前端 `useIconStore` 分批懒加载。
 - 备份：`platform::backup` 维护 `~/.daemonMan/autostart-backup/index.json` 与文件副本/任务 XML，写入走 `config::write_atomic` + 进程内锁。
   - `disable`：`toggle_supported` 的项走各来源的系统开关（mode=native）；其余（如 RunOnce）先备份再移除（mode=removed）。
-  - `restore`：无备份记录时回退为扫描后 native 启用；native 重新启用；removed 还原注册表原值（含类型与原始字节）/文件/任务 XML，成功后清理记录。
+  - `restore`：无备份记录时回退为扫描后 native 启用；native 重新启用；removed 还原注册表原值（含类型与原始字节）/文件/任务 XML，成功后清理记录。前端会用 `overrides` 里 mode=removed 的记录补一行「已移除」，因此被移除项仍可恢复。
   - `delete`：拒绝 `can_delete=false`（服务），先备份（mode=deleted）再永久删除；备份失败即中止。
 - `AutostartItem.can_delete` 由各扫描器填写；`AutostartOverride.mode` 记录 native/removed，用于恢复语义。
 

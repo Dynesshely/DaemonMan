@@ -157,6 +157,7 @@ export interface AutostartItem {
   args: string | null;
   enabled: boolean;
   toggleSupported: boolean;
+  canDelete: boolean;
   requiresAdmin: boolean;
   isSelf: boolean;
   takenOver: boolean;
@@ -170,6 +171,14 @@ export interface AutostartOverride {
   name: string;
   source: AutostartSource;
   disabledAt: string;
+  /** native = 系统开关禁用；removed = 备份后从原位置移除 */
+  mode: string;
+}
+
+/** 批量图标提取结果。 */
+export interface FileIcon {
+  path: string;
+  dataUrl: string | null;
 }
 
 export interface TakeOverResult {

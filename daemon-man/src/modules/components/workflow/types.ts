@@ -37,3 +37,6 @@ export interface WorkflowSelection {
   nodeId: string | null;
   edgeId: string | null;
 }
+
+/** 编辑器中间区域的两种视图。 */
+export type WorkflowViewMode = "nodes" | "text";

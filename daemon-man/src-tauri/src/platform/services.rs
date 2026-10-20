@@ -225,6 +225,8 @@ fn record_to_item(record: ServiceRecord) -> AutostartItem {
         args,
         enabled: true,
         toggle_supported: true,
+        // 服务不提供删除（属于系统基础设施，只允许改启动类型）。
+        can_delete: false,
         // 改服务启动类型必须提权。
         requires_admin: true,
         is_self: false,

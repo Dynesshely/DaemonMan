@@ -12,6 +12,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 
 use windows::core::{BSTR, Interface, VARIANT};
 use windows::Win32::Foundation::VARIANT_BOOL;
@@ -366,6 +367,7 @@ fn record_to_item(record: TaskRecord) -> AutostartItem {
         enabled,
         // 计划任务可以整任务 Enable/Disable。
         toggle_supported: true,
+        can_delete: true,
         requires_admin,
         is_self,
         taken_over: false,
@@ -394,6 +396,20 @@ pub fn set_enabled(item: &AutostartItem, enabled: bool) -> Result<()> {
 
 fn set_enabled_com(item: &AutostartItem, enabled: bool) -> Result<()> {
     let _apartment = super::com::init_apartment()?;
+    let service = connect_service()?;
+    let folder = folder_for(&service, &folder_path_of(item))?;
+    let task = task_for(&folder, item)?;
+
+    let flag = VARIANT_BOOL(if enabled { -1 } else { 0 });
+    unsafe { task.SetEnabled(flag) }
+        .with_context(|| format!("设置计划任务「{}」启用状态失败", item.name))
+}
+
+// ---------------------------------------------------------------------------
+// 备份 / 删除 / 还原：导出任务 XML、删除任务、从 XML 重新注册
+// ---------------------------------------------------------------------------
+
+fn connect_service() -> Result<ITaskService> {
     let service: ITaskService = super::com::create_instance(&CLSID_TASK_SCHEDULER)
         .context("创建 Task Scheduler COM 对象失败")?;
     unsafe {
@@ -406,21 +422,208 @@ fn set_enabled_com(item: &AutostartItem, enabled: bool) -> Result<()> {
             )
             .context("连接本机任务计划服务失败")?
     };
+    Ok(service)
+}
 
-    let folder_path = if item.scope.trim().is_empty() {
+fn folder_path_of(item: &AutostartItem) -> String {
+    if item.scope.trim().is_empty() {
         "\\".to_string()
     } else {
         item.scope.clone()
-    };
-    let folder: ITaskFolder = unsafe { service.GetFolder(&BSTR::from(folder_path.as_str())) }
-        .with_context(|| format!("打开任务文件夹失败：{folder_path}"))?;
-    let task: IRegisteredTask =
-        unsafe { folder.GetTask(&BSTR::from(item.locator.as_str())) }
-            .with_context(|| format!("找到计划任务失败：{}", item.locator))?;
+    }
+}
 
-    let flag = VARIANT_BOOL(if enabled { -1 } else { 0 });
-    unsafe { task.SetEnabled(flag) }
-        .with_context(|| format!("设置计划任务「{}」启用状态失败", item.name))
+fn folder_for(service: &ITaskService, folder_path: &str) -> Result<ITaskFolder> {
+    unsafe { service.GetFolder(&BSTR::from(folder_path)) }
+        .with_context(|| format!("打开任务文件夹失败：{folder_path}"))
+}
+
+fn task_for(folder: &ITaskFolder, item: &AutostartItem) -> Result<IRegisteredTask> {
+    unsafe { folder.GetTask(&BSTR::from(item.locator.as_str())) }
+        .with_context(|| format!("找到计划任务失败：{}", item.locator))
+}
+
+/// 导出一项计划任务的完整 XML（备份用）。
+pub(crate) fn export_xml(item: &AutostartItem) -> Result<String> {
+    let _apartment = super::com::init_apartment()?;
+    let service = connect_service()?;
+    let folder = folder_for(&service, &folder_path_of(item))?;
+    let task = task_for(&folder, item)?;
+    let xml = unsafe { task.Xml() }.with_context(|| {
+        format!(
+            "导出计划任务 XML 失败：{}",
+            task_full_path(&item.scope, &item.locator)
+        )
+    })?;
+    Ok(xml.to_string())
+}
+
+/// 永久删除一项计划任务（COM `DeleteTask`，失败回退 `schtasks /Delete /F`）。
+pub(crate) fn delete_task(item: &AutostartItem) -> Result<()> {
+    match delete_task_com(item) {
+        Ok(()) => Ok(()),
+        Err(com_err) => match run_schtasks_delete(item) {
+            Ok(()) => Ok(()),
+            Err(fallback_err) => bail!(
+                "删除计划任务「{}」失败：通过任务计划服务删除失败（{com_err:#}）；\
+                 改用 schtasks 回退也失败（{fallback_err:#}）。\
+                 系统级/其他用户创建的任务需要以管理员身份运行 DaemonMan",
+                item.name
+            ),
+        },
+    }
+}
+
+fn delete_task_com(item: &AutostartItem) -> Result<()> {
+    let _apartment = super::com::init_apartment()?;
+    let service = connect_service()?;
+    let folder = folder_for(&service, &folder_path_of(item))?;
+    unsafe { folder.DeleteTask(&BSTR::from(item.locator.as_str()), 0) }.with_context(|| {
+        format!(
+            "删除计划任务失败：{}",
+            task_full_path(&item.scope, &item.locator)
+        )
+    })
+}
+
+fn run_schtasks_delete(item: &AutostartItem) -> Result<()> {
+    let full_path = task_full_path(&item.scope, &item.locator);
+    let mut command = std::process::Command::new("schtasks.exe");
+    command
+        .arg("/Delete")
+        .arg("/TN")
+        .arg(&full_path)
+        .arg("/F");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command.output().context("启动 schtasks.exe 失败")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    bail!(
+        "schtasks /Delete 返回 {}：{}{}",
+        output.status,
+        if stdout.is_empty() {
+            String::new()
+        } else {
+            format!("{stdout} ")
+        },
+        stderr
+    )
+}
+
+/// 用备份的 XML 重新注册计划任务（COM `RegisterTask`，失败回退 `schtasks /Create /XML`）。
+pub(crate) fn register_from_xml(task_path: &str, xml_path: &Path) -> Result<()> {
+    let xml = std::fs::read_to_string(xml_path)
+        .with_context(|| format!("读取任务 XML 备份失败：{}", xml_path.display()))?;
+    match register_com(task_path, &xml) {
+        Ok(()) => Ok(()),
+        Err(com_err) => match run_schtasks_create(task_path, xml_path) {
+            Ok(()) => Ok(()),
+            Err(fallback_err) => bail!(
+                "从 XML 还原计划任务「{task_path}」失败：COM 注册失败（{com_err:#}）；\
+                 改用 schtasks 回退也失败（{fallback_err:#}）。\
+                 需要凭据（密码登录类型）的任务必须手动导入 XML"
+            ),
+        },
+    }
+}
+
+fn register_com(task_path: &str, xml: &str) -> Result<()> {
+    let (folder_path, task_name) = split_task_path(task_path)?;
+    let _apartment = super::com::init_apartment()?;
+    let service = connect_service()?;
+    let folder = match folder_for(&service, &folder_path) {
+        Ok(folder) => folder,
+        Err(_) => create_folder_chain(&service, &folder_path)?,
+    };
+    unsafe {
+        folder.RegisterTask(
+            &BSTR::from(task_name.as_str()),
+            &BSTR::from(xml),
+            TASK_CREATE_OR_UPDATE.0,
+            &VARIANT::default(),
+            &VARIANT::default(),
+            TASK_LOGON_NONE,
+            &VARIANT::default(),
+        )
+    }
+    .with_context(|| format!("注册计划任务失败：{task_path}"))?;
+    Ok(())
+}
+
+/// 逐级创建任务文件夹（`\A\B` → 先 `\A` 再 `\A\B`）。
+fn create_folder_chain(service: &ITaskService, folder_path: &str) -> Result<ITaskFolder> {
+    let root = folder_for(service, "\\")?;
+    let mut current = root;
+    let mut current_path = String::new();
+    for segment in folder_path.trim_matches('\\').split('\\') {
+        if segment.is_empty() {
+            continue;
+        }
+        current_path.push('\\');
+        current_path.push_str(segment);
+        current = match folder_for(service, &current_path) {
+            Ok(folder) => folder,
+            Err(_) => unsafe {
+                current
+                    .CreateFolder(&BSTR::from(segment), &VARIANT::default())
+            }
+            .with_context(|| format!("创建任务文件夹失败：{current_path}"))?,
+        };
+    }
+    Ok(current)
+}
+
+/// 把 `\Sub\Name` 拆成 (文件夹路径, 任务名)。
+pub(crate) fn split_task_path(full: &str) -> Result<(String, String)> {
+    let trimmed = full.trim();
+    if !trimmed.starts_with('\\') {
+        bail!("任务路径必须以 \\ 开头：{full}");
+    }
+    match trimmed.rfind('\\') {
+        Some(0) if trimmed.len() > 1 => {
+            let name = &trimmed[1..];
+            if name.is_empty() {
+                bail!("任务路径缺少任务名：{full}");
+            }
+            Ok(("\\".to_string(), name.to_string()))
+        }
+        Some(index) if index + 1 < trimmed.len() => Ok((
+            trimmed[..index].to_string(),
+            trimmed[index + 1..].to_string(),
+        )),
+        _ => bail!("任务路径缺少任务名：{full}"),
+    }
+}
+
+fn run_schtasks_create(task_path: &str, xml_path: &Path) -> Result<()> {
+    let mut command = std::process::Command::new("schtasks.exe");
+    command
+        .arg("/Create")
+        .arg("/XML")
+        .arg(xml_path)
+        .arg("/TN")
+        .arg(task_path)
+        .arg("/F");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command.output().context("启动 schtasks.exe 失败")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    bail!(
+        "schtasks /Create /XML 返回 {}：{}{}",
+        output.status,
+        if stdout.is_empty() {
+            String::new()
+        } else {
+            format!("{stdout} ")
+        },
+        stderr
+    )
 }
 
 /// 完整任务路径（`\Sub\Name`），schtasks 需要它。
@@ -479,6 +682,25 @@ mod tests {
         assert_eq!(task_full_path("\\", "Foo"), "\\Foo");
         assert_eq!(task_full_path("\\Sub", "Foo"), "\\Sub\\Foo");
         assert_eq!(task_full_path("\\Sub\\", "Foo"), "\\Sub\\Foo");
+    }
+
+    #[test]
+    fn split_task_path_cases() {
+        assert_eq!(
+            split_task_path("\\Foo").unwrap(),
+            ("\\".to_string(), "Foo".to_string())
+        );
+        assert_eq!(
+            split_task_path("\\Sub\\Foo").unwrap(),
+            ("\\Sub".to_string(), "Foo".to_string())
+        );
+        assert_eq!(
+            split_task_path("\\中文 目录\\任务 名").unwrap(),
+            ("\\中文 目录".to_string(), "任务 名".to_string())
+        );
+        assert!(split_task_path("Foo").is_err());
+        assert!(split_task_path("\\").is_err());
+        assert!(split_task_path("\\Sub\\").is_err());
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use winreg::enums::*;
-use winreg::RegKey;
+use winreg::{RegKey, RegValue};
 
 use crate::model::{AutostartItem, AutostartSource};
 
@@ -223,6 +223,7 @@ fn scan_location(loc: &Location) -> Result<Vec<AutostartItem>> {
             args,
             enabled,
             toggle_supported,
+            can_delete: true,
             requires_admin: loc.hive.is_machine(),
             is_self,
             taken_over: false,
@@ -283,9 +284,127 @@ pub fn set_enabled(item: &AutostartItem, enabled: bool) -> Result<()> {
         .with_context(|| format!("切换注册表自启动项「{}」失败", item.name))
 }
 
+// ---------------------------------------------------------------------------
+// 备份 / 删除 / 还原：需要原始注册表值（保留类型与字节）
+// ---------------------------------------------------------------------------
+
+/// 一个注册表自启动项的原始值，用于备份后还原。
+#[derive(Debug, Clone)]
+pub(crate) struct RawRegistryValue {
+    pub hive: Hive,
+    pub key_path: &'static str,
+    pub value_name: String,
+    pub value_type: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// 读取某个注册表自启动项的原始值；键或值不存在时返回 `Ok(None)`。
+pub(crate) fn read_raw_value(
+    source: AutostartSource,
+    scope: &str,
+    locator: &str,
+) -> Result<Option<RawRegistryValue>> {
+    let loc = location_for(source, scope).ok_or_else(|| {
+        anyhow::anyhow!("未知的注册表自启动位置：{source:?} / {scope}")
+    })?;
+    let key = match startup_approved::open(loc.hive, loc.key_path, false) {
+        Ok(key) => key,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("打开 {}\\{} 失败", loc.hive.label(), loc.key_path)
+            })
+        }
+    };
+    match key.get_raw_value(locator) {
+        Ok(raw) => Ok(Some(RawRegistryValue {
+            hive: loc.hive,
+            key_path: loc.key_path,
+            value_name: locator.to_string(),
+            value_type: startup_approved::reg_type_to_u32(raw.vtype),
+            bytes: raw.bytes,
+        })),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "读取注册表值失败：{}\\{} → {locator}",
+                loc.hive.label(),
+                loc.key_path
+            )
+        }),
+    }
+}
+
+/// 把备份的原始注册表值写回（restore 用）。
+pub(crate) fn write_raw_value(
+    hive: Hive,
+    key_path: &str,
+    value_name: &str,
+    value_type: u32,
+    bytes: &[u8],
+) -> Result<()> {
+    let key = startup_approved::open_or_create(hive, key_path)?;
+    let value = RegValue {
+        bytes: bytes.to_vec(),
+        vtype: startup_approved::reg_type_from_u32(value_type),
+    };
+    key.set_raw_value(value_name, &value)
+        .with_context(|| {
+            format!(
+                "写入注册表值失败：{}\\{key_path} → {value_name}（HKLM 需要管理员权限）",
+                hive.label()
+            )
+        })
+}
+
+/// 永久删除注册表自启动项：删除 Run/RunOnce 值，并清掉对应的 StartupApproved 开关值。
+pub(crate) fn delete_value(source: AutostartSource, scope: &str, locator: &str) -> Result<()> {
+    let loc = location_for(source, scope).ok_or_else(|| {
+        anyhow::anyhow!("未知的注册表自启动位置：{source:?} / {scope}")
+    })?;
+    if let Ok(key) = startup_approved::open(loc.hive, loc.key_path, true) {
+        match key.delete_value(locator) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "删除注册表值失败：{}\\{} → {locator}",
+                        loc.hive.label(),
+                        loc.key_path
+                    )
+                })
+            }
+        }
+    }
+    // StartupApproved 只是辅助开关，删除失败不影响主值已删除的事实。
+    if let Err(err) =
+        startup_approved::delete_value(loc.approved_hive, loc.approved_key, locator)
+    {
+        eprintln!("[platform] 清理 StartupApproved 值失败（可忽略）：{err:#}");
+    }
+    Ok(())
+}
+
+/// 还原后清除禁用状态，让系统重新认可该自启动项。
+pub(crate) fn clear_disabled_state(
+    source: AutostartSource,
+    scope: &str,
+    locator: &str,
+) -> Result<()> {
+    // RunOnce 没有 StartupApproved 机制。
+    if source == AutostartSource::RegistryRunOnce {
+        return Ok(());
+    }
+    let loc = location_for(source, scope).ok_or_else(|| {
+        anyhow::anyhow!("未知的注册表自启动位置：{source:?} / {scope}")
+    })?;
+    startup_approved::write_enabled(loc.approved_hive, loc.approved_key, locator, true)
+        .with_context(|| format!("清除注册表自启动项的禁用状态失败：{locator}"))
+}
+
 /// DaemonMan 自身是否已注册开机自启。
-pub fn is_self_enabled() -> bool {
-    let Ok(key) = startup_approved::open(Hive::CurrentUser, RUN, false) else {
+pub fn is_self_enabled() -> bool {    let Ok(key) = startup_approved::open(Hive::CurrentUser, RUN, false) else {
         return false;
     };
     if key.get_value::<String, _>(SELF_VALUE_NAME).is_err() {

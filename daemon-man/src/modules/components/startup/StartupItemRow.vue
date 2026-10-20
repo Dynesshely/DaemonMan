@@ -1,12 +1,19 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { RotateCcw } from "lucide-vue-next";
+import {
+  CalendarClock,
+  FolderOpen,
+  KeyRound,
+  RotateCcw,
+  Server,
+} from "lucide-vue-next";
 
 import type { AutostartItem } from "@/api";
 import BaseBadge from "@/modules/components/ui/BaseBadge.vue";
 import BaseButton from "@/modules/components/ui/BaseButton.vue";
 import ToggleSwitch from "@/modules/components/ui/ToggleSwitch.vue";
 import { useI18n } from "@/modules/locales";
+import { useIconStore } from "@/modules/stores/icons";
 import type { BadgeVariant } from "@/modules/utils/status";
 
 const props = defineProps<{
@@ -20,9 +27,27 @@ const emit = defineEmits<{
   "update:selected": [value: boolean];
   toggle: [item: AutostartItem, enabled: boolean];
   release: [item: AutostartItem];
+  contextmenu: [item: AutostartItem, event: MouseEvent];
 }>();
 
 const { t } = useI18n();
+const iconStore = useIconStore();
+
+/** 20×20 行内图标；未加载或提取失败时为 null，回退到按来源的 lucide 图标。 */
+const iconUrl = computed(() => iconStore.get(props.item.executable));
+
+const fallbackIcon = computed(() => {
+  switch (props.item.source) {
+    case "startup-folder":
+      return FolderOpen;
+    case "scheduled-task":
+      return CalendarClock;
+    case "service":
+      return Server;
+    default:
+      return KeyRound;
+  }
+});
 
 const badges = computed<{ label: string; variant: BadgeVariant }[]>(() => {
   const list: { label: string; variant: BadgeVariant }[] = [];
@@ -54,6 +79,10 @@ const toggleDisabled = computed(
 function onSelectChange(event: Event) {
   emit("update:selected", (event.target as HTMLInputElement).checked);
 }
+
+function onContextMenu(event: MouseEvent) {
+  emit("contextmenu", props.item, event);
+}
 </script>
 
 <template>
@@ -64,6 +93,7 @@ function onSelectChange(event: Event) {
         ? 'bg-brand-50/50 dark:bg-brand-500/5'
         : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/30'
     "
+    @contextmenu.prevent="onContextMenu"
   >
     <input
       type="checkbox"
@@ -73,6 +103,24 @@ function onSelectChange(event: Event) {
       :aria-label="item.name"
       @change="onSelectChange"
     />
+
+    <span
+      class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center"
+      aria-hidden="true"
+    >
+      <img
+        v-if="iconUrl"
+        :src="iconUrl"
+        alt=""
+        class="h-5 w-5 rounded object-contain"
+        draggable="false"
+      />
+      <component
+        :is="fallbackIcon"
+        v-else
+        class="h-4 w-4 text-zinc-400 dark:text-zinc-500"
+      />
+    </span>
 
     <div class="min-w-0 flex-1">
       <div class="flex flex-wrap items-center gap-x-2 gap-y-1">

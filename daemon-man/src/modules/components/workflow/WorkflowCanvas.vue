@@ -34,6 +34,12 @@ import type { WorkflowSelection } from "./types";
 
 const emit = defineEmits<{ "selection-change": [selection: WorkflowSelection] }>();
 
+/** 外部（比如从文本视图切回来）希望保持的选中节点。 */
+const props = withDefaults(
+  defineProps<{ selectedNodeId?: string | null }>(),
+  { selectedNodeId: null },
+);
+
 const store = useWorkflowStore();
 const ui = useUiStore();
 const theme = useThemeStore();
@@ -52,6 +58,7 @@ const {
   getSelectedNodes,
   removeEdges,
   removeNodes,
+  removeSelectedElements,
   updateNode,
   viewport,
   zoomIn,
@@ -105,6 +112,26 @@ function emitSelection() {
       nodes.length === 0 && edges.length === 1 ? edges[0].id : null,
   });
 }
+
+/** 从文本视图切回节点视图时画布会重新挂载，这里按外部选中恢复画布选中态。 */
+function applySelectedNode(id: string | null | undefined) {
+  if (!id) return;
+  const current = getSelectedNodes.value;
+  if (current.length === 1 && current[0].id === id) return;
+  const node = findNode(id);
+  if (!node) return;
+  removeSelectedElements();
+  addSelectedNodes([node]);
+}
+
+watch(
+  () => props.selectedNodeId,
+  (id) => {
+    // 只在明确选中某个节点时同步；null 不主动清空，避免把「选中边」也一起取消。
+    if (id) applySelectedNode(id);
+  },
+  { immediate: true, flush: "post" },
+);
 
 /** 从 draft 全量重建画布（仅在 draft 对象整体替换时调用：载入 / 保存 / 切换）。 */
 function rebuildFromDraft(next: Workflow | null) {
@@ -180,6 +207,7 @@ watch([getSelectedNodes, getSelectedEdges], () => emitSelection(), {
 });
 
 function onInit() {
+  applySelectedNode(props.selectedNodeId);
   if ((store.draft?.nodes.length ?? 0) > 0) {
     fitWhenReady();
   }

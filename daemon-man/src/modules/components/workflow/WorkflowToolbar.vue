@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed } from "vue";
-import { GitBranch, Rocket } from "lucide-vue-next";
+import { computed, type Component } from "vue";
+import { GitBranch, ListTree, Rocket, Workflow } from "lucide-vue-next";
 
-import type { Workflow } from "@/api";
+import type { Workflow as WorkflowModel } from "@/api";
 import BaseBadge from "@/modules/components/ui/BaseBadge.vue";
 import ToggleSwitch from "@/modules/components/ui/ToggleSwitch.vue";
 import { inputClass } from "@/modules/components/ui/form";
@@ -10,12 +10,26 @@ import { useI18n } from "@/modules/locales";
 import { useWorkflowStore } from "@/modules/stores/workflows";
 import { runStatusVariant } from "@/modules/utils/status";
 
-const props = defineProps<{ draft: Workflow }>();
+import type { WorkflowViewMode } from "./types";
+
+const props = defineProps<{ draft: WorkflowModel; view: WorkflowViewMode }>();
+
+const emit = defineEmits<{ "update:view": [view: WorkflowViewMode] }>();
 
 const store = useWorkflowStore();
 const { t } = useI18n();
 
 const run = computed(() => store.draftRun);
+
+/** 视图切换胶囊按钮。 */
+const viewOptions: {
+  value: WorkflowViewMode;
+  labelKey: string;
+  icon: Component;
+}[] = [
+  { value: "nodes", labelKey: "workflow.view.nodes", icon: Workflow },
+  { value: "text", labelKey: "workflow.view.text", icon: ListTree },
+];
 
 const progress = computed(() => {
   const nodes = run.value ? Object.values(run.value.nodes) : [];
@@ -89,6 +103,31 @@ const progress = computed(() => {
         class="h-3.5 w-3.5 text-brand-500"
         :title="t('workflow.enabledOnStartup')"
       />
+    </div>
+
+    <!-- 节点视图 / 文本视图 切换 -->
+    <div
+      role="group"
+      :aria-label="t('workflow.view.label')"
+      :title="t('workflow.view.label')"
+      class="inline-flex shrink-0 items-center gap-0.5 rounded-lg bg-zinc-100 p-0.5 dark:bg-zinc-800/80"
+    >
+      <button
+        v-for="option in viewOptions"
+        :key="option.value"
+        type="button"
+        class="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition"
+        :class="
+          props.view === option.value
+            ? 'bg-brand-600 text-white shadow-sm'
+            : 'text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200'
+        "
+        :aria-pressed="props.view === option.value"
+        @click="emit('update:view', option.value)"
+      >
+        <component :is="option.icon" class="h-3.5 w-3.5" />
+        {{ t(option.labelKey) }}
+      </button>
     </div>
   </div>
 </template>

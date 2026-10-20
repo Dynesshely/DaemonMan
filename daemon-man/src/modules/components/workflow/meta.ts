@@ -72,6 +72,17 @@ export const nodeStatusDot: Record<NodeStatus, string> = {
   cancelled: "bg-amber-500",
 };
 
+/** 运行状态 -> 文本视图里节点名的文字色（与画布状态色系一致）。 */
+export const nodeStatusText: Record<NodeStatus, string> = {
+  pending: "text-zinc-600 dark:text-zinc-300",
+  waiting: "text-sky-600 dark:text-sky-400",
+  running: "text-brand-600 dark:text-brand-400",
+  success: "text-emerald-600 dark:text-emerald-400",
+  failed: "text-red-600 dark:text-red-400",
+  skipped: "text-zinc-400 dark:text-zinc-500",
+  cancelled: "text-amber-600 dark:text-amber-400",
+};
+
 /** 连线上显示的简短条件文案（完整文案见 workflow.edge* i18n）。 */
 export function edgeConditionLabel(
   condition: EdgeCondition,

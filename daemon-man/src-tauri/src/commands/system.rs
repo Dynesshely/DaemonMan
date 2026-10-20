@@ -2,11 +2,13 @@
 
 use std::sync::Arc;
 
+use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config;
 use crate::legacy;
 use crate::model::{AppConfig, LegacyImportResult, LogEntry, LogLevel};
+use crate::platform;
 use crate::state::AppState;
 
 #[tauri::command]
@@ -132,6 +134,26 @@ pub fn import_legacy_config(
         warnings,
         replaced,
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileIconPayload {
+    pub path: String,
+    pub data_url: Option<String>,
+}
+
+/// 批量提取文件图标（PNG data URL），供自启动列表懒加载显示。
+#[tauri::command]
+pub fn get_file_icons(paths: Vec<String>, size: Option<u32>) -> Vec<FileIconPayload> {
+    let size = size.unwrap_or(32).clamp(16, 128);
+    paths
+        .into_iter()
+        .map(|path| {
+            let data_url = platform::file_icon_data_url(&path, size);
+            FileIconPayload { path, data_url }
+        })
+        .collect()
 }
 
 #[tauri::command]

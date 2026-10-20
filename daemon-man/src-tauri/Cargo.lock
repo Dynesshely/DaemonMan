@@ -664,8 +664,10 @@ name = "daemon-man"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "dirs 6.0.0",
+ "image",
  "serde",
  "serde_json",
  "sysinfo",

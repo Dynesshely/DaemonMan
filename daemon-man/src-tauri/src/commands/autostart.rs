@@ -58,6 +58,7 @@ pub fn set_autostart_enabled(
             name: item.name.clone(),
             source: item.source,
             disabled_at: now_iso(),
+            mode: "native".into(),
         };
         state
             .mutate_config(|config| {
@@ -212,6 +213,7 @@ pub fn take_over_autostart(
             name: item.name.clone(),
             source: item.source,
             disabled_at: now_iso(),
+            mode: "native".into(),
         });
         success_ids.push(item.id.clone());
     }
@@ -276,7 +278,7 @@ pub fn take_over_autostart(
     })
 }
 
-/// 取消接管：重新启用系统自启动项。
+/// 取消接管 / 从备份恢复：重新启用系统自启动项。
 #[tauri::command]
 pub fn release_autostart(
     app: AppHandle,
@@ -284,8 +286,8 @@ pub fn release_autostart(
     item_id: String,
 ) -> Result<AutostartItem, String> {
     let state = state.inner().clone();
-    let item = platform::set_autostart_enabled(&item_id, true)
-        .map_err(|err| format!("恢复自启动项失败：{err}"))?;
+    let item = platform::restore_autostart(&item_id)
+        .map_err(|err| format!("恢复自启动项失败：{err:#}"))?;
     state
         .mutate_config(|config| config.overrides.retain(|o| o.id != item_id))
         .map_err(|err| err.to_string())?;
@@ -298,6 +300,131 @@ pub fn release_autostart(
         Some(item_id),
     );
     Ok(item)
+}
+
+/// 右键「禁用」：支持的项用系统开关；不支持的项备份到配置目录后从原位置移除。
+#[tauri::command]
+pub fn disable_autostart_item(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    item_id: String,
+) -> Result<AutostartItem, String> {
+    let state = state.inner().clone();
+    let item = state
+        .autostart_cached(true)
+        .into_iter()
+        .find(|candidate| candidate.id == item_id)
+        .ok_or_else(|| "未找到自启动项".to_string())?;
+
+    if item.is_self {
+        return Err("不能禁用 DaemonMan 自身".into());
+    }
+
+    platform::disable_autostart(&item).map_err(|err| format!("禁用失败：{err:#}"))?;
+    let mode = if item.toggle_supported { "native" } else { "removed" };
+
+    let entry = AutostartOverride {
+        id: item.id.clone(),
+        name: item.name.clone(),
+        source: item.source,
+        disabled_at: now_iso(),
+        mode: mode.to_string(),
+    };
+    state
+        .mutate_config(|config| {
+            config.overrides.retain(|o| o.id != entry.id);
+            config.overrides.push(entry);
+        })
+        .map_err(|err| err.to_string())?;
+    state.autostart_cache_invalidate();
+
+    state.log(
+        &app,
+        LogLevel::Info,
+        "autostart",
+        format!(
+            "自启动项「{}」已禁用（{}）",
+            item.name,
+            if mode == "native" {
+                "系统开关"
+            } else {
+                "已备份并移除"
+            }
+        ),
+        Some(item.id.clone()),
+    );
+
+    let mut updated = state
+        .autostart_cached(true)
+        .into_iter()
+        .find(|candidate| candidate.id == item_id)
+        .unwrap_or(item);
+    updated.enabled = false;
+    updated.taken_over = true;
+    Ok(updated)
+}
+
+/// 右键「恢复」：与取消接管等价，同时支持从备份还原被移除的项。
+#[tauri::command]
+pub fn restore_autostart_item(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    item_id: String,
+) -> Result<AutostartItem, String> {
+    let state = state.inner().clone();
+    let item = platform::restore_autostart(&item_id)
+        .map_err(|err| format!("恢复失败：{err:#}"))?;
+    state
+        .mutate_config(|config| config.overrides.retain(|o| o.id != item_id))
+        .map_err(|err| err.to_string())?;
+    state.autostart_cache_invalidate();
+    state.log(
+        &app,
+        LogLevel::Info,
+        "autostart",
+        format!("已恢复自启动项「{}」", item.name),
+        Some(item_id),
+    );
+    Ok(item)
+}
+
+/// 右键「删除」：先把数据备份到配置目录，再从原位置永久删除。
+#[tauri::command]
+pub fn delete_autostart_item(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    item_id: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let item = state
+        .autostart_cached(true)
+        .into_iter()
+        .find(|candidate| candidate.id == item_id)
+        .ok_or_else(|| "未找到自启动项".to_string())?;
+
+    if item.is_self {
+        return Err("不能删除 DaemonMan 自身".into());
+    }
+    if !item.can_delete {
+        return Err("该类型的自启动项不支持删除（系统服务请使用禁用）".into());
+    }
+
+    platform::delete_autostart(&item).map_err(|err| format!("删除失败：{err:#}"))?;
+    state
+        .mutate_config(|config| config.overrides.retain(|o| o.id != item_id))
+        .map_err(|err| err.to_string())?;
+    state.autostart_cache_invalidate();
+    state.log(
+        &app,
+        LogLevel::Warn,
+        "autostart",
+        format!(
+            "已删除自启动项「{}」（原数据已备份到配置目录的 autostart-backup/）",
+            item.name
+        ),
+        Some(item_id),
+    );
+    Ok(())
 }
 
 /// 简单的命令行参数切分，支持双引号包裹。

@@ -187,6 +187,7 @@ fn scan_entry(loc: FolderLocation, path: &Path) -> Option<AutostartItem> {
         args,
         enabled,
         toggle_supported: true,
+        can_delete: true,
         requires_admin: loc.hive.is_machine(),
         is_self,
         taken_over: false,
@@ -209,6 +210,15 @@ pub fn set_enabled(item: &AutostartItem, enabled: bool) -> Result<()> {
     let full_path = dir.join(&item.locator).display().to_string();
     startup_approved::write_enabled(loc.hive, APPROVED_STARTUP_FOLDER, &full_path, enabled)
         .with_context(|| format!("切换启动文件夹自启动项「{}」失败", item.name))
+}
+
+/// 启动文件夹条目的真实文件路径（供备份 / 删除 / 还原使用）。
+pub(crate) fn item_path(scope: &str, locator: &str) -> Result<PathBuf> {
+    let loc = location_for(scope).ok_or_else(|| {
+        anyhow::anyhow!("未知的启动文件夹范围：{scope}")
+    })?;
+    let dir = startup_dir(loc).context("无法确定启动文件夹路径")?;
+    Ok(dir.join(locator))
 }
 
 #[cfg(test)]

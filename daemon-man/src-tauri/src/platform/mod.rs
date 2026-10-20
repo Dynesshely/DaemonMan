@@ -16,6 +16,8 @@ use anyhow::Result;
 use crate::model::{AppLaunchSpec, AutostartItem, ProcessInfo};
 
 mod com;
+pub mod backup;
+pub mod icon;
 pub mod proc;
 pub mod registry;
 pub mod services;
@@ -157,6 +159,26 @@ pub fn close_main_window(process_name: &str) -> bool {
 /// 把主窗口置前。
 pub fn focus_main_window(process_name: &str) -> bool {
     proc::focus_main_window(process_name)
+}
+
+/// 提取文件图标（PNG data URL）；失败返回 None。
+pub fn file_icon_data_url(path: &str, size: u32) -> Option<String> {
+    icon::file_icon_data_url(path, size)
+}
+
+/// 禁用自启动项：优先系统开关；不支持的项备份后从原位置移除。
+pub fn disable_autostart(item: &AutostartItem) -> Result<()> {
+    backup::disable(item)
+}
+
+/// 恢复（重新启用）自启动项。
+pub fn restore_autostart(item_id: &str) -> Result<AutostartItem> {
+    backup::restore(item_id)
+}
+
+/// 删除自启动项：先备份到 DaemonMan 配置目录，再从原位置永久删除。
+pub fn delete_autostart(item: &AutostartItem) -> Result<()> {
+    backup::delete(item)
 }
 
 #[cfg(test)]

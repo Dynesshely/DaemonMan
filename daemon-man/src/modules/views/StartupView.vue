@@ -14,12 +14,14 @@ import {
 } from "lucide-vue-next";
 
 import type { AutostartItem, TakeOverResult } from "@/api";
+import { api } from "@/api";
 import PageHeader from "@/modules/components/layout/PageHeader.vue";
 import BaseButton from "@/modules/components/ui/BaseButton.vue";
 import BaseModal from "@/modules/components/ui/BaseModal.vue";
 import EmptyState from "@/modules/components/ui/EmptyState.vue";
 import SectionCard from "@/modules/components/ui/SectionCard.vue";
 import FilterTabs from "@/modules/components/startup/FilterTabs.vue";
+import StartupContextMenu from "@/modules/components/startup/StartupContextMenu.vue";
 import StartupItemRow from "@/modules/components/startup/StartupItemRow.vue";
 import TakeOverModal from "@/modules/components/startup/TakeOverModal.vue";
 import {
@@ -34,6 +36,7 @@ import { inputClass } from "@/modules/components/ui/form";
 import { useI18n } from "@/modules/locales";
 import { useAppStore } from "@/modules/stores/app";
 import { useAutostartStore } from "@/modules/stores/autostart";
+import { useIconStore } from "@/modules/stores/icons";
 import { useUiStore } from "@/modules/stores/ui";
 import { useWorkflowStore } from "@/modules/stores/workflows";
 import { formatRelative } from "@/modules/utils/format";
@@ -43,6 +46,7 @@ type FilterKind = "all" | "enabled" | "disabled" | "takenOver";
 const router = useRouter();
 const appStore = useAppStore();
 const autostartStore = useAutostartStore();
+const iconStore = useIconStore();
 const workflowStore = useWorkflowStore();
 const ui = useUiStore();
 const { t, locale } = useI18n();
@@ -58,6 +62,19 @@ const takeOverBusy = ref(false);
 const takeOverResult = ref<TakeOverResult | null>(null);
 const releaseTarget = ref<AutostartItem | null>(null);
 const releaseBusy = ref(false);
+const contextOpen = ref(false);
+const contextX = ref(0);
+const contextY = ref(0);
+const contextTarget = ref<AutostartItem | null>(null);
+const disableTarget = ref<AutostartItem | null>(null);
+const disableBusy = ref(false);
+const deleteTarget = ref<AutostartItem | null>(null);
+const deleteBusy = ref(false);
+const restoreBusy = ref(false);
+
+const actionBusy = computed(
+  () => disableBusy.value || deleteBusy.value || restoreBusy.value,
+);
 
 const filters = computed<
   { value: FilterKind; label: string }[]
@@ -214,6 +231,18 @@ async function rescan() {
     }
   } catch (error) {
     ui.notify("error", String(error));
+  } finally {
+    syncIcons();
+  }
+}
+
+/** 扫描结果变化后补齐行内图标（去重、批量、失败静默）。 */
+function syncIcons() {
+  const paths = autostartStore.items
+    .map((item) => item.executable)
+    .filter((path): path is string => Boolean(path));
+  if (paths.length > 0) {
+    void iconStore.ensure(paths);
   }
 }
 
@@ -309,6 +338,94 @@ function goSettings() {
   void router.push("/settings");
 }
 
+function openContextMenu(item: AutostartItem, event: MouseEvent) {
+  contextTarget.value = item;
+  contextX.value = event.clientX;
+  contextY.value = event.clientY;
+  contextOpen.value = true;
+}
+
+function closeContextMenu() {
+  contextOpen.value = false;
+  contextTarget.value = null;
+}
+
+/** 右键「禁用」：先确认，再交给后端（系统开关或备份后移除）。 */
+function askDisable(item: AutostartItem) {
+  closeContextMenu();
+  if (!item.enabled || item.isSelf) return;
+  disableTarget.value = item;
+}
+
+function closeDisable() {
+  if (disableBusy.value) return;
+  disableTarget.value = null;
+}
+
+async function confirmDisable() {
+  const target = disableTarget.value;
+  if (!target || disableBusy.value) return;
+  disableBusy.value = true;
+  try {
+    await api.disableAutostartItem(target.id);
+    await autostartStore.scan(true);
+    syncIcons();
+    ui.notify("success", t("startup.disableSuccess", { name: target.name }));
+    disableTarget.value = null;
+  } catch (error) {
+    ui.notify("error", t("startup.disableFailed", { error: String(error) }));
+  } finally {
+    disableBusy.value = false;
+  }
+}
+
+/** 右键「恢复」：无需确认。 */
+async function restoreItem(item: AutostartItem) {
+  closeContextMenu();
+  if (item.isSelf || restoreBusy.value) return;
+  if (!(item.enabled === false || item.takenOver)) return;
+  restoreBusy.value = true;
+  try {
+    await api.restoreAutostartItem(item.id);
+    await autostartStore.scan(true);
+    syncIcons();
+    ui.notify("success", t("startup.restoreSuccess", { name: item.name }));
+  } catch (error) {
+    ui.notify("error", t("startup.restoreFailed", { error: String(error) }));
+  } finally {
+    restoreBusy.value = false;
+  }
+}
+
+/** 右键「删除」：先确认，再备份到配置目录并从原位置删除。 */
+function askDelete(item: AutostartItem) {
+  closeContextMenu();
+  if (!item.canDelete || item.isSelf) return;
+  deleteTarget.value = item;
+}
+
+function closeDelete() {
+  if (deleteBusy.value) return;
+  deleteTarget.value = null;
+}
+
+async function confirmDelete() {
+  const target = deleteTarget.value;
+  if (!target || deleteBusy.value) return;
+  deleteBusy.value = true;
+  try {
+    await api.deleteAutostartItem(target.id);
+    await autostartStore.scan(true);
+    syncIcons();
+    ui.notify("success", t("startup.deleteSuccess", { name: target.name }));
+    deleteTarget.value = null;
+  } catch (error) {
+    ui.notify("error", t("startup.deleteFailed", { error: String(error) }));
+  } finally {
+    deleteBusy.value = false;
+  }
+}
+
 watch(
   () => autostartStore.items,
   (items) => {
@@ -318,6 +435,13 @@ watch(
     );
     if (next.size !== selected.value.size) {
       selected.value = next;
+    }
+    syncIcons();
+    if (
+      contextTarget.value &&
+      !items.some((item) => item.id === contextTarget.value?.id)
+    ) {
+      closeContextMenu();
     }
   },
 );
@@ -341,6 +465,7 @@ onMounted(async () => {
       ? workflowStore.load()
       : Promise.resolve(),
   ]);
+  syncIcons();
 });
 </script>
 
@@ -513,6 +638,7 @@ onMounted(async () => {
           @update:selected="setSelected(item.id, $event)"
           @toggle="onToggle"
           @release="askRelease"
+          @contextmenu="openContextMenu"
         />
       </div>
 
@@ -529,6 +655,18 @@ onMounted(async () => {
         </template>
       </EmptyState>
     </SectionCard>
+
+    <StartupContextMenu
+      :open="contextOpen"
+      :x="contextX"
+      :y="contextY"
+      :item="contextTarget"
+      :busy="actionBusy"
+      @close="closeContextMenu"
+      @disable="askDisable"
+      @restore="restoreItem"
+      @delete="askDelete"
+    />
 
     <TakeOverModal
       :open="takeOverOpen"
@@ -568,6 +706,70 @@ onMounted(async () => {
           @click="confirmRelease"
         >
           {{ t("startup.release") }}
+        </BaseButton>
+      </template>
+    </BaseModal>
+
+    <!-- 右键「禁用」确认 -->
+    <BaseModal
+      :open="disableTarget !== null"
+      :title="t('startup.menu.disable')"
+      size="sm"
+      :closable="!disableBusy"
+      @close="closeDisable"
+    >
+      <p class="text-xs leading-relaxed text-zinc-600 dark:text-zinc-300">
+        {{
+          t("startup.disableConfirm", { name: disableTarget?.name ?? "" })
+        }}
+      </p>
+      <template #footer>
+        <BaseButton
+          variant="secondary"
+          size="sm"
+          :disabled="disableBusy"
+          @click="closeDisable"
+        >
+          {{ t("common.cancel") }}
+        </BaseButton>
+        <BaseButton
+          variant="primary"
+          size="sm"
+          :loading="disableBusy"
+          @click="confirmDisable"
+        >
+          {{ t("startup.menu.disable") }}
+        </BaseButton>
+      </template>
+    </BaseModal>
+
+    <!-- 右键「删除」确认 -->
+    <BaseModal
+      :open="deleteTarget !== null"
+      :title="t('startup.menu.delete')"
+      size="sm"
+      :closable="!deleteBusy"
+      @close="closeDelete"
+    >
+      <p class="text-xs leading-relaxed text-zinc-600 dark:text-zinc-300">
+        {{ t("startup.deleteConfirm", { name: deleteTarget?.name ?? "" }) }}
+      </p>
+      <template #footer>
+        <BaseButton
+          variant="secondary"
+          size="sm"
+          :disabled="deleteBusy"
+          @click="closeDelete"
+        >
+          {{ t("common.cancel") }}
+        </BaseButton>
+        <BaseButton
+          variant="danger"
+          size="sm"
+          :loading="deleteBusy"
+          @click="confirmDelete"
+        >
+          {{ t("startup.menu.delete") }}
         </BaseButton>
       </template>
     </BaseModal>

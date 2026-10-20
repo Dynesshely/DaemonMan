@@ -483,6 +483,8 @@ pub struct AutostartItem {
     pub enabled: bool,
     /// 是否支持由 DaemonMan 开关
     pub toggle_supported: bool,
+    /// 是否支持从原位置永久删除（系统服务不支持）
+    pub can_delete: bool,
     /// 开关是否需要管理员权限
     pub requires_admin: bool,
     /// 是否是 DaemonMan 自己
@@ -509,6 +511,7 @@ impl Default for AutostartItem {
             args: None,
             enabled: true,
             toggle_supported: true,
+            can_delete: false,
             requires_admin: false,
             is_self: false,
             taken_over: false,
@@ -526,6 +529,8 @@ pub struct AutostartOverride {
     pub name: String,
     pub source: AutostartSource,
     pub disabled_at: String,
+    /// 禁用方式：`native`（系统开关）或 `removed`（备份后从原位置移除）
+    pub mode: String,
 }
 
 impl Default for AutostartOverride {
@@ -535,6 +540,7 @@ impl Default for AutostartOverride {
             name: String::new(),
             source: AutostartSource::RegistryRun,
             disabled_at: now_iso(),
+            mode: "native".into(),
         }
     }
 }

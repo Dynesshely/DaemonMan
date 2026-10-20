@@ -137,4 +137,20 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 
 两组 Tabs 与搜索、状态筛选是 AND 关系；计数徽标基于其它筛选条件的当前结果动态计算；全选与批量接管只作用于可见行。
 
+### 8.1 图标与右键禁用/删除
+
+- 图标：`platform::icon::file_icon_data_url` 用 `IShellItemImageFactory` 取 shell 图标（`.exe`/`.lnk`/`.bat` 一致），HBITMAP → 32bpp DIB → RGBA → PNG → base64 data URL；`SHGetFileInfoW` 兜底；进程内按（小写路径, 尺寸）缓存。命令层 `get_file_icons` 批量返回，前端 `useIconStore` 分批懒加载。
+- 备份：`platform::backup` 维护 `~/.daemonMan/autostart-backup/index.json` 与文件副本/任务 XML，写入走 `config::write_atomic` + 进程内锁。
+  - `disable`：`toggle_supported` 的项走各来源的系统开关（mode=native）；其余（如 RunOnce）先备份再移除（mode=removed）。
+  - `restore`：无备份记录时回退为扫描后 native 启用；native 重新启用；removed 还原注册表原值（含类型与原始字节）/文件/任务 XML，成功后清理记录。
+  - `delete`：拒绝 `can_delete=false`（服务），先备份（mode=deleted）再永久删除；备份失败即中止。
+- `AutostartItem.can_delete` 由各扫描器填写；`AutostartOverride.mode` 记录 native/removed，用于恢复语义。
+
+## 9. 工作流双视图
+
+`WorkflowsView` 提供两种视图，共享同一 `draft`、保存/校验/运行与实时状态：
+
+- 节点视图：Vue Flow 画布（拖拽、连线、自动排列、属性检查器、运行监控）。
+- 文本视图：`WorkflowTextView.vue` + `graph.ts` 的 Kahn 分层算法。表格展示序号、执行层、类型、名称、目标/参数、上游依赖（含条件）、下游数、运行状态；另有「执行分层」区块。行点击联动右侧属性面板；切换视图保留选中节点。
+
 

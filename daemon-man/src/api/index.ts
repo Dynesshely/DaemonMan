@@ -5,6 +5,7 @@ import type {
   AppConfig,
   AppSettings,
   AutostartItem,
+  FileIcon,
   LegacyImportResult,
   LogEntry,
   ProcessInfo,
@@ -66,6 +67,22 @@ export const api = {
     }),
   releaseAutostart: (itemId: string) =>
     invoke<AutostartItem>("release_autostart", { itemId }),
+
+  /** 右键「禁用」：native 开关或备份后移除。 */
+  disableAutostartItem: (itemId: string) =>
+    invoke<AutostartItem>("disable_autostart_item", { itemId }),
+
+  /** 右键「恢复」：启用系统开关或从备份还原。 */
+  restoreAutostartItem: (itemId: string) =>
+    invoke<AutostartItem>("restore_autostart_item", { itemId }),
+
+  /** 右键「删除」：先备份到配置目录再从原位置删除。 */
+  deleteAutostartItem: (itemId: string) =>
+    invoke<void>("delete_autostart_item", { itemId }),
+
+  /** 批量提取文件图标（PNG data URL）。 */
+  getFileIcons: (paths: string[], size = 32) =>
+    invoke<FileIcon[]>("get_file_icons", { paths, size }),
 
   // 进程
   listProcesses: () => invoke<ProcessInfo[]>("list_processes"),

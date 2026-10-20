@@ -68,6 +68,51 @@ impl Hive {
             Hive::LocalMachine32 => "HKLM\\WOW6432Node",
         }
     }
+
+    /// 备份记录里使用的稳定短名：`HKCU` / `HKLM` / `HKLM32`。
+    pub(crate) fn as_record_str(self) -> &'static str {
+        match self {
+            Hive::CurrentUser => "HKCU",
+            Hive::LocalMachine => "HKLM",
+            Hive::LocalMachine32 => "HKLM32",
+        }
+    }
+
+    /// 从备份记录的字符串恢复。
+    pub(crate) fn from_record_str(text: &str) -> Option<Hive> {
+        match text {
+            "HKCU" => Some(Hive::CurrentUser),
+            "HKLM" => Some(Hive::LocalMachine),
+            "HKLM32" => Some(Hive::LocalMachine32),
+            _ => None,
+        }
+    }
+}
+
+/// `REG_*` 类型值（winreg 的枚举）转成备份记录里的 u32。
+pub(crate) fn reg_type_to_u32(value_type: RegType) -> u32 {
+    value_type as u32
+}
+
+/// 备份记录里的 u32 还原成 winreg 的 `RegType`。
+///
+/// 未知类型退回 `REG_BINARY`，保证原始字节仍然能被写回。
+pub(crate) fn reg_type_from_u32(value_type: u32) -> RegType {
+    match value_type {
+        0 => REG_NONE,
+        1 => REG_SZ,
+        2 => REG_EXPAND_SZ,
+        3 => REG_BINARY,
+        4 => REG_DWORD,
+        5 => REG_DWORD_BIG_ENDIAN,
+        6 => REG_LINK,
+        7 => REG_MULTI_SZ,
+        8 => REG_RESOURCE_LIST,
+        9 => REG_FULL_RESOURCE_DESCRIPTOR,
+        10 => REG_RESOURCE_REQUIREMENTS_LIST,
+        11 => REG_QWORD,
+        _ => REG_BINARY,
+    }
 }
 
 /// 打开一个注册表键。

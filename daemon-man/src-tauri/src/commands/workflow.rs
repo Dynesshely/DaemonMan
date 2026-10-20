@@ -282,6 +282,21 @@ pub fn run_single_node(
         .ok_or_else(|| "创建运行记录失败".to_string())
 }
 
+/// 单点启动分组：把分组内所有可执行节点作为一次调试运行执行。
+#[tauri::command]
+pub fn run_single_group(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    workflow: Workflow,
+    group_id: String,
+) -> Result<WorkflowRun, String> {
+    let state = state.inner().clone();
+    let run_id = engine::spawn_group_run(app, state.clone(), workflow, &group_id)?;
+    state
+        .run(&run_id)
+        .ok_or_else(|| "创建运行记录失败".to_string())
+}
+
 /// 运行所有启用中的工作流（供托盘菜单与登录启动复用）。
 pub fn run_all_enabled_impl(
     app: &AppHandle,

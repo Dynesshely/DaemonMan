@@ -1,4 +1,4 @@
-import type { NodePosition, WorkflowEdge, WorkflowNode } from "@/api";
+import type { WorkflowEdge, WorkflowNode } from "@/api";
 
 import { buildAdjacency } from "./graph";
 
@@ -50,19 +50,63 @@ export function computeDelayPills(
       targetEdgeId: targetEdge.id,
     });
   }
+
+  // 相邻的两个候选（延时链）都不折叠：合成边会引用不可见节点，渲染/交互会错乱。
+  // 这类延时仍然按普通卡片展示，候选判定保持动态。
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [id, pill] of pills) {
+      if (pills.has(pill.sourceId) || pills.has(pill.targetId)) {
+        pills.delete(id);
+        changed = true;
+      }
+    }
+  }
   return pills;
 }
 
-/** 边 id -> 折叠在该边上的延时节点 id（两侧边都会映射）。 */
-export function pillByEdge(
+/** 合成连线 id：`delay:${sourceEdgeId}:${targetEdgeId}`。 */
+export function delayEdgeId(pill: DelayPillInfo): string {
+  return `delay:${pill.sourceEdgeId}:${pill.targetEdgeId}`;
+}
+
+/**
+ * 渲染用的「折叠边」：每个候选延时丢弃原两条边，合成一条 source→target 的边
+ * （condition 固定 success，id 稳定），其余边原样保留。
+ *
+ * 与 `buildDelayLayoutGraph` 的区别：这里保留所有边对象（含分组/条件等），只做 1:1 替换。
+ */
+export function foldDelayEdges(
+  edges: WorkflowEdge[],
   pills: Map<string, DelayPillInfo>,
-): Map<string, string> {
-  const map = new Map<string, string>();
+): WorkflowEdge[] {
+  if (pills.size === 0) return edges;
+
+  const pillBySourceEdge = new Map<string, DelayPillInfo>();
+  const foldedEdgeIds = new Set<string>();
   for (const pill of pills.values()) {
-    map.set(pill.sourceEdgeId, pill.nodeId);
-    map.set(pill.targetEdgeId, pill.nodeId);
+    pillBySourceEdge.set(pill.sourceEdgeId, pill);
+    foldedEdgeIds.add(pill.sourceEdgeId);
+    foldedEdgeIds.add(pill.targetEdgeId);
   }
-  return map;
+
+  const result: WorkflowEdge[] = [];
+  for (const edge of edges) {
+    const pill = pillBySourceEdge.get(edge.id);
+    if (pill) {
+      result.push({
+        id: delayEdgeId(pill),
+        source: pill.sourceId,
+        target: pill.targetId,
+        condition: "success",
+      });
+      continue;
+    }
+    if (foldedEdgeIds.has(edge.id)) continue;
+    result.push(edge);
+  }
+  return result;
 }
 
 export interface DelayLayoutGraph {
@@ -131,38 +175,4 @@ export function buildDelayLayoutGraph(
       ...virtualEdges,
     ],
   };
-}
-
-/**
- * 布局完成后把药丸放到 source / target 的中点（节点坐标是左上角，这里再偏移半个体积，
- * 让药丸中心落在两点中间）。相邻药丸链通过递归求值，成环时回退。
- */
-export function placeDelayPills(
-  pills: Map<string, DelayPillInfo>,
-  positions: Map<string, NodePosition>,
-): void {
-  if (pills.size === 0) return;
-  const resolving = new Set<string>();
-
-  const resolve = (id: string): NodePosition | null => {
-    const existing = positions.get(id);
-    if (existing) return existing;
-    const pill = pills.get(id);
-    if (!pill || resolving.has(id)) return null;
-    resolving.add(id);
-    const source = resolve(pill.sourceId);
-    const target = resolve(pill.targetId);
-    resolving.delete(id);
-    if (!source && !target) return null;
-    const from = source ?? (target as NodePosition);
-    const to = target ?? (source as NodePosition);
-    const position: NodePosition = {
-      x: Math.round((from.x + to.x) / 2 - DELAY_PILL_WIDTH / 2),
-      y: Math.round((from.y + to.y) / 2 - DELAY_PILL_HEIGHT / 2),
-    };
-    positions.set(id, position);
-    return position;
-  };
-
-  for (const id of pills.keys()) resolve(id);
 }

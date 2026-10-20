@@ -1,10 +1,16 @@
 <script setup lang="ts">
-import { computed } from "vue";
-import { BaseEdge, getSmoothStepPath } from "@vue-flow/core";
+import { computed, inject } from "vue";
+import {
+  BaseEdge,
+  EdgeLabelRenderer,
+  getSmoothStepPath,
+} from "@vue-flow/core";
 import type { Position } from "@vue-flow/core";
 
 import type { FlowEdgeData } from "../types";
+import { WORKFLOW_SELECTED_NODE } from "../types";
 import { edgeConditionLabel } from "../meta";
+import WorkflowDelayPill from "../nodes/WorkflowDelayPill.vue";
 import { useI18n } from "@/modules/locales";
 import { useThemeStore } from "@/modules/stores/theme";
 
@@ -78,6 +84,21 @@ const labelBgStyle = computed(() => ({
   stroke: theme.isDark ? "#3f3f46" : "#e4e4e7",
   strokeWidth: 1,
 }));
+
+/** 折叠了延时药丸的边：在连线中点渲染药丸标签。 */
+const delayNodeId = computed(() => props.data?.delayNodeId ?? null);
+const delayMs = computed(() => props.data?.delayMs ?? 0);
+
+const selectedNodeId = inject(WORKFLOW_SELECTED_NODE, null);
+const delaySelected = computed(
+  () => Boolean(delayNodeId.value) && selectedNodeId?.value === delayNodeId.value,
+);
+
+const delayLabelStyle = computed(() => ({
+  position: "absolute" as const,
+  transform: `translate(-50%, -50%) translate(${geometry.value[1]}px, ${geometry.value[2]}px)`,
+  pointerEvents: "none" as const,
+}));
 </script>
 
 <template>
@@ -92,4 +113,13 @@ const labelBgStyle = computed(() => ({
     :label-style="labelStyle"
     :label-bg-style="labelBgStyle"
   />
+
+  <EdgeLabelRenderer v-if="delayNodeId">
+    <div class="nodrag nopan" :style="delayLabelStyle">
+      <WorkflowDelayPill
+        :delay-ms="delayMs"
+        :selected="delaySelected || Boolean(selected)"
+      />
+    </div>
+  </EdgeLabelRenderer>
 </template>

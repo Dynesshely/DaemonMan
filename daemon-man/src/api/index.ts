@@ -12,6 +12,7 @@ import type {
   StartMenuApp,
   SystemInfo,
   TakeOverResult,
+  TrackedProcess,
   Workflow,
   WorkflowRun,
   WorkflowValidation,
@@ -111,6 +112,16 @@ export const api = {
   /** 单点执行：用当前草稿中的某个节点发起一次调试运行。 */
   runSingleNode: (workflow: Workflow, nodeId: string) =>
     invoke<WorkflowRun>("run_single_node", { workflow, nodeId }),
+
+  /** 单点启动分组：运行分组内所有可执行节点。 */
+  runSingleGroup: (workflow: Workflow, groupId: string) =>
+    invoke<WorkflowRun>("run_single_group", { workflow, groupId }),
+
+  /** 按工作流节点追踪当前运行中的进程（含非 DaemonMan 启动的进程）。 */
+  trackWorkflowProcesses: (workflowId?: string | null) =>
+    invoke<TrackedProcess[]>("track_workflow_processes", {
+      workflowId: workflowId ?? null,
+    }),
 
   /** 临时提权执行自启动操作（GUI 仍以普通权限运行）。 */
   runElevatedAutostart: (

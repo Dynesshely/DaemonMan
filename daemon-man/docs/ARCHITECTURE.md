@@ -91,8 +91,9 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 4. **状态与取消**：任何状态变化都 `state.upsert_run` 并 emit `workflow:run`（payload 为完整 `WorkflowRun`）；取消通过 `state.run_flag(run_id)`（`Arc<AtomicBool>`）协作式生效：未执行的节点标记为 cancelled，已启动的进程不强制结束。
 5. **失败传播**：失败/取消会让 `success` 边的下游节点变为 `skipped`，但 `failure`/`always` 边继续执行，从而支持降级分支。
 6. **单点执行**：`engine::spawn_single_node_run` 校验节点存在且非分组、强制 `enabled=true`，用只含该节点的最小工作流（edges 清空、沿用原 workflow id/name/skip_existing）复用同一执行器，便于调试；不校验整张图，未保存的草稿也能单点运行。节点 id 保持不变，前端按 `run.workflowId + nodeId` 显示状态。
-7. **进程父进程**：普通启动走 `CreateProcessW + STARTUPINFOEXW`，用 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 把父进程指向当前 shell（`GetShellWindow` 所属 explorer），使工作流启动的进程不挂在 DaemonMan 进程树下；属性列表/句柄失败或 `CREATE_BREAKAWAY_FROM_JOB` 不被允许时按「去 breakaway → 普通 CreateProcess」回退。管理员启动仍由 ShellExecuteEx(runas) 处理。
-8. **已运行检测**：`platform::proc::find_running_app(spec, display_name)` 先按 processName/目标 exe 检测；若目标是浏览器（chrome/msedge/brave/chromium/opera/vivaldi），再枚举可见顶层窗口，按窗口标题与节点显示名打分匹配，并过滤「 - Google Chrome」「 - Microsoft Edge」等普通标签页标题，从而识别 PWA/Web App 是否已打开。无法精确读取命令行 `--app-id`（windows crate 未导出对应 API），标题匹配可能对无浏览器后缀的标签页产生误判，取舍为「宁可跳过也不重复开窗」。
+7. **分组单点执行**：`engine::spawn_group_run` 递归收集分组内所有后代可执行节点（含嵌套组、排除分组节点本身），强制 `enabled=true`，只保留两端都在集合内的边；沿用原 workflow id/name/skip_existing，走同一执行器产生完整运行记录，便于整体调试一个分组。
+8. **进程父进程**：普通启动走 `CreateProcessW + STARTUPINFOEXW`，用 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 把父进程指向当前 shell（`GetShellWindow` 所属 explorer），使工作流启动的进程不挂在 DaemonMan 进程树下；属性列表/句柄失败或 `CREATE_BREAKAWAY_FROM_JOB` 不被允许时按「去 breakaway → 普通 CreateProcess」回退。管理员启动仍由 ShellExecuteEx(runas) 处理。
+9. **已运行检测**：`platform::proc::find_running_app(spec, display_name)` 先按 processName/目标 exe 检测；若目标是浏览器（chrome/msedge/brave/chromium/opera/vivaldi），再枚举可见顶层窗口，按窗口标题与节点显示名打分匹配，并过滤「 - Google Chrome」「 - Microsoft Edge」等普通标签页标题，从而识别 PWA/Web App 是否已打开。无法精确读取命令行 `--app-id`（windows crate 未导出对应 API），标题匹配可能对无浏览器后缀的标签页产生误判，取舍为「宁可跳过也不重复开窗」。
 
 ## 4. 自启动接管
 
@@ -108,6 +109,19 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 ### 4.1 临时提权
 
 GUI 始终以普通权限运行。需要管理员权限的单个操作（启用/禁用 HKLM 项、服务、系统任务，恢复或删除系统级项）失败时，前端弹确认框，命令层 `elevate_autostart_op` 通过 `ShellExecuteExW(runas)` 启动同一个 exe 的 `--elevated-autostart <request.json> <result.json>` 一次性子进程（无窗口/托盘），子进程执行操作后把结果 JSON 写回并退出，父进程读取结果、失效自启动缓存并刷新界面，自身权限不变。请求只支持 `enable/disable/restore/delete` 四种动作；用户取消 UAC 时错误文案为「已取消管理员授权」。
+
+### 4.2 工作流进程追踪
+
+进程页的「工作流追踪」通过 `track_workflow_processes(workflow_id?)` 把当前进程列表与工作流节点做匹配：
+
+- application 节点：解析 `.lnk` 得到真实目标，按 `processName`/目标 exe 名或可执行文件路径匹配；
+- 浏览器目标：用 `find_running_app` 的窗口标题识别结果匹配 PWA；
+- 运行记录中出现过的 pid 也直接纳入（进程仍存活时），并标记 `managed=true`；
+- 返回 `TrackedProcess`（工作流/节点/pid/内存/CPU/运行时长/来源/窗口标题），前端按工作流过滤展示，包含不是 DaemonMan 启动的进程。
+
+### 4.3 单项接管
+
+右键「接管此项」把选择重置为单个自启动项后复用批量接管流程（选择/新建工作流 + `take_over_autostart`），关闭该项并写入工作流；其余项与批量接管逻辑不受影响。
 
 「接管」流程：批量关闭系统自启（失败项汇总到 `failures`）→ 为目标工作流追加节点（可执行文件存在则用 Application 节点，否则退化为 Script 节点）→ 按顺序串联 success 边 → 标记 `overrides`。整个过程只使用系统官方开关，不删除注册表值或快捷方式。
 
@@ -132,7 +146,7 @@ GUI 始终以普通权限运行。需要管理员权限的单个操作（启用/
 
 - 每个可执行节点计算 `layer`（1 + max(上游层)）与 `拓扑序`（Kahn 出队顺序）。顶层单元按层分列，同层按拓扑序排列；顺序分组内子项按拓扑序排列（延时节点位于其真实前后节点之间），并行分组用三列紧凑网格。
 - 自动排列采用「单元图 + 思维导图森林」：顶层单元（分组/未分组节点）先按拓扑分层，再以主父关系构造森林，父节点在左、子节点向右纵向展开并垂直居中；多棵树按面积估算目标宽度水平换行，使整体保持 landscape；分组内部同算法，分组尺寸与子项坐标同源。
-- 连线延时：只有一个入边/一个出边且条件均为 success 的 delay 节点视为「连线延时」，自动排列时从布局图折叠（两条边合并为 source→target 虚拟边），画布渲染为连线上的小药丸并放到两端中点；选中药丸或相邻连线会选中该延时节点，右侧可编辑延时。
+- 连线延时：只有一个入边/一个出边且条件均为 success 的 delay 节点视为「连线延时」；自动排列时从布局图折叠、两条边合并为一条 source→target 的合成边（`delay:<sourceEdgeId>:<targetEdgeId>`），画布完全不渲染该延时节点，改由自定义边用 `EdgeLabelRenderer` 在 `getSmoothStepPath` 的 labelX/labelY 渲染标签，因此标签必然位于连线上、不会浮空或绕线。点击合成边（标签区域 `pointer-events:none`，点击落到边的交互路径）会选中隐藏的延时节点，右侧可编辑延时；删除合成边等价于删除其折叠的两条原始边，延时恢复为普通卡片。相邻的两个延时节点不折叠，避免合成边引用不可见节点。
 - 吸附：Vue Flow `snap-to-grid` 16px，可开关；分组节点可拖动，拖动时整组后代按整数 delta 平移。
 - 边分类：`target.layer === source.layer + 1 && condition === "success"` 为执行流（实线、品牌色、粗箭头）；其余（跨层/同层跳线、失败/总是）为依赖线（虚线、灰色、细箭头）。图例见画布工具栏。
 - 历史：`stores/workflows.ts` 对 `draft` 做深度 watch + 约 400ms 防抖，把 JSON 快照压入 past/future 栈；上限取 `AppSettings.undo_limit`（默认 100，范围 1..=10000），加载/保存/切换工作流时重置。撤销/重做恢复快照并保持 dirty/选中态一致。

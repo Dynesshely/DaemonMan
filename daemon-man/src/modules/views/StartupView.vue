@@ -366,6 +366,14 @@ function closeTakeOver() {
   takeOverResult.value = null;
 }
 
+/** 右键「接管此项」：选择重置为仅该项，再走现有接管弹窗流程。 */
+function takeOverSingle(item: AutostartItem) {
+  closeContextMenu();
+  if (item.takenOver || item.isSelf) return;
+  selected.value = new Set([item.id]);
+  openTakeOver();
+}
+
 async function confirmTakeOver(payload: {
   workflowId?: string;
   workflowName?: string;
@@ -864,6 +872,7 @@ onMounted(async () => {
       @close="closeContextMenu"
       @disable="askDisable"
       @restore="restoreItem"
+      @take-over="takeOverSingle"
       @reveal="revealItem"
       @edit="editScript"
       @delete="askDelete"

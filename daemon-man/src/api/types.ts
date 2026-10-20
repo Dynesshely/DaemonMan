@@ -224,6 +224,22 @@ export interface ProcessInfo {
   mainWindowTitle: string | null;
 }
 
+/** 按工作流节点追踪到的运行中进程（含非 DaemonMan 启动的进程）。 */
+export interface TrackedProcess {
+  workflowId: string;
+  workflowName: string;
+  nodeId: string;
+  nodeName: string;
+  pid: number;
+  name: string;
+  executable: string | null;
+  memoryBytes: number;
+  cpuUsage: number;
+  runningSecs: number;
+  managed: boolean;
+  mainWindowTitle: string | null;
+}
+
 export interface SystemInfo {
   os: string;
   arch: string;

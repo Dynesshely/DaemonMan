@@ -46,14 +46,13 @@ import { useUiStore } from "@/modules/stores/ui";
 import { useWorkflowStore } from "@/modules/stores/workflows";
 
 import WorkflowEdgeLine from "./edges/WorkflowEdgeLine.vue";
-import { runSingleNode } from "./commands";
+import { runSingleGroup, runSingleNode } from "./commands";
 import {
-  DELAY_PILL_HEIGHT,
-  DELAY_PILL_WIDTH,
   buildDelayLayoutGraph,
   computeDelayPills,
-  pillByEdge,
-  placeDelayPills,
+  delayEdgeId,
+  foldDelayEdges,
+  type DelayPillInfo,
 } from "./delayPill";
 import {
   buildFlowEdge,
@@ -75,11 +74,14 @@ import {
   computeGroupPlans,
 } from "./layout";
 import { nodeKindMeta, nodeKindOrder } from "./meta";
-import WorkflowDelayPill from "./nodes/WorkflowDelayPill.vue";
 import WorkflowGroupNode from "./nodes/WorkflowGroupNode.vue";
 import WorkflowNodeCard from "./nodes/WorkflowNodeCard.vue";
 import { errorText } from "./shared";
-import { WORKFLOW_STEPS, type WorkflowSelection } from "./types";
+import {
+  WORKFLOW_SELECTED_NODE,
+  WORKFLOW_STEPS,
+  type WorkflowSelection,
+} from "./types";
 
 const emit = defineEmits<{
   "selection-change": [selection: WorkflowSelection];
@@ -168,11 +170,21 @@ const snapHint = computed(() => {
   return value === "workflow.snapHint" ? "拖动节点时按 16px 网格对齐" : value;
 });
 
-/** 执行步骤号（拓扑序），通过 provide 给节点卡片显示 `#N` 徽标。 */
+/** 执行步骤号（拓扑序，折叠药丸后连续编号），通过 provide 给节点卡片显示 `#N` 徽标。 */
 const stepOf = ref<Map<string, number>>(new Map());
 /** 执行层，用于区分「执行流」与「依赖跳线」。 */
 const layerMap = ref<Map<string, number>>(new Map());
 provide(WORKFLOW_STEPS, stepOf);
+
+/**
+ * 折叠成药丸的延时节点不渲染，但右栏需要显示它的属性：
+ * 这里记录「当前通过连线选中的隐藏节点 id」，参与选中回传与药丸高亮。
+ */
+const hiddenSelectedNodeId = ref<string | null>(null);
+const activeSelectedNodeId = computed(
+  () => hiddenSelectedNodeId.value ?? props.selectedNodeId ?? null,
+);
+provide(WORKFLOW_SELECTED_NODE, activeSelectedNodeId);
 
 function applyTopology(draft: Workflow) {
   const pills = computeDelayPills(draft.nodes, draft.edges);
@@ -182,11 +194,12 @@ function applyTopology(draft: Workflow) {
     layerMap.value = topology.layerOf;
     return;
   }
-  // 步骤号：把折叠成药丸的延时排除在外，可见节点保持连续编号（#1 → #2，不再断档）。
+  // 步骤号与执行层都按「折叠药丸后」的图算：可见节点连续编号，
+  // 合成边两端相邻层，因此合成连线判定为执行流（实线）。
   const graph = buildDelayLayoutGraph(draft.nodes, draft.edges, pills);
-  stepOf.value = computeTopology(graph.nodes, graph.edges).stepOf;
-  // 连线分类仍按完整图算：药丸两侧的边要按真实层级判定为执行流（实线）。
-  layerMap.value = computeTopology(draft.nodes, draft.edges).layerOf;
+  const topology = computeTopology(graph.nodes, graph.edges);
+  stepOf.value = topology.stepOf;
+  layerMap.value = topology.layerOf;
 }
 
 /** 相邻层 + success 才算执行流；跨层、同层、失败/总是都算依赖跳线。 */
@@ -198,9 +211,29 @@ function edgeIsFlow(edge: WorkflowEdge): boolean {
   return target === source + 1;
 }
 
+/** 合成连线 id -> 延时节点（药丸数据）；供边构建与选中使用。 */
+function delayLabelOfEdge(
+  draft: Workflow,
+  pills: Map<string, DelayPillInfo>,
+): Map<string, { delayNodeId: string; delayMs: number }> {
+  const result = new Map<string, { delayNodeId: string; delayMs: number }>();
+  for (const pill of pills.values()) {
+    const node = draft.nodes.find((item) => item.id === pill.nodeId);
+    if (!node) continue;
+    result.set(delayEdgeId(pill), {
+      delayNodeId: node.id,
+      delayMs: node.delayMs,
+    });
+  }
+  return result;
+}
+
 function buildEdgesFor(draft: Workflow): Edge[] {
-  return draft.edges.map((edge) =>
-    buildFlowEdge(edge, theme.isDark, edgeIsFlow(edge)),
+  const pills = computeDelayPills(draft.nodes, draft.edges);
+  const labels = delayLabelOfEdge(draft, pills);
+  // 候选延时的两条边合并成一条 source→target 的合成边，药丸渲染在它的标签上。
+  return foldDelayEdges(draft.edges, pills).map((edge) =>
+    buildFlowEdge(edge, theme.isDark, edgeIsFlow(edge), labels.get(edge.id)),
   );
 }
 
@@ -209,39 +242,48 @@ let refreshToken = 0;
 let suppressSelectionEmit = false;
 
 /**
- * 依据当前图结构同步节点类型：
- * - 候选「连线延时」→ delay-pill（药丸，尺寸 88×28）；
- * - 不再候选 → 恢复普通 delay 卡片；
- * - 其它 kind 切换照旧。
+ * 依据当前图结构同步画布节点：
+ * - 候选「连线延时」→ 从画布移除（药丸改由合成边的标签渲染）；
+ * - 不再候选 → 重新加回普通 delay 卡片；
+ * - 其它 kind 切换照旧就地更新。
  */
 function syncFlowNodeTypes() {
   const draft = store.draft;
   if (!draft) return;
   const pills = computeDelayPills(draft.nodes, draft.edges);
+  let restored = false;
   for (const node of draft.nodes) {
     const current = findNode(node.id);
-    if (!current) continue;
-    const isPill = node.kind === "delay" && pills.has(node.id);
-    const expectedType = isPill ? "delay-pill" : node.kind;
-    if (current.type === expectedType) continue;
+    const hidden = node.kind === "delay" && pills.has(node.id);
+    if (hidden) {
+      if (current) {
+        // 注意：不能用 actions.removeNodes（会触发 nodesChange，把 draft 里的节点删掉）。
+        // 直接从 v-model 的节点列表里摘掉，Vue Flow 的 setNodes 不会再发出删除变更。
+        if (current.selected) hiddenSelectedNodeId.value = node.id;
+        flowNodes.value = flowNodes.value.filter((item) => item.id !== node.id);
+      }
+      continue;
+    }
+    if (!current) {
+      addNodes(buildFlowNode(node));
+      restored = true;
+      continue;
+    }
+    if (current.type !== node.kind) {
+      updateNode(node.id, { type: node.kind });
+    }
+  }
+  if (restored) scheduleGroupGeometry();
 
-    const update: Partial<Node> = { type: expectedType };
-    if (node.kind === "group") {
-      update.connectable = false;
-    } else {
-      // 药丸锁定在连线上：不可拖拽 / 不可连线；恢复卡片时再打开。
-      update.draggable = !isPill;
-      update.connectable = !isPill;
+  // 之前通过连线选中的延时如果重新变回卡片，接回真实节点选中态。
+  const hiddenId = hiddenSelectedNodeId.value;
+  if (hiddenId && !pills.has(hiddenId)) {
+    const restoredNode = findNode(hiddenId);
+    if (restoredNode) {
+      hiddenSelectedNodeId.value = null;
+      removeSelectedElements();
+      addSelectedNodes([restoredNode]);
     }
-    if (isPill) {
-      update.style = {
-        width: `${DELAY_PILL_WIDTH}px`,
-        height: `${DELAY_PILL_HEIGHT}px`,
-      };
-    } else if (current.type === "delay-pill") {
-      update.style = {};
-    }
-    updateNode(node.id, update);
   }
 }
 
@@ -343,8 +385,11 @@ function computeGroupBoxes(): Map<string, GroupBox> {
 
   const groups = draft.nodes.filter((node) => node.kind === "group");
   const groupIds = new Set(groups.map((group) => group.id));
+  // 折叠成药丸的延时节点不渲染，也不参与分组边界计算。
+  const pills = computeDelayPills(draft.nodes, draft.edges);
   const childrenOf = new Map<string, WorkflowNode[]>();
   for (const node of draft.nodes) {
+    if (pills.has(node.id)) continue;
     const parentId = node.parentId;
     if (!parentId || parentId === node.id || !groupIds.has(parentId)) continue;
     const bucket = childrenOf.get(parentId);
@@ -516,31 +561,6 @@ function layoutChildrenOf(
       y: Math.round(child.position.y),
     });
   }
-
-  // 组内的连线药丸：按 source/target 当前位置取中点。
-  const pillChildren = draft.nodes.filter(
-    (node) => node.parentId === group.id && pills.has(node.id),
-  );
-  if (pillChildren.length > 0) {
-    const positions = new Map<string, NodePosition>();
-    for (const node of draft.nodes) {
-      positions.set(node.id, { x: node.position.x, y: node.position.y });
-    }
-    const pillSubset = new Map(
-      [...pills].filter(([id]) =>
-        pillChildren.some((child) => child.id === id),
-      ),
-    );
-    placeDelayPills(pillSubset, positions);
-    for (const child of pillChildren) {
-      const position = positions.get(child.id);
-      if (!position) continue;
-      if (child.position.x !== position.x || child.position.y !== position.y) {
-        child.position = position;
-      }
-      updateNode(child.id, { position });
-    }
-  }
 }
 
 /**
@@ -645,16 +665,19 @@ const menuNode = computed(() => {
 });
 
 const menuDisabled = computed(
-  () =>
-    !menuNode.value ||
-    menuNode.value.kind === "group" ||
-    runningNodeId.value !== null,
+  () => !menuNode.value || runningNodeId.value !== null,
 );
 
 const menuTitle = computed(() =>
   menuNode.value?.kind === "group"
-    ? t("node.groupHint")
+    ? t("workflow.runGroupHint")
     : t("workflow.runNodeHint"),
+);
+
+const menuActionLabel = computed(() =>
+  menuNode.value?.kind === "group"
+    ? t("workflow.runGroup")
+    : t("workflow.runNode"),
 );
 
 function openNodeContextMenu(event: NodeMouseEvent) {
@@ -704,21 +727,33 @@ async function runNodeNow() {
   closeContextMenu();
   if (!menu || !current) return;
   const node = current.nodes.find((item) => item.id === menu.nodeId);
-  if (!node || node.kind === "group") return;
+  if (!node) return;
   if (runningNodeId.value !== null) return;
 
+  const isGroup = node.kind === "group";
   runningNodeId.value = node.id;
   try {
-    const run = await runSingleNode(current, node.id);
+    const run = isGroup
+      ? await runSingleGroup(current, node.id)
+      : await runSingleNode(current, node.id);
     store.applyRun(run);
     ui.notify(
       "success",
-      t("workflow.runNodeStarted", {
-        name: node.name || t(nodeKindMeta[node.kind].labelKey),
-      }),
+      isGroup
+        ? t("workflow.runGroupStarted", {
+            name: node.name || t("node.kind.group"),
+          })
+        : t("workflow.runNodeStarted", {
+            name: node.name || t(nodeKindMeta[node.kind].labelKey),
+          }),
     );
   } catch (error) {
-    ui.notify("error", t("workflow.runNodeFailed", { error: errorText(error) }));
+    ui.notify(
+      "error",
+      isGroup
+        ? t("workflow.runGroupFailed", { error: errorText(error) })
+        : t("workflow.runNodeFailed", { error: errorText(error) }),
+    );
   } finally {
     runningNodeId.value = null;
   }
@@ -785,6 +820,7 @@ async function handleFileDrop(
 }
 
 onMounted(async () => {
+  window.addEventListener("keydown", onHiddenNodeKeydown);
   try {
     const unlisten = await getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type !== "drop") return;
@@ -807,6 +843,7 @@ onBeforeUnmount(() => {
   dragUnlisten = null;
   window.removeEventListener("pointerdown", onWindowPointerDown, true);
   window.removeEventListener("keydown", onWindowKeydown);
+  window.removeEventListener("keydown", onHiddenNodeKeydown);
 });
 
 /**
@@ -824,12 +861,44 @@ function fitWhenReady(attempts = 4) {
   });
 }
 
+/** 折叠药丸不渲染成节点，选中它时用 Delete / Backspace 删除该延时节点。 */
+function onHiddenNodeKeydown(event: KeyboardEvent) {
+  const hiddenId = hiddenSelectedNodeId.value;
+  if (!hiddenId || !DELETE_KEYS.includes(event.key)) return;
+  const target = event.target as HTMLElement | null;
+  if (
+    target &&
+    (target.closest("input, textarea, select") || target.isContentEditable)
+  ) {
+    return;
+  }
+  event.preventDefault();
+  hiddenSelectedNodeId.value = null;
+  removeNodeById(hiddenId);
+  emitSelection();
+}
+
+/** 点击画布空白：清掉「隐藏选中」，右栏回到空态。 */
+function onPaneClick() {
+  if (!hiddenSelectedNodeId.value) return;
+  hiddenSelectedNodeId.value = null;
+  emitSelection();
+}
+
 function emitSelection() {
   if (suppressSelectionEmit) return;
   const nodes = getSelectedNodes.value;
   const edges = getSelectedEdges.value;
+  // 真实的节点/边选中优先；都没有时才回落到「隐藏的折叠延时节点」。
+  if (nodes.length > 0 || edges.length > 0) hiddenSelectedNodeId.value = null;
+  const hidden = hiddenSelectedNodeId.value;
   emit("selection-change", {
-    nodeId: nodes.length === 1 ? nodes[0].id : null,
+    nodeId:
+      nodes.length === 1
+        ? nodes[0].id
+        : nodes.length === 0 && edges.length === 0
+          ? hidden
+          : null,
     edgeId:
       nodes.length === 0 && edges.length === 1 ? edges[0].id : null,
   });
@@ -838,10 +907,21 @@ function emitSelection() {
 /** 从文本视图切回节点视图时画布会重新挂载，这里按外部选中恢复画布选中态。 */
 function applySelectedNode(id: string | null | undefined) {
   if (!id) return;
+  const node = findNode(id);
+  if (!node) {
+    // 折叠成药丸的延时没有画布节点：只保留「隐藏选中」状态给右栏。
+    hiddenSelectedNodeId.value = store.draft?.nodes.some((item) => item.id === id)
+      ? id
+      : null;
+    if (getSelectedNodes.value.length > 0 || getSelectedEdges.value.length > 0) {
+      removeSelectedElements();
+    }
+    emitSelection();
+    return;
+  }
+  hiddenSelectedNodeId.value = null;
   const current = getSelectedNodes.value;
   if (current.length === 1 && current[0].id === id) return;
-  const node = findNode(id);
-  if (!node) return;
   removeSelectedElements();
   addSelectedNodes([node]);
 }
@@ -885,12 +965,16 @@ function rebuildFromDraft(next: Workflow | null) {
   // 若是 0×0 就会一直 visibility:hidden，容器背景不可见。
   const initialBoxes = computeGroupBoxes();
   const pills = computeDelayPills(next.nodes, next.edges);
+  // 折叠成药丸的延时没有画布节点：若外部仍选中它，用「隐藏选中」状态承接。
+  hiddenSelectedNodeId.value =
+    selectedNodeIds.find((id) => pills.has(id)) ?? null;
+  const visibleNodes = next.nodes.filter((node) => !pills.has(node.id));
   const orderedNodes = [
-    ...next.nodes.filter((node) => node.kind === "group"),
-    ...next.nodes.filter((node) => node.kind !== "group"),
+    ...visibleNodes.filter((node) => node.kind === "group"),
+    ...visibleNodes.filter((node) => node.kind !== "group"),
   ];
   flowNodes.value = orderedNodes.map((node) =>
-    buildFlowNode(node, initialBoxes.get(node.id), pills.has(node.id)),
+    buildFlowNode(node, initialBoxes.get(node.id)),
   );
   applyTopology(next);
   flowEdges.value = buildEdgesFor(next);
@@ -906,8 +990,17 @@ function rebuildFromDraft(next: Workflow | null) {
     const edges = selectedEdgeIds
       .map((id) => findEdge(id))
       .filter((edge): edge is GraphEdge => Boolean(edge));
-    if (edges.length > 0) {
-      addSelectedEdges(edges);
+    // 选中折叠延时合成边时，等价于选中那个隐藏延时节点。
+    const delayEdge = edges.find(
+      (edge) => (edge.data as { delayNodeId?: string } | undefined)?.delayNodeId,
+    );
+    if (delayEdge) {
+      hiddenSelectedNodeId.value =
+        (delayEdge.data as { delayNodeId?: string }).delayNodeId ?? null;
+    }
+    const plainEdges = edges.filter((edge) => !delayEdge || edge.id !== delayEdge.id);
+    if (plainEdges.length > 0) {
+      addSelectedEdges(plainEdges);
     }
 
     // 建立结构快照 + 计算分组容器边界（首次量测后还会再刷新一次）。
@@ -994,19 +1087,15 @@ function onConnect(connection: Connection) {
   refreshFlowEdges();
 }
 
-/** 点击连线：若该边两端折叠了延时药丸，则改为选中延时节点，右栏可直接改延时。 */
+/** 点击连线：若该边折叠了延时药丸，则改为选中延时节点，右栏可直接改延时。 */
 function onEdgeClick(event: EdgeMouseEvent) {
-  const current = store.draft;
-  if (!current) return;
-  const pills = computeDelayPills(current.nodes, current.edges);
-  const delayId = pillByEdge(pills).get(event.edge.id);
-  if (!delayId) return;
-  // Vue Flow 会在 click 内先选中边，这里下一拍改成选中节点。
+  const delayNodeId = (event.edge.data as { delayNodeId?: string } | undefined)
+    ?.delayNodeId;
+  if (!delayNodeId) return;
+  // Vue Flow 会在 click 内先选中边；这里下一拍清掉边选中，改为「隐藏选中」该延时节点。
   void nextTick(() => {
-    const node = findNode(delayId);
-    if (!node) return;
+    hiddenSelectedNodeId.value = delayNodeId;
     removeSelectedElements();
-    addSelectedNodes([node]);
     emitSelection();
   });
 }
@@ -1029,6 +1118,29 @@ function onNodesChange(changes: NodeChange[]) {
   void nextTick(() => persistGroupPositions());
 }
 
+/** 合成边 id 展开成它折叠的两条原始边 id（删除药丸所在连线时两条边一起删）。 */
+function expandRemovedEdgeIds(
+  ids: string[],
+  draft: Workflow,
+): Set<string> {
+  const pills = computeDelayPills(draft.nodes, draft.edges);
+  const pillByDelayEdge = new Map<string, DelayPillInfo>();
+  for (const pill of pills.values()) {
+    pillByDelayEdge.set(delayEdgeId(pill), pill);
+  }
+  const result = new Set<string>();
+  for (const id of ids) {
+    const pill = pillByDelayEdge.get(id);
+    if (pill) {
+      result.add(pill.sourceEdgeId);
+      result.add(pill.targetEdgeId);
+    } else {
+      result.add(id);
+    }
+  }
+  return result;
+}
+
 function onEdgesChange(changes: EdgeChange[]) {
   const current = store.draft;
   if (!current) return;
@@ -1036,7 +1148,8 @@ function onEdgesChange(changes: EdgeChange[]) {
     .filter((change): change is EdgeRemoveChange => change.type === "remove")
     .map((change) => change.id);
   if (removedIds.length === 0) return;
-  current.edges = current.edges.filter((edge) => !removedIds.includes(edge.id));
+  const removed = expandRemovedEdgeIds(removedIds, current);
+  current.edges = current.edges.filter((edge) => !removed.has(edge.id));
 }
 
 function onNodeDragStart(event: NodeDragEvent) {
@@ -1245,7 +1358,8 @@ function removeNodeById(id: string) {
 function removeEdgeById(id: string) {
   const current = store.draft;
   if (current) {
-    current.edges = current.edges.filter((edge) => edge.id !== id);
+    const removed = expandRemovedEdgeIds([id], current);
+    current.edges = current.edges.filter((edge) => !removed.has(edge.id));
   }
   removeEdges([id]);
 }
@@ -1311,6 +1425,7 @@ defineExpose({
       @node-drag="onNodeDrag"
       @node-drag-stop="onNodeDragStop"
       @node-context-menu="openNodeContextMenu"
+      @pane-click="onPaneClick"
       @nodes-initialized="scheduleGroupGeometry"
     >
       <template #node-application="nodeProps">
@@ -1318,9 +1433,6 @@ defineExpose({
       </template>
       <template #node-delay="nodeProps">
         <WorkflowNodeCard v-bind="nodeProps" />
-      </template>
-      <template #node-delay-pill="nodeProps">
-        <WorkflowDelayPill v-bind="nodeProps" />
       </template>
       <template #node-wait="nodeProps">
         <WorkflowNodeCard v-bind="nodeProps" />
@@ -1497,7 +1609,7 @@ defineExpose({
           @click="runNodeNow"
         >
           <Play class="h-3.5 w-3.5 shrink-0" />
-          <span class="min-w-0 flex-1 truncate">{{ t("workflow.runNode") }}</span>
+          <span class="min-w-0 flex-1 truncate">{{ menuActionLabel }}</span>
           <span
             v-if="runningNodeId === contextMenu.nodeId"
             class="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-brand-500"

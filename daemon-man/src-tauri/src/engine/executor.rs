@@ -35,7 +35,7 @@ use tokio::task::JoinSet;
 use crate::engine::{graph, launcher};
 use crate::model::{
     now_iso, EdgeCondition, LogLevel, NodeKind, NodeRunState, NodeStatus, RunStatus, RunTrigger,
-    ScriptSpec, Workflow, WorkflowNode, WorkflowRun,
+    ScriptSpec, Workflow, WorkflowEdge, WorkflowNode, WorkflowRun,
 };
 use crate::platform;
 use crate::state::AppState;
@@ -341,6 +341,133 @@ fn build_single_node_workflow(workflow: &Workflow, node: &WorkflowNode) -> Workf
         edges: Vec::new(),
         ..workflow.clone()
     }
+}
+
+/// 只运行某个分组下的全部节点（右键分组「单点启动分组」）。
+///
+/// 语义：
+/// - 校验 `group_id` 对应一个分组节点（不存在 / 不是分组 → 中文 `Err`）；
+/// - 递归收集该分组的所有后代（沿 `parent_id` 链，包含嵌套分组里的节点），
+///   排除分组节点本身；没有可执行节点时返回 `Err`；
+/// - 构造子工作流：`id` / `name` / `enabled` / `skip_existing_processes` 等沿用原工作流，
+///   `nodes` 是后代可执行节点（**强制 `enabled = true`**，便于调试），
+///   `edges` 只保留两端都在集合内的边（内部依赖保留，跨组边丢弃）；
+/// - 不校验整图，直接复用 [`spawn_workflow_run`]（Manual、delay 0、完整事件/日志/历史），
+///   `run.workflow_id` 仍是原工作流 id、节点 id 不变。
+///
+/// 返回 run id（与 [`spawn_single_node_run`] 一致）。
+// commands 层的 `run_single_group` 尚未接入（Lead 负责），接入后这条 allow 可移除。
+#[allow(dead_code)]
+pub fn spawn_group_run(
+    app: AppHandle,
+    state: Arc<AppState>,
+    workflow: Workflow,
+    group_id: &str,
+) -> Result<String, String> {
+    let group = resolve_group_node(&workflow, group_id)?;
+    let mini = build_group_workflow(&workflow, group)?;
+
+    Ok(spawn_workflow_run(
+        app,
+        state,
+        mini,
+        RunRequest {
+            trigger: RunTrigger::Manual,
+            delay: Duration::ZERO,
+        },
+    ))
+}
+
+/// 分组校验：节点必须存在且 `kind == Group`。
+#[allow(dead_code)]
+fn resolve_group_node<'a>(
+    workflow: &'a Workflow,
+    group_id: &str,
+) -> Result<&'a WorkflowNode, String> {
+    let node = workflow
+        .nodes
+        .iter()
+        .find(|node| node.id == group_id)
+        .ok_or_else(|| format!("分组不存在：{group_id}"))?;
+    if node.kind != NodeKind::Group {
+        return Err(format!("「{}」不是分组节点", graph::node_label(node)));
+    }
+    Ok(node)
+}
+
+/// 收集分组下所有可执行后代节点的 id（按 `workflow.nodes` 原顺序）。
+///
+/// 沿 `parent_id` 链展开嵌套分组；分组节点本身不进入结果。
+/// `visited` 用于防御 `parent_id` 成环的异常数据，避免死循环。
+#[allow(dead_code)]
+fn collect_group_node_ids(workflow: &Workflow, group_id: &str) -> Vec<String> {
+    let mut executable: HashSet<String> = HashSet::new();
+    let mut pending: Vec<String> = vec![group_id.to_string()];
+    let mut visited: HashSet<String> = HashSet::new();
+
+    while let Some(parent) = pending.pop() {
+        if !visited.insert(parent.clone()) {
+            continue;
+        }
+        for node in &workflow.nodes {
+            if node.parent_id.as_deref() != Some(parent.as_str()) {
+                continue;
+            }
+            if node.kind == NodeKind::Group {
+                pending.push(node.id.clone());
+            } else {
+                executable.insert(node.id.clone());
+            }
+        }
+    }
+
+    workflow
+        .nodes
+        .iter()
+        .filter(|node| executable.contains(&node.id))
+        .map(|node| node.id.clone())
+        .collect()
+}
+
+/// 构造「分组子工作流」：后代可执行节点强制启用，只保留分组内部的边。
+#[allow(dead_code)]
+fn build_group_workflow(workflow: &Workflow, group: &WorkflowNode) -> Result<Workflow, String> {
+    let member_ids: HashSet<String> = collect_group_node_ids(workflow, &group.id)
+        .into_iter()
+        .collect();
+
+    if member_ids.is_empty() {
+        return Err(format!(
+            "分组「{}」内没有可执行节点",
+            graph::node_label(group)
+        ));
+    }
+
+    let nodes: Vec<WorkflowNode> = workflow
+        .nodes
+        .iter()
+        .filter(|node| member_ids.contains(&node.id))
+        .map(|node| {
+            let mut copy = node.clone();
+            // 与单点执行一致：分组运行忽略节点上的禁用标记，便于调试。
+            copy.enabled = true;
+            copy
+        })
+        .collect();
+
+    // 只保留两端都在分组内的边：内部依赖保留，跨组边丢弃。
+    let edges: Vec<WorkflowEdge> = workflow
+        .edges
+        .iter()
+        .filter(|edge| member_ids.contains(&edge.source) && member_ids.contains(&edge.target))
+        .cloned()
+        .collect();
+
+    Ok(Workflow {
+        nodes,
+        edges,
+        ..workflow.clone()
+    })
 }
 
 fn build_initial_run(workflow: &Workflow, run_id: &str, trigger: RunTrigger) -> WorkflowRun {
@@ -1440,6 +1567,20 @@ mod tests {
         }
     }
 
+    /// 普通节点 + 所属分组（`parent_id`）。
+    fn child_node(id: &str, parent: &str) -> WorkflowNode {
+        let mut node = node(id);
+        node.parent_id = Some(parent.to_string());
+        node
+    }
+
+    /// 嵌套分组（`parent_id` 指向外层分组）。
+    fn nested_group(id: &str, parent: &str) -> WorkflowNode {
+        let mut group = group_node(id);
+        group.parent_id = Some(parent.to_string());
+        group
+    }
+
     fn edge(source: &str, target: &str, condition: EdgeCondition) -> WorkflowEdge {
         WorkflowEdge {
             id: format!("{source}->{target}"),
@@ -1494,6 +1635,91 @@ mod tests {
 
         let group = resolve_single_node(&workflow, "g").unwrap_err();
         assert!(group.contains("分组节点"), "实际：{group}");
+    }
+
+    #[test]
+    fn group_collects_nested_descendants() {
+        // g1 直接包含 a；g1 内还嵌套 g2，g2 包含 b；outside 不属于任何分组。
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![
+                group_node("g1"),
+                child_node("a", "g1"),
+                nested_group("g2", "g1"),
+                child_node("b", "g2"),
+                node("outside"),
+            ],
+            ..Default::default()
+        };
+
+        let ids = collect_group_node_ids(&workflow, "g1");
+        // 按 workflow.nodes 原顺序，排除 group 节点本身，递归进入嵌套分组。
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn group_workflow_keeps_internal_edges_and_forces_enabled() {
+        let mut disabled = child_node("a", "g1");
+        disabled.enabled = false;
+        let workflow = Workflow {
+            id: "wf-g".to_string(),
+            name: "原工作流".to_string(),
+            skip_existing_processes: false,
+            nodes: vec![
+                group_node("g1"),
+                disabled,
+                child_node("b", "g1"),
+                node("outside"),
+            ],
+            edges: vec![
+                edge("a", "b", EdgeCondition::Success),       // 组内 → 保留
+                edge("a", "outside", EdgeCondition::Success), // 跨组 → 丢弃
+                edge("outside", "b", EdgeCondition::Success), // 跨组 → 丢弃
+            ],
+            ..Default::default()
+        };
+
+        let group = resolve_group_node(&workflow, "g1").expect("分组应存在");
+        let mini = build_group_workflow(&workflow, group).expect("分组非空");
+
+        // 只含组内可执行节点，且强制启用（原节点是 disabled）。
+        assert_eq!(mini.nodes.len(), 2);
+        assert!(mini.nodes.iter().all(|node| node.enabled));
+        assert!(mini.nodes.iter().all(|node| node.kind != NodeKind::Group));
+        // 只保留组内边。
+        assert_eq!(mini.edges.len(), 1);
+        assert_eq!(mini.edges[0].source, "a");
+        assert_eq!(mini.edges[0].target, "b");
+        // 身份沿用原工作流（run.workflow_id 不变）。
+        assert_eq!(mini.id, "wf-g");
+        assert_eq!(mini.name, "原工作流");
+        assert!(!mini.skip_existing_processes);
+    }
+
+    #[test]
+    fn group_run_rejects_unknown_non_group_and_empty_group() {
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![
+                group_node("empty"),
+                group_node("g"),
+                child_node("a", "g"),
+                node("plain"),
+            ],
+            ..Default::default()
+        };
+
+        let unknown = resolve_group_node(&workflow, "missing").unwrap_err();
+        assert!(unknown.contains("分组不存在"), "实际：{unknown}");
+
+        let not_group = resolve_group_node(&workflow, "plain").unwrap_err();
+        assert!(not_group.contains("不是分组节点"), "实际：{not_group}");
+
+        let group = resolve_group_node(&workflow, "empty").expect("空分组应存在");
+        let empty = build_group_workflow(&workflow, group).unwrap_err();
+        assert!(empty.contains("没有可执行节点"), "实际：{empty}");
     }
 
     #[test]

@@ -13,16 +13,25 @@ export interface FlowNodeData {
 /**
  * Vue Flow 自定义连线的 `data`。
  * 同样直接持有 draft 中的边对象，条件改动会实时反映到连线标签。
+ * 带 `delayNodeId` 的边是「延时折叠」合成边，药丸在边标签里渲染。
  */
 export interface FlowEdgeData {
   edge: WorkflowEdge;
   /** true = 执行流（相邻层 success），false = 依赖跳线 */
   flow: boolean;
+  /** 该边折叠的延时节点 id（存在时渲染药丸标签，且点击边会选中该节点）。 */
+  delayNodeId?: string;
+  /** 延时毫秒数（药丸文案）。 */
+  delayMs?: number;
 }
 
 /** 画布向下游节点卡片提供「执行步骤号」。 */
 export const WORKFLOW_STEPS: InjectionKey<Ref<Map<string, number>>> =
   Symbol("workflow-steps");
+
+/** 画布向下游边组件提供「当前选中的节点 id」（折叠药丸不渲染节点，需要外部选中态高亮）。 */
+export const WORKFLOW_SELECTED_NODE: InjectionKey<Ref<string | null>> =
+  Symbol("workflow-selected-node");
 
 /** 四种节点类型的展示元数据（图标、i18n key、强调色）。 */
 export interface NodeKindMeta {

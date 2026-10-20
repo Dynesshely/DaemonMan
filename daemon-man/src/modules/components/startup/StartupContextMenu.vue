@@ -5,6 +5,7 @@ import {
   Ban,
   FilePenLine,
   FolderSearch,
+  GitMerge,
   RotateCcw,
   Trash2,
 } from "lucide-vue-next";
@@ -28,6 +29,7 @@ const emit = defineEmits<{
   close: [];
   disable: [item: AutostartItem];
   restore: [item: AutostartItem];
+  takeOver: [item: AutostartItem];
   reveal: [item: AutostartItem];
   edit: [item: AutostartItem];
   delete: [item: AutostartItem];
@@ -57,6 +59,16 @@ const restoreDisabled = computed(() => {
     !(current.enabled === false || current.takenOver)
   );
 });
+/** 接管此项：未接管且不是自身（已移除行会出现在已接管状态，自动隐藏）。 */
+const takeOverDisabled = computed(
+  () =>
+    props.busy ||
+    !item.value ||
+    item.value.takenOver ||
+    item.value.isSelf === true ||
+    item.value.removed === true,
+);
+
 /** 删除：后端声明可删除且不是自身。 */
 const deleteDisabled = computed(
   () => props.busy || !item.value?.canDelete || item.value?.isSelf === true,
@@ -256,6 +268,21 @@ onBeforeUnmount(unbind);
               class="h-3.5 w-3.5 shrink-0 text-zinc-400 dark:text-zinc-500"
             />
             <span class="truncate">{{ t("startup.menu.restore") }}</span>
+          </button>
+
+          <button
+            v-if="!item.takenOver && !item.isSelf"
+            type="button"
+            role="menuitem"
+            class="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-zinc-700 outline-none transition hover:bg-zinc-100 focus-visible:bg-zinc-100 focus-visible:ring-2 focus-visible:ring-brand-500/50 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent dark:text-zinc-200 dark:hover:bg-zinc-800 dark:focus-visible:bg-zinc-800 dark:disabled:hover:bg-transparent"
+            :disabled="takeOverDisabled"
+            :title="t('startup.menu.takeOver')"
+            @click="emit('takeOver', item)"
+          >
+            <GitMerge
+              class="h-3.5 w-3.5 shrink-0 text-zinc-400 dark:text-zinc-500"
+            />
+            <span class="truncate">{{ t("startup.menu.takeOver") }}</span>
           </button>
         </div>
 

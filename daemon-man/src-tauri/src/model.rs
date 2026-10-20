@@ -655,6 +655,24 @@ pub struct StartMenuApp {
     pub location: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TrackedProcess {
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub node_id: String,
+    pub node_name: String,
+    pub pid: u32,
+    pub name: String,
+    pub executable: Option<String>,
+    pub memory_bytes: u64,
+    pub cpu_usage: f32,
+    pub running_secs: u64,
+    /// 该进程是否由 DaemonMan 的某次运行托管
+    pub managed: bool,
+    pub main_window_title: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogEntry {

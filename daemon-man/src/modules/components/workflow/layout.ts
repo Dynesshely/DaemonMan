@@ -6,14 +6,7 @@ import type {
 } from "@/api";
 
 import { computeTopology } from "./graph";
-import {
-  DELAY_PILL_HEIGHT,
-  DELAY_PILL_WIDTH,
-  buildDelayLayoutGraph,
-  computeDelayPills,
-  placeDelayPills,
-  type DelayPillInfo,
-} from "./delayPill";
+import { buildDelayLayoutGraph, computeDelayPills } from "./delayPill";
 
 /** 节点卡片尺寸估算（实际尺寸以 Vue Flow 量测为准，这里用于布局与空分组占位）。 */
 export const NODE_WIDTH = 224;
@@ -787,156 +780,21 @@ export function computeGroupSizes(
  * - 多棵根树在顶层水平排开（必要时换行，最多 3 行），避免一列到底的竖长图；
  * - 分组内部同样按子图拓扑展开；并行分组仍是 3 列紧凑网格。
  *
- * 候选「连线延时」会先从布局图中折叠掉（两条边合并为 source→target 虚拟边），
- * 布局完成后放到两点中点，视觉上正好落在连线上。
+ * 候选「连线延时」会先从布局图中折叠掉（两条边合并为 source→target 虚拟边）；
+ * 它们不再产出坐标，药丸改由合成边上的 EdgeLabelRenderer 渲染（必然在连线上）。
  *
- * 返回所有节点的目标位置（含分组与药丸），由调用方写回 draft/store。
+ * 返回所有可见节点的目标位置（含分组），由调用方写回 draft/store。
  */
 export function computeAutoLayout(
   nodes: WorkflowNode[],
   edges: WorkflowEdge[],
 ): Map<string, NodePosition> {
   const pills = computeDelayPills(nodes, edges);
+  if (pills.size === 0) return computeAutoLayoutCore(nodes, edges);
+  // 候选延时（连线标签）先从布局图折叠掉，不再产出它们的坐标：
+  // 药丸由合成边上的 EdgeLabelRenderer 渲染，位置必然在连线上。
   const graph = buildDelayLayoutGraph(nodes, edges, pills);
-  const positions = computeAutoLayoutCore(graph.nodes, graph.edges);
-  if (pills.size > 0) {
-    placeDelayPills(pills, positions);
-    settleDelayPills(pills, positions, graph.nodes);
-  }
-  return positions;
-}
-
-interface RectObstacle {
-  id: string;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-/**
- * 药丸微调：换行后 source/target 可能不在同一行，中点容易压到别的卡片。
- * 优先沿 source→target 连线上换位置（0.5 → 两侧偏移），仍冲突再轻微垂直避让，
- * 保证药丸既贴着连线又互不重叠。
- */
-function settleDelayPills(
-  pills: Map<string, DelayPillInfo>,
-  positions: Map<string, NodePosition>,
-  layoutNodes: WorkflowNode[],
-): void {
-  const obstacles: RectObstacle[] = [];
-  for (const node of layoutNodes) {
-    // 分组是容器背景，不能当作药丸的碰撞障碍。
-    if (node.kind === "group") continue;
-    const position = positions.get(node.id);
-    if (!position) continue;
-    obstacles.push({
-      id: node.id,
-      x: position.x,
-      y: position.y,
-      width: NODE_WIDTH,
-      height: NODE_HEIGHT,
-    });
-  }
-
-  const placed: RectObstacle[] = [];
-  const collides = (x: number, y: number, ignore: Set<string>): boolean => {
-    const rects = [...obstacles, ...placed];
-    for (const rect of rects) {
-      if (ignore.has(rect.id)) continue;
-      if (
-        x < rect.x + rect.width &&
-        rect.x < x + DELAY_PILL_WIDTH &&
-        y < rect.y + rect.height &&
-        rect.y < y + DELAY_PILL_HEIGHT
-      ) {
-        return true;
-      }
-    }
-    return false;
-  };
-
-  for (const pill of pills.values()) {
-    const source = positions.get(pill.sourceId);
-    const target = positions.get(pill.targetId);
-    if (!source || !target) continue;
-    const ignore = new Set([pill.sourceId, pill.targetId]);
-
-    const sourceCenterX = source.x + NODE_WIDTH / 2;
-    const sourceCenterY = source.y + NODE_HEIGHT / 2;
-    const targetCenterX = target.x + NODE_WIDTH / 2;
-    const targetCenterY = target.y + NODE_HEIGHT / 2;
-
-    const candidates: NodePosition[] = [];
-
-    // 两端不在同一行（长链换行处）：把药丸放在两行之间的空隙带里，
-    // 这条带子没有卡片，连线只是在这里「拐弯」，视觉上仍然贴着线。
-    if (Math.abs(sourceCenterY - targetCenterY) > NODE_HEIGHT + 8) {
-      const upperCenterY = Math.min(sourceCenterY, targetCenterY);
-      const lowerCenterY = Math.max(sourceCenterY, targetCenterY);
-      const gapTop = upperCenterY + NODE_HEIGHT / 2;
-      const gapBottom = lowerCenterY - NODE_HEIGHT / 2;
-      if (gapBottom - gapTop >= DELAY_PILL_HEIGHT) {
-        const gapY = Math.round(
-          (gapTop + gapBottom) / 2 - DELAY_PILL_HEIGHT / 2,
-        );
-        for (const fraction of [0.5, 0.42, 0.58, 0.35, 0.65]) {
-          candidates.push({
-            x: Math.round(
-              sourceCenterX +
-                (targetCenterX - sourceCenterX) * fraction -
-                DELAY_PILL_WIDTH / 2,
-            ),
-            y: gapY,
-          });
-        }
-      }
-    }
-
-    // 正常情况：沿 source→target 连线取点。
-    for (const fraction of [0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74]) {
-      candidates.push({
-        x: Math.round(
-          source.x + (target.x - source.x) * fraction - DELAY_PILL_WIDTH / 2,
-        ),
-        y: Math.round(
-          source.y + (target.y - source.y) * fraction - DELAY_PILL_HEIGHT / 2,
-        ),
-      });
-    }
-
-    let chosen: NodePosition | null = null;
-    for (const candidate of candidates) {
-      if (!collides(candidate.x, candidate.y, ignore)) {
-        chosen = candidate;
-        break;
-      }
-    }
-    if (!chosen) {
-      // 连线被占：在原始中点附近做少量垂直避让。
-      const midX = Math.round((source.x + target.x) / 2 - DELAY_PILL_WIDTH / 2);
-      const midY = Math.round((source.y + target.y) / 2 - DELAY_PILL_HEIGHT / 2);
-      const nudges = [0, -NODE_HEIGHT / 2, NODE_HEIGHT / 2, -NODE_HEIGHT, NODE_HEIGHT];
-      for (const nudge of nudges) {
-        const y = Math.round(midY + nudge);
-        if (!collides(midX, y, ignore)) {
-          chosen = { x: midX, y };
-          break;
-        }
-      }
-    }
-    const fallback = positions.get(pill.nodeId);
-    const position = chosen ?? fallback;
-    if (!position) continue;
-    positions.set(pill.nodeId, position);
-    placed.push({
-      id: pill.nodeId,
-      x: position.x,
-      y: position.y,
-      width: DELAY_PILL_WIDTH,
-      height: DELAY_PILL_HEIGHT,
-    });
-  }
+  return computeAutoLayoutCore(graph.nodes, graph.edges);
 }
 
 function computeAutoLayoutCore(

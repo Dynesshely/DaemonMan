@@ -10,7 +10,6 @@ import type {
 
 import type { FlowEdgeData, FlowNodeData } from "./types";
 import { DEFAULT_GROUP_HEIGHT, DEFAULT_GROUP_WIDTH } from "./layout";
-import { DELAY_PILL_HEIGHT, DELAY_PILL_WIDTH } from "./delayPill";
 
 /** crypto.randomUUID 的降级实现（与 store 中的 uuid 保持一致的行为）。 */
 export function createNodeId(): string {
@@ -70,29 +69,11 @@ export function createWorkflowNode(
   };
 }
 
-/** draft 中的节点 -> 画布节点（type 直接用 kind；候选 delay 渲染成连线药丸）。 */
+/** draft 中的节点 -> 画布节点（type 直接用 kind）。 */
 export function buildFlowNode(
   node: WorkflowNode,
   groupSize?: { width: number; height: number },
-  pill = false,
 ): Node<FlowNodeData> {
-  if (pill && node.kind === "delay") {
-    return {
-      id: node.id,
-      type: "delay-pill",
-      position: { x: node.position.x, y: node.position.y },
-      data: { node },
-      // 药丸锁定在连线上：不可拖动、不可连线，但可选中 / 删除 / 单点执行。
-      draggable: false,
-      connectable: false,
-      selectable: true,
-      style: {
-        width: `${DELAY_PILL_WIDTH}px`,
-        height: `${DELAY_PILL_HEIGHT}px`,
-      },
-    };
-  }
-
   const base: Node<FlowNodeData> = {
     id: node.id,
     type: node.kind,
@@ -122,11 +103,18 @@ export function buildFlowNode(
   };
 }
 
-/** draft 中的边 -> 画布连线（flow=true 执行流，false 依赖跳线）。 */
+/** 合成连线上的延时标签数据（药丸由边组件的 EdgeLabelRenderer 渲染）。 */
+export interface DelayEdgeLabel {
+  delayNodeId: string;
+  delayMs: number;
+}
+
+/** draft 中的边 -> 画布连线（flow=true 执行流，false 依赖跳线；延时折叠边带药丸数据）。 */
 export function buildFlowEdge(
   edge: WorkflowEdge,
   dark: boolean,
   flow = true,
+  delay?: DelayEdgeLabel,
 ): Edge<FlowEdgeData> {
   const color = flow
     ? dark
@@ -140,7 +128,9 @@ export function buildFlowEdge(
     source: edge.source,
     target: edge.target,
     type: "workflow",
-    data: { edge, flow },
+    data: delay
+      ? { edge, flow, delayNodeId: delay.delayNodeId, delayMs: delay.delayMs }
+      : { edge, flow },
     markerEnd: {
       type: MarkerType.ArrowClosed,
       color,

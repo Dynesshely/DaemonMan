@@ -7,5 +7,8 @@ pub mod executor;
 pub mod graph;
 pub mod launcher;
 
-pub use executor::{spawn_single_node_run, spawn_workflow_run, RunRequest};
+// `spawn_group_run` 供 commands 层的 `run_single_group` 使用（Lead 负责接入），
+// 接入前先允许「未使用」以免产生告警。
+#[allow(unused_imports)]
+pub use executor::{spawn_group_run, spawn_single_node_run, spawn_workflow_run, RunRequest};
 pub use graph::validate;

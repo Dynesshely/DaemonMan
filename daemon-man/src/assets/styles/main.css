@@ -1,0 +1,103 @@
+@import "tailwindcss";
+@import "@vue-flow/core/dist/style.css";
+@import "@vue-flow/core/dist/theme-default.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+    "PingFang SC", system-ui, -apple-system, sans-serif;
+  --font-mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+
+  --color-brand-50: #eef2ff;
+  --color-brand-100: #e0e7ff;
+  --color-brand-200: #c7d2fe;
+  --color-brand-300: #a5b4fc;
+  --color-brand-400: #818cf8;
+  --color-brand-500: #6366f1;
+  --color-brand-600: #4f46e5;
+  --color-brand-700: #4338ca;
+  --color-brand-800: #3730a3;
+  --color-brand-900: #312e81;
+  --color-brand-950: #1e1b4b;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-sans);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background-color: rgb(99 102 241 / 0.35);
+}
+
+/* 细滚动条 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(161 161 170 / 0.45);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(113 113 122 / 0.7);
+  background-clip: content-box;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: rgb(63 63 70 / 0.8);
+  background-clip: content-box;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgb(82 82 91 / 0.9);
+  background-clip: content-box;
+}
+
+/* Vue Flow 主题适配 */
+.vue-flow {
+  --vf-node-bg: transparent;
+  --vf-node-text: currentColor;
+  --vf-connection-path: rgb(99 102 241 / 0.6);
+  --vf-handle: rgb(99 102 241 / 0.9);
+}
+.vue-flow__edge.selected .vue-flow__edge-path,
+.vue-flow__edge:focus .vue-flow__edge-path {
+  stroke: #6366f1;
+  stroke-width: 2.5;
+}
+.vue-flow__attribution {
+  display: none;
+}
+.vue-flow__background {
+  background-color: #fafafa;
+}
+.dark .vue-flow__background {
+  background-color: #09090b;
+}
+
+/* 视图切换动画 */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.14s ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+/* 表格数字等宽，避免跳动 */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}

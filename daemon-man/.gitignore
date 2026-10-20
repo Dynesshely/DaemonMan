@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# 验证产物（UI 截图 / 冒烟输出）
+.develop/verify/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

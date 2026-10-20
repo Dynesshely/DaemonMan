@@ -1,16 +1,141 @@
-# Tauri + Vue + TypeScript
+# DaemonMan
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+用**工作流**编排软件启动顺序的 Windows 启动管线管理器，同时能接管系统自启动项。
 
-## Recommended IDE Setup
+DaemonMan 是旧 PowerShell 启动器（`ProgressManager`）的完全重写版本：后端 Rust（Tauri 2），前端 Vue 3 + TypeScript + Tailwind CSS 4。它把「开机要启动的一堆软件」抽象成一张有向无环图（DAG）：节点是启动应用 / 延时 / 等待进程 / 执行命令，连线表达依赖与条件；登录时按图执行，并且可以把 Windows 里散落的自启动项关掉、收编进同一条管线。
 
-- [VS Code](https://code.visualstudio.com/) + [Volar](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## 功能
 
-## Type Support For `.vue` Imports in TS
+- **可视化工作流编辑**：Vue Flow 画布，拖拽节点、连线定义依赖；节点支持启动参数、工作目录、环境变量、跳过已运行、等待主窗口、关闭启动画面、窗口置前、管理员启动等选项。
+- **登录启动管线**：标记「登录时自动运行」的工作流会在 DaemonMan 随系统启动后依次执行；支持启动缓冲时间、并发上限、节点超时。
+- **自启动项扫描与接管**：扫描注册表 `Run/RunOnce`（HKCU/HKLM/WOW6432Node）、启动文件夹、登录触发的计划任务、自动启动的 Windows 服务；展示启用状态；可单选/切换，也可批量「接管」——关闭系统自启并把它们加入工作流，需要时还能一键恢复系统自启。
+- **按图调度**：无入边节点并行启动，依赖边支持「成功后 / 失败后 / 总是」三种条件，失败可沿 failure 边做降级分支；运行状态实时推送到界面。
+- **进程与日志**：查看由 DaemonMan 启动的进程（PID/内存/CPU/运行时/所属工作流）并可结束；结构化日志支持级别筛选、实时滚动、导出。
+- **托盘常驻**：关闭窗口可隐藏到托盘；托盘菜单可打开主界面、运行全部启用工作流、退出。
+- **明暗主题 + 中英双语**，配置与日志持久化到 `~/.daemon-man/`。
 
-Since TypeScript cannot handle type information for `.vue` imports, they are shimmed to be a generic Vue component type by default. In most cases this is fine if you don't really care about component prop types outside of templates. However, if you wish to get actual prop types in `.vue` imports (for example to get props validation when using manual `h(...)` calls), you can enable Volar's Take Over mode by following these steps:
+## 技术栈
 
-1. Run `Extensions: Show Built-in Extensions` from VS Code's command palette, look for `TypeScript and JavaScript Language Features`, then right click and select `Disable (Workspace)`. By default, Take Over mode will enable itself if the default TypeScript extension is disabled.
-2. Reload the VS Code window by running `Developer: Reload Window` from the command palette.
+| 层 | 选型 |
+| --- | --- |
+| 桌面框架 | Tauri 2（Rust） |
+| 前端 | Vue 3 + TypeScript + Vite 6 + Pinia + Vue Router |
+| 样式 | Tailwind CSS 4（纯 class，无独立样式文件） |
+| 图编辑 | @vue-flow/core |
+| Windows 集成 | winreg、windows（Win32 API）、sysinfo |
 
-You can learn more about Take Over mode [here](https://github.com/johnsoncodehk/volar/discussions/471).
+## 开发
+
+```powershell
+# 安装依赖
+pnpm install
+
+# 开发模式（前端 HMR + Rust 后端）
+pnpm tauri dev
+
+# 仅前端类型检查 / 构建
+pnpm typecheck
+pnpm build
+
+# 生产构建（生成 NSIS 安装包）
+pnpm tauri build
+
+# 后端检查
+cd src-tauri
+cargo check
+cargo clippy --all-targets
+cargo test --lib
+
+# 手动打包（等价于 pnpm tauri build，必须启用 custom-protocol 才会内嵌前端资源）
+cargo build --release --features custom-protocol --bin daemon-man
+```
+
+> 注意：Tauri 2 的 dev/生产模式由 `custom-protocol` feature 决定，而不是 Cargo profile。
+> 不带该 feature 的构建（包括 `cargo build --release`）会加载 `devUrl`，需要同时运行
+> `pnpm dev`；`pnpm tauri build` 会自动启用该 feature。
+
+环境要求：Rust stable（MSVC toolchain）、Node.js 18+、pnpm、Windows 10/11、WebView2 Runtime。
+
+## 验证与自检
+
+```powershell
+# 无窗口后端自检：配置路径、权限、自启动项分布、进程数（退出码 0 = 通过）
+.\src-tauri\target\debug\daemon-man.exe --selftest
+
+# 后端单元测试（含平台层真实环境的 #[ignore] 冒烟测试）
+cd src-tauri
+cargo test --lib
+cargo test --lib scan_smoke -- --ignored --nocapture
+```
+
+GUI 冒烟脚本通过 WebView2 远程调试协议驱动真实窗口（截图 + 前端错误采集）：
+
+```powershell
+pnpm dev                                  # 终端 A
+$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=19222"
+.\src-tauri\target\debug\daemon-man.exe    # 终端 B
+
+node scripts/ui-smoke.mjs       # 逐页截图到 .develop/verify/
+node scripts/e2e-workflow.mjs   # 新建工作流→加节点→保存→运行→校验
+```
+
+## 目录结构
+
+```
+daemon-man/
+├── src/                       # Vue 前端
+│   ├── api/                   # IPC 类型与 invoke 封装（与 src-tauri/src/model.rs 对齐）
+│   ├── modules/
+│   │   ├── components/        # layout / ui / workflow / dashboard / startup / settings
+│   │   ├── stores/            # Pinia：app / workflows / autostart / runtime / logs / theme / ui
+│   │   ├── views/             # 概览、工作流、自启动、进程、日志、设置
+│   │   ├── locales/           # 轻量 i18n（zh-CN / en）
+│   │   ├── router/
+│   │   └── utils/
+│   └── assets/styles/main.css # Tailwind 入口 + 第三方样式适配
+└── src-tauri/                 # Rust 后端
+    └── src/
+        ├── model.rs           # 配置 / 工作流 / 运行状态 / 自启动项数据模型
+        ├── config.rs          # ~/.daemon-man/config.json 原子读写
+        ├── state.rs           # 共享状态（配置、运行记录、日志、取消标记、扫描缓存）
+        ├── platform/          # Windows 平台层：注册表、启动文件夹、计划任务、服务、进程/窗口
+        ├── engine/            # DAG 校验、调度执行、应用启动器
+        ├── commands/          # Tauri IPC 命令（config/workflow/autostart/process/system）
+        ├── tray.rs            # 系统托盘
+        └── lib.rs             # 应用装配、登录启动、关闭到托盘
+```
+
+## 数据与配置
+
+- 配置：`%USERPROFILE%\.daemon-man\config.json`（原子写入，保留 `.bak`）
+- 日志：`%USERPROFILE%\.daemon-man\logs\daemon-man.log`
+- 开机自启：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `DaemonMan` 值（`--autostart` 参数启动，默认隐藏窗口并延迟执行工作流）
+- 自启动项开关不删除用户数据：注册表 Run 项通过 `Explorer\StartupApproved\Run` 的启用/禁用标记控制，启动文件夹项通过 `StartupApproved\StartupFolder` 控制，与任务管理器行为一致，可无损恢复。
+
+## 权限说明
+
+普通权限即可管理当前用户的 `Run`、启动文件夹与用户级计划任务；以下操作需要以管理员身份运行 DaemonMan：
+
+- 开关 `HKLM`（所有用户）自启动项
+- 开关系统服务（把启动类型在自动/手动之间切换）
+- 开关部分系统级计划任务
+
+界面会标注「需要管理员」并在侧边栏/设置页提示当前权限。
+
+## 与旧版 ProgressManager 的差异
+
+| 能力 | 旧版（PowerShell） | DaemonMan |
+| --- | --- | --- |
+| 编排方式 | 嵌套 JSON 分组 + `waiting` 依赖 | 任意 DAG，可视化编辑 |
+| 依赖条件 | 仅「等某个分组启动完成」 | 成功后 / 失败后 / 总是 |
+| 启动选项 | 关闭窗口、并行/顺序、间隔 | 参数/工作目录/环境变量/等待窗口/跳过已运行/置前/管理员等 |
+| 自启动项 | 无 | 扫描 + 切换 + 接管 + 恢复 |
+| 状态可见性 | 终端 ANSI 刷新 | 桌面 GUI 实时状态 + 运行历史 + 日志 |
+| 运行方式 | 登录脚本 | 托盘常驻 + 登录启动管线 |
+
+## 已知限制
+
+- 目前仅实现 Windows 平台（`platform` 层为 Windows 专用；跨平台需补 macOS/Linux 实现）。
+- UWP / Store 应用的自启动任务（StartupTask）暂未纳入扫描。
+- 服务与系统级任务受权限限制，普通权限下会提示需要管理员。
+- 打包产物默认 NSIS；如需 MSI 可在 `tauri.conf.json` 的 `bundle.targets` 中调整。

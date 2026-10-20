@@ -1,10 +1,38 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri + Vue + Typescript App</title>
+    <title>DaemonMan</title>
+    <script>
+      // 避免首帧主题闪烁
+      (function () {
+        try {
+          var stored = localStorage.getItem("daemon-man-theme") || "system";
+          var dark =
+            stored === "dark" ||
+            (stored === "system" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (dark) document.documentElement.classList.add("dark");
+        } catch (e) {
+          /* ignore */
+        }
+      })();
+    </script>
+    <style>
+      html,
+      body,
+      #app {
+        height: 100%;
+        margin: 0;
+      }
+      html {
+        background: #f4f4f5;
+      }
+      html.dark {
+        background: #09090b;
+      }
+    </style>
   </head>
 
   <body>

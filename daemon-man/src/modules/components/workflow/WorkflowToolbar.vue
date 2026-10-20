@@ -1,9 +1,17 @@
 <script setup lang="ts">
 import { computed, type Component } from "vue";
-import { GitBranch, ListTree, Rocket, Workflow } from "lucide-vue-next";
+import {
+  GitBranch,
+  ListTree,
+  Redo2,
+  Rocket,
+  Undo2,
+  Workflow,
+} from "lucide-vue-next";
 
 import type { Workflow as WorkflowModel } from "@/api";
 import BaseBadge from "@/modules/components/ui/BaseBadge.vue";
+import BaseButton from "@/modules/components/ui/BaseButton.vue";
 import ToggleSwitch from "@/modules/components/ui/ToggleSwitch.vue";
 import { inputClass } from "@/modules/components/ui/form";
 import { useI18n } from "@/modules/locales";
@@ -115,6 +123,30 @@ const progress = computed(() => {
         class="h-3.5 w-3.5 text-brand-500"
         :title="t('workflow.enabledOnStartup')"
       />
+    </div>
+
+    <!-- 撤销 / 重做 -->
+    <div class="flex shrink-0 items-center gap-0.5">
+      <BaseButton
+        variant="ghost"
+        size="sm"
+        icon-only
+        :disabled="!store.canUndo"
+        :title="t('workflow.undoHint')"
+        @click="store.undo()"
+      >
+        <Undo2 class="h-3.5 w-3.5" />
+      </BaseButton>
+      <BaseButton
+        variant="ghost"
+        size="sm"
+        icon-only
+        :disabled="!store.canRedo"
+        :title="t('workflow.redoHint')"
+        @click="store.redo()"
+      >
+        <Redo2 class="h-3.5 w-3.5" />
+      </BaseButton>
     </div>
 
     <!-- 节点视图 / 文本视图 切换 -->

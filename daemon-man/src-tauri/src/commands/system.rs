@@ -6,8 +6,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::config;
-use crate::legacy;
-use crate::model::{AppConfig, LegacyImportResult, LogEntry, LogLevel};
+use crate::model::{AppConfig, LogEntry, LogLevel, StartMenuApp};
 use crate::platform;
 use crate::state::AppState;
 
@@ -83,59 +82,6 @@ pub fn import_config(
     Ok(state.config())
 }
 
-#[tauri::command]
-pub fn import_legacy_config(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-    path: String,
-) -> Result<LegacyImportResult, String> {
-    let state = state.inner().clone();
-    let converted = legacy::convert_file(std::path::Path::new(&path))
-        .map_err(|error| format!("{error:#}"))?;
-
-    let workflow_id = converted.workflow.id.clone();
-    let workflow_name = converted.workflow.name.clone();
-    let node_count = converted.workflow.nodes.len();
-    let edge_count = converted.workflow.edges.len();
-    let warnings = converted.warnings.clone();
-    let workflow = converted.workflow.clone();
-
-    let mut replaced = false;
-    state
-        .mutate_config(|config| {
-            replaced = legacy::import_into_config(config, workflow.clone());
-        })
-        .map_err(|error| format!("保存迁移结果失败：{error}"))?;
-
-    state.log(
-        &app,
-        LogLevel::Success,
-        "legacy",
-        format!(
-            "已从 ProgressManager 配置导入工作流「{workflow_name}」（{node_count} 个节点 / {edge_count} 条依赖）"
-        ),
-        Some(path),
-    );
-    for warning in &warnings {
-        state.log(
-            &app,
-            LogLevel::Warn,
-            "legacy",
-            warning.clone(),
-            None,
-        );
-    }
-
-    Ok(LegacyImportResult {
-        workflow_id,
-        workflow_name,
-        node_count,
-        edge_count,
-        warnings,
-        replaced,
-    })
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileIconPayload {
@@ -154,6 +100,12 @@ pub fn get_file_icons(paths: Vec<String>, size: Option<u32>) -> Vec<FileIconPayl
             FileIconPayload { path, data_url }
         })
         .collect()
+}
+
+/// 列出开始菜单里的可见应用，供工作流「新建启动应用」快速选择。
+#[tauri::command]
+pub fn list_start_menu_apps() -> Vec<StartMenuApp> {
+    platform::start_menu::scan()
 }
 
 #[tauri::command]

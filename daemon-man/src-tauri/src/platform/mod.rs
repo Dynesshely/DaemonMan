@@ -21,6 +21,7 @@ pub mod icon;
 pub mod proc;
 pub mod registry;
 pub mod services;
+pub mod start_menu;
 pub mod startup_approved;
 pub mod startup_folder;
 pub mod tasks;

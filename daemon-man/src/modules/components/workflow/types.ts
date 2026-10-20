@@ -1,4 +1,4 @@
-import type { Component } from "vue";
+import type { Component, InjectionKey, Ref } from "vue";
 
 import type { NodeKind, WorkflowEdge, WorkflowNode } from "@/api";
 
@@ -16,7 +16,13 @@ export interface FlowNodeData {
  */
 export interface FlowEdgeData {
   edge: WorkflowEdge;
+  /** true = 执行流（相邻层 success），false = 依赖跳线 */
+  flow: boolean;
 }
+
+/** 画布向下游节点卡片提供「执行步骤号」。 */
+export const WORKFLOW_STEPS: InjectionKey<Ref<Map<string, number>>> =
+  Symbol("workflow-steps");
 
 /** 四种节点类型的展示元数据（图标、i18n key、强调色）。 */
 export interface NodeKindMeta {

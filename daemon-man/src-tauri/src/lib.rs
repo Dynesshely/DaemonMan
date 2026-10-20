@@ -3,7 +3,6 @@
 mod commands;
 mod config;
 mod engine;
-mod legacy;
 mod model;
 mod platform;
 mod state;
@@ -16,50 +15,6 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 use crate::model::{LogLevel, RunTrigger};
 use crate::state::AppState;
-
-/// 从旧版 ProgressManager 配置导入工作流（无窗口 CLI）。
-/// 用法：`DaemonMan.exe --import-legacy <config.json 路径>`。
-fn run_import_legacy(path: &str) -> i32 {
-    let converted = match legacy::convert_file(std::path::Path::new(path)) {
-        Ok(converted) => converted,
-        Err(error) => {
-            eprintln!("导入失败：{error:#}");
-            return 1;
-        }
-    };
-
-    let workflow = converted.workflow;
-    let nodes = workflow.nodes.len();
-    let edges = workflow.edges.len();
-    let name = workflow.name.clone();
-    let warnings = converted.warnings;
-
-    let mut app_config = config::load_or_init();
-    let replaced = legacy::import_into_config(&mut app_config, workflow);
-    if let Err(error) = config::save(&app_config) {
-        eprintln!("保存配置失败：{error:#}");
-        return 1;
-    }
-
-    println!("config: {}", config::config_path().display());
-    println!("workflow: {name}");
-    println!("nodes: {nodes}");
-    println!("edges: {edges}");
-    println!("replaced: {replaced}");
-    for warning in &warnings {
-        println!("warning: {warning}");
-    }
-    println!("import: ok");
-    0
-}
-
-fn import_legacy_arg(args: &[String]) -> Option<String> {
-    if let Some(index) = args.iter().position(|arg| arg == "--import-legacy") {
-        return args.get(index + 1).cloned();
-    }
-    args.iter()
-        .find_map(|arg| arg.strip_prefix("--import-legacy=").map(str::to_string))
-}
 
 /// 无窗口自检：验证配置、平台层扫描与进程枚举是否可用。
 /// 用法：`DaemonMan.exe --selftest`（退出码 0 表示自检通过）。
@@ -84,6 +39,12 @@ fn run_selftest() {
 
     let processes = platform::list_processes();
     println!("processes: {}", processes.len());
+
+    let start_menu_apps = platform::start_menu::scan();
+    println!("start_menu_apps: {}", start_menu_apps.len());
+    for app in start_menu_apps.iter().take(3) {
+        println!("start_menu[{}]: {} -> {:?}", app.location, app.name, app.target);
+    }
 
     let config = state.config();
     println!("workflows: {}", config.workflows.len());
@@ -111,19 +72,6 @@ pub fn run() {
     if args.iter().any(|arg| arg == "--selftest") {
         run_selftest();
         return;
-    }
-
-    if args
-        .iter()
-        .any(|arg| arg == "--import-legacy" || arg.starts_with("--import-legacy="))
-    {
-        match import_legacy_arg(&args) {
-            Some(path) => std::process::exit(run_import_legacy(&path)),
-            None => {
-                eprintln!("用法：DaemonMan.exe --import-legacy <旧版 config.json 路径>");
-                std::process::exit(2);
-            }
-        }
     }
 
     tauri::Builder::default()
@@ -280,8 +228,8 @@ pub fn run() {
             commands::system::export_logs,
             commands::system::export_config,
             commands::system::import_config,
-            commands::system::import_legacy_config,
             commands::system::get_file_icons,
+            commands::system::list_start_menu_apps,
             commands::system::open_config_dir,
             commands::system::open_log_dir,
             commands::system::quit_app,

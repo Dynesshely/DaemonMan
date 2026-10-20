@@ -103,22 +103,30 @@ export function buildFlowNode(
   };
 }
 
-/** draft 中的边 -> 画布连线。 */
+/** draft 中的边 -> 画布连线（flow=true 执行流，false 依赖跳线）。 */
 export function buildFlowEdge(
   edge: WorkflowEdge,
   dark: boolean,
+  flow = true,
 ): Edge<FlowEdgeData> {
+  const color = flow
+    ? dark
+      ? "#818cf8"
+      : "#6366f1"
+    : dark
+      ? "#71717a"
+      : "#a1a1aa";
   return {
     id: edge.id,
     source: edge.source,
     target: edge.target,
     type: "workflow",
-    data: { edge },
+    data: { edge, flow },
     markerEnd: {
       type: MarkerType.ArrowClosed,
-      color: dark ? "#818cf8" : "#6366f1",
-      width: 18,
-      height: 18,
+      color,
+      width: flow ? 18 : 14,
+      height: flow ? 18 : 14,
     },
   };
 }

@@ -97,3 +97,70 @@ export function computeExecutionLayers(
 
   return { layerOf, layers, count: layers.length };
 }
+
+/** 拓扑信息：分层 + 执行步骤号（按拓扑序 1..N，分组节点不占号）。 */
+export interface WorkflowTopology extends WorkflowLayers {
+  /** nodeId -> 执行步骤号（拓扑序）；分组或成环节点没有步骤号 */
+  stepOf: Map<string, number>;
+  /** 可执行节点的拓扑顺序（不含分组） */
+  order: string[];
+}
+
+/**
+ * Kahn 拓扑排序：同层/同时可执行时按 draft 顺序决定先后，
+ * 因此「A → 延时 → B」这类链条会得到 A=1、延时=2、B=3，延时节点不会再排到最后。
+ */
+export function computeTopology(
+  nodes: WorkflowNode[],
+  edges: WorkflowEdge[],
+): WorkflowTopology {
+  const layers = computeExecutionLayers(nodes, edges);
+  const adjacency = buildAdjacency(nodes, edges);
+  const draftIndex = new Map(nodes.map((node, index) => [node.id, index]));
+
+  const executable = nodes.filter((node) => node.kind !== "group");
+  const executableIds = new Set(executable.map((node) => node.id));
+  const indegree = new Map<string, number>();
+
+  for (const node of executable) {
+    const incoming = (adjacency.incoming.get(node.id) ?? []).filter((edge) =>
+      executableIds.has(edge.source),
+    );
+    indegree.set(node.id, incoming.length);
+  }
+
+  const ready = executable
+    .filter((node) => (indegree.get(node.id) ?? 0) === 0)
+    .map((node) => node.id);
+  const compare = (left: string, right: string) =>
+    (layers.layerOf.get(left) ?? 1) - (layers.layerOf.get(right) ?? 1) ||
+    (draftIndex.get(left) ?? 0) - (draftIndex.get(right) ?? 0);
+  ready.sort(compare);
+
+  const stepOf = new Map<string, number>();
+  const order: string[] = [];
+
+  while (ready.length > 0) {
+    const id = ready.shift() as string;
+    order.push(id);
+    stepOf.set(id, order.length);
+
+    for (const edge of adjacency.outgoing.get(id) ?? []) {
+      if (!executableIds.has(edge.target)) continue;
+      const left = (indegree.get(edge.target) ?? 1) - 1;
+      indegree.set(edge.target, left);
+      if (left > 0) continue;
+      // 按 (层, draft 顺序) 插入就绪队列，保证结果稳定。
+      let at = ready.length;
+      for (let index = 0; index < ready.length; index += 1) {
+        if (compare(edge.target, ready[index]) < 0) {
+          at = index;
+          break;
+        }
+      }
+      ready.splice(at, 0, edge.target);
+    }
+  }
+
+  return { ...layers, stepOf, order };
+}

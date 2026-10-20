@@ -37,6 +37,8 @@ pub struct AppSettings {
     pub default_node_timeout_ms: u64,
     /// 同时执行的最大节点数
     pub max_concurrency: usize,
+    /// 工作流编辑器的撤销/重做历史层数（1..=10000，默认 100）
+    pub undo_limit: usize,
     /// 历史运行记录保留条数
     pub max_run_history: usize,
     /// 日志保留条数
@@ -59,6 +61,7 @@ impl Default for AppSettings {
             startup_grace_ms: 3000,
             default_node_timeout_ms: 30_000,
             max_concurrency: 8,
+            undo_limit: 100,
             max_run_history: 50,
             max_log_entries: 2000,
             confirm_take_over: true,
@@ -634,16 +637,19 @@ pub enum LogLevel {
     Success,
 }
 
-/// 旧版 ProgressManager 配置导入结果。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct LegacyImportResult {
-    pub workflow_id: String,
-    pub workflow_name: String,
-    pub node_count: usize,
-    pub edge_count: usize,
-    pub warnings: Vec<String>,
-    pub replaced: bool,
+/// 开始菜单里的可启动应用（用于「新建启动应用」快速选择）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartMenuApp {
+    /// 显示名（快捷方式文件名）
+    pub name: String,
+    /// `.lnk` 完整路径（可直接作为节点 app.path）
+    pub path: String,
+    /// 解析出的目标可执行文件（用于图标/预览）
+    pub target: Option<String>,
+    pub args: Vec<String>,
+    /// "user" | "machine"
+    pub location: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,7 +5,7 @@ import type {
   WorkflowNode,
 } from "@/api";
 
-import { computeExecutionLayers } from "./graph";
+import { computeTopology } from "./graph";
 
 /** 节点卡片尺寸估算（实际尺寸以 Vue Flow 量测为准，这里用于布局与空分组占位）。 */
 export const NODE_WIDTH = 224;
@@ -204,8 +204,22 @@ export function computeAutoLayout(
 ): Map<string, NodePosition> {
   const { childrenOf, topLevel } = buildGroupChildren(nodes);
   const groupSizes = computeGroupSizes(nodes);
-  const { layerOf } = computeExecutionLayers(nodes, edges);
+  // 用拓扑序（而不是 draft 数组顺序）决定子项/同层单元先后，
+  // 这样「A → 延时 → B」里的延时节点会落在 A 与 B 之间，而不是被追加到最后。
+  const topology = computeTopology(nodes, edges);
+  const layerOf = topology.layerOf;
+  const stepOf = topology.stepOf;
   const draftIndex = new Map(nodes.map((node, index) => [node.id, index]));
+
+  const stepKey = (node: WorkflowNode) =>
+    stepOf.get(node.id) ?? Number.MAX_SAFE_INTEGER;
+
+  const childrenInOrder = (group: WorkflowNode): WorkflowNode[] =>
+    [...(childrenOf.get(group.id) ?? [])].sort(
+      (left, right) =>
+        stepKey(left) - stepKey(right) ||
+        (draftIndex.get(left.id) ?? 0) - (draftIndex.get(right.id) ?? 0),
+    );
 
   const sizeOf: SizeOf = (node) =>
     node.kind === "group"
@@ -250,7 +264,7 @@ export function computeAutoLayout(
   }
 
   function placeGroupChildren(group: WorkflowNode, x: number, y: number) {
-    const children = childrenOf.get(group.id) ?? [];
+    const children = childrenInOrder(group);
     if (children.length === 0) return;
 
     if (group.groupParallel) {
@@ -290,6 +304,7 @@ export function computeAutoLayout(
   for (const layer of layers) {
     const units = (byLayer.get(layer) ?? []).sort(
       (left, right) =>
+        stepKey(left) - stepKey(right) ||
         (draftIndex.get(left.id) ?? 0) - (draftIndex.get(right.id) ?? 0),
     );
     let columnWidth = 0;

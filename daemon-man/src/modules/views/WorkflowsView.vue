@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   AlertTriangle,
   GitBranch,
@@ -11,7 +11,11 @@ import {
   XCircle,
 } from "lucide-vue-next";
 
-import type { WorkflowValidation } from "@/api";
+import type {
+  NodePosition,
+  StartMenuApp,
+  WorkflowValidation,
+} from "@/api";
 import PageHeader from "@/modules/components/layout/PageHeader.vue";
 import BaseBadge from "@/modules/components/ui/BaseBadge.vue";
 import BaseButton from "@/modules/components/ui/BaseButton.vue";
@@ -19,9 +23,11 @@ import BaseModal from "@/modules/components/ui/BaseModal.vue";
 import BaseSpinner from "@/modules/components/ui/BaseSpinner.vue";
 import EmptyState from "@/modules/components/ui/EmptyState.vue";
 import { useI18n } from "@/modules/locales";
+import { useIconStore } from "@/modules/stores/icons";
 import { useUiStore } from "@/modules/stores/ui";
 import { useWorkflowStore } from "@/modules/stores/workflows";
 
+import StartMenuPicker from "@/modules/components/workflow/StartMenuPicker.vue";
 import WorkflowCanvas from "@/modules/components/workflow/WorkflowCanvas.vue";
 import WorkflowInspector from "@/modules/components/workflow/WorkflowInspector.vue";
 import WorkflowListPanel from "@/modules/components/workflow/WorkflowListPanel.vue";
@@ -29,6 +35,7 @@ import WorkflowRunHistory from "@/modules/components/workflow/WorkflowRunHistory
 import WorkflowTextView from "@/modules/components/workflow/WorkflowTextView.vue";
 import WorkflowToolbar from "@/modules/components/workflow/WorkflowToolbar.vue";
 import { errorText } from "@/modules/components/workflow/shared";
+import { createWorkflowNode } from "@/modules/components/workflow/factory";
 import type {
   WorkflowSelection,
   WorkflowViewMode,
@@ -36,6 +43,7 @@ import type {
 
 const store = useWorkflowStore();
 const ui = useUiStore();
+const icons = useIconStore();
 const { t } = useI18n();
 
 const canvasRef = ref<InstanceType<typeof WorkflowCanvas> | null>(null);
@@ -45,6 +53,11 @@ const selectedEdgeId = ref<string | null>(null);
 
 /** 节点画布 / 高密度文本视图。 */
 const viewMode = ref<WorkflowViewMode>("nodes");
+
+/** 开始菜单选择器：create = 新建应用节点，replace = 替换现有应用节点路径。 */
+const pickerOpen = ref(false);
+const pickerMode = ref<"create" | "replace">("create");
+const pickerNodeId = ref<string | null>(null);
 
 const validationOpen = ref(false);
 const validation = ref<WorkflowValidation | null>(null);
@@ -85,6 +98,104 @@ function setViewMode(next: WorkflowViewMode) {
   // 文本视图没有「选中边」的概念，避免切过去后右栏还停留在边的属性上。
   if (next === "text") selectedEdgeId.value = null;
 }
+
+/** 打开开始菜单选择器：create = 新建应用节点，replace = 替换当前应用节点路径。 */
+function openAppPicker(mode: "create" | "replace") {
+  if (mode === "replace" && !selectedNodeId.value) return;
+  pickerMode.value = mode;
+  pickerNodeId.value = mode === "replace" ? selectedNodeId.value : null;
+  pickerOpen.value = true;
+}
+
+/** 画布卸载（文本视图）时的兜底位置。 */
+function fallbackPosition(): NodePosition {
+  const offset = (store.draft?.nodes.length ?? 0) % 4;
+  return { x: 120 + offset * 40, y: 120 + offset * 40 };
+}
+
+function createApplicationNode(app: StartMenuApp | null) {
+  const current = store.draft;
+  if (!current) return;
+  const node = createWorkflowNode("application", fallbackPosition());
+  if (app) {
+    node.name = app.name;
+    node.app.path = app.path;
+    node.app.args = [...app.args];
+  } else {
+    const index =
+      current.nodes.filter((item) => item.kind === "application").length + 1;
+    node.name = `${t("node.kind.application")} ${index}`;
+  }
+  current.nodes.push(node);
+  selectedNodeId.value = node.id;
+  selectedEdgeId.value = null;
+}
+
+function onAppPicked(app: StartMenuApp) {
+  pickerOpen.value = false;
+  if (pickerMode.value === "create") {
+    const canvas = canvasRef.value;
+    if (canvas) canvas.addApplicationNode(app);
+    else createApplicationNode(app);
+    return;
+  }
+  const node = store.draft?.nodes.find((item) => item.id === pickerNodeId.value);
+  if (!node) return;
+  node.name = app.name;
+  node.app.path = app.path;
+  node.app.args = [...app.args];
+}
+
+function onAppManual() {
+  pickerOpen.value = false;
+  if (pickerMode.value !== "create") return;
+  const canvas = canvasRef.value;
+  if (canvas) canvas.addNode("application");
+  else createApplicationNode(null);
+}
+
+/** 撤销/重做/切换后，选中项可能已不存在。 */
+function clearMissingSelection() {
+  const current = store.draft;
+  if (!current) {
+    selectedNodeId.value = null;
+    selectedEdgeId.value = null;
+    return;
+  }
+  if (
+    selectedNodeId.value &&
+    !current.nodes.some((node) => node.id === selectedNodeId.value)
+  ) {
+    selectedNodeId.value = null;
+  }
+  if (
+    selectedEdgeId.value &&
+    !current.edges.some((edge) => edge.id === selectedEdgeId.value)
+  ) {
+    selectedEdgeId.value = null;
+  }
+}
+
+/** 批量懒加载应用节点图标（卡片 / 文本视图都从 icon store 读取）。 */
+function syncApplicationIcons() {
+  const paths = (store.draft?.nodes ?? [])
+    .filter((node) => node.kind === "application")
+    .map((node) => node.app.path.trim())
+    .filter((path) => path.length > 0);
+  if (paths.length > 0) void icons.ensure(paths);
+}
+
+watch(
+  () =>
+    (store.draft?.nodes ?? [])
+      .filter((node) => node.kind === "application")
+      .map((node) => node.app.path)
+      .join("|"),
+  () => syncApplicationIcons(),
+  { immediate: true },
+);
+
+watch(() => store.draft, () => clearMissingSelection());
 
 function confirmDiscard(): boolean {
   if (!store.draftDirty || !store.draft) return true;
@@ -225,11 +336,45 @@ function onDeleteEdge() {
 }
 
 /** Ctrl/Cmd+S 保存（输入框内也允许，符合常见编辑器习惯）。 */
+/** 焦点在可编辑元素里时不拦截快捷键，交给原生撤销/输入。 */
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return (
+    tag === "INPUT" ||
+    tag === "TEXTAREA" ||
+    tag === "SELECT" ||
+    target.isContentEditable ||
+    Boolean(target.closest("[contenteditable='true'], .nokey"))
+  );
+}
+
 function onKeydown(event: KeyboardEvent) {
-  if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "s") return;
-  event.preventDefault();
-  if (!store.draft || event.repeat) return;
-  void saveWorkflow();
+  if (!(event.ctrlKey || event.metaKey)) return;
+  const key = event.key.toLowerCase();
+
+  if (key === "z") {
+    if (isEditableTarget(event.target)) return;
+    event.preventDefault();
+    if (event.repeat || !store.draft) return;
+    if (event.shiftKey) store.redo();
+    else store.undo();
+    return;
+  }
+
+  if (key === "y") {
+    if (isEditableTarget(event.target)) return;
+    event.preventDefault();
+    if (event.repeat || !store.draft) return;
+    store.redo();
+    return;
+  }
+
+  if (key === "s") {
+    event.preventDefault();
+    if (!store.draft || event.repeat) return;
+    void saveWorkflow();
+  }
 }
 
 onMounted(async () => {
@@ -324,6 +469,7 @@ onBeforeUnmount(() => {
             class="h-full flex-1"
             :selected-node-id="selectedNodeId"
             @selection-change="onSelectionChange"
+            @pick-app="openAppPicker('create')"
           />
           <WorkflowTextView
             v-else-if="draft"
@@ -361,8 +507,16 @@ onBeforeUnmount(() => {
         :edge-id="selectedEdgeId"
         @delete-node="onDeleteNode"
         @delete-edge="onDeleteEdge"
+        @pick-app="openAppPicker('replace')"
       />
     </div>
+
+    <StartMenuPicker
+      :open="pickerOpen"
+      @close="pickerOpen = false"
+      @pick="onAppPicked"
+      @manual="onAppManual"
+    />
 
     <BaseModal
       :open="validationOpen"

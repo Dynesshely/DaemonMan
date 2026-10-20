@@ -16,7 +16,11 @@ const props = defineProps<{
   edgeId: string | null;
 }>();
 
-const emit = defineEmits<{ "delete-node": []; "delete-edge": [] }>();
+const emit = defineEmits<{
+  "delete-node": [];
+  "delete-edge": [];
+  "pick-app": [];
+}>();
 
 const store = useWorkflowStore();
 const { t } = useI18n();
@@ -68,6 +72,7 @@ const conditionKey = computed(() => {
         v-if="node"
         :node="node"
         @delete="emit('delete-node')"
+        @pick-app="emit('pick-app')"
       />
       <EdgeInspector
         v-else-if="edge"

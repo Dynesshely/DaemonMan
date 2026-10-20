@@ -115,18 +115,16 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 - Rust：`cargo test --lib` 覆盖工作流图算法、配置容错、平台层纯函数；涉及真实注册表/服务的测试标记 `#[ignore]`。
 - 前端：`pnpm typecheck`（vue-tsc strict）与 `pnpm build`；编辑器交互依赖人工验证。
 
-## 7. 旧版配置迁移（legacy.rs）
+## 7. 工作流编辑器：布局、边样式与历史
 
-`legacy::convert_file()` 解析 ProgressManager 的 `config.json`（容忍 UTF-8 BOM），递归构建工作流：
+`components/workflow/layout.ts` 负责自动排列，`graph.ts` 提供 Kahn 拓扑分层：
 
-- 程序项 → Application 节点；带子项的程序同样先启动自身，再按 `launchOrder` 处理子项；
-- ordered：子项之间串联 success 边，`latency` 以 Delay 节点插入；
-- parallel：子项之间不建边；
-- `waiting` 在第二遍解析：`type | name` 通过注册表（HashMap）找到被依赖项的出口节点集合后连边；
-- 入口/出口语义：分组本身无节点，入口是第一个（或全部并行）子项，出口是最后一个（或全部并行）子项；
-- 结果用 `engine::validate` 做环检测，失败时写入 warning 而不产出坏配置。
-
-导入入口：`import_legacy_config` IPC（设置页「数据迁移」）与 `--import-legacy <path>` CLI；`import_into_config()` 对同名工作流做替换，保证重复导入幂等。
+- 每个可执行节点计算 `layer`（1 + max(上游层)）与 `拓扑序`（Kahn 出队顺序）。顶层单元按层分列，同层按拓扑序排列；顺序分组内子项按拓扑序排列（延时节点位于其真实前后节点之间），并行分组用三列紧凑网格。
+- 节点卡片显示执行步骤号（拓扑序）；分组容器边界由子节点位置递归推导。
+- 边分类：`target.layer === source.layer + 1 && condition === "success"` 为执行流（实线、品牌色、粗箭头）；其余（跨层/同层跳线、失败/总是）为依赖线（虚线、灰色、细箭头）。图例见画布工具栏。
+- 历史：`stores/workflows.ts` 对 `draft` 做深度 watch + 约 400ms 防抖，把 JSON 快照压入 past/future 栈；上限取 `AppSettings.undo_limit`（默认 100，范围 1..=10000），加载/保存/切换工作流时重置。撤销/重做恢复快照并保持 dirty/选中态一致。
+- 新建启动应用：`api.list_start_menu_apps` 扫描用户与系统开始菜单中的 `.lnk`（解析目标与参数、过滤卸载/帮助/文档等噪声），前端 `StartMenuPicker` 搜索/图标/键盘选择后填入节点。
+- 应用节点图标复用 `get_file_icons`：画布层收集所有 application 节点的 path 批量调用 `useIconStore().ensure`，卡片渲染 PNG data URL，失败回退 lucide 图标。
 
 ## 8. 自启动管理的筛选模型
 

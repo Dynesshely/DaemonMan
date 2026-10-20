@@ -16,9 +16,10 @@ import type {
 import BaseBadge from "@/modules/components/ui/BaseBadge.vue";
 import EmptyState from "@/modules/components/ui/EmptyState.vue";
 import { useI18n } from "@/modules/locales";
+import { useIconStore } from "@/modules/stores/icons";
 import { useWorkflowStore } from "@/modules/stores/workflows";
 
-import { buildAdjacency, computeExecutionLayers } from "./graph";
+import { buildAdjacency, computeTopology } from "./graph";
 import { aggregateStatus, buildGroupChildren } from "./layout";
 import {
   edgeConditionLabel,
@@ -36,15 +37,31 @@ const props = defineProps<{
 const emit = defineEmits<{ select: [nodeId: string] }>();
 
 const store = useWorkflowStore();
+const icons = useIconStore();
 const { t } = useI18n();
 
 const nodes = computed<WorkflowNode[]>(() => props.draft?.nodes ?? []);
 const edges = computed(() => props.draft?.edges ?? []);
 
 const adjacency = computed(() => buildAdjacency(nodes.value, edges.value));
-const layerInfo = computed(() => computeExecutionLayers(nodes.value, edges.value));
+const topology = computed(() => computeTopology(nodes.value, edges.value));
+const layerInfo = topology;
 const groupIndex = computed(() => buildGroupChildren(nodes.value));
 const isEmpty = computed(() => nodes.value.length === 0);
+
+function stepOf(nodeId: string): number | null {
+  return topology.value.stepOf.get(nodeId) ?? null;
+}
+
+/** 应用节点的真实 exe/.lnk 图标（视图层已批量 ensure）。 */
+function iconOf(node: WorkflowNode): string | null {
+  if (node.kind !== "application") return null;
+  return icons.get(node.app.path);
+}
+
+function iconSrc(node: WorkflowNode): string {
+  return iconOf(node) ?? "";
+}
 
 /** 折叠的分组 id（默认全部展开）。 */
 const collapsedGroups = ref<Set<string>>(new Set());
@@ -181,16 +198,23 @@ const treeRows = computed<TreeRow[]>(() => {
     const parentId = node.parentId;
     return !parentId || parentId === node.id || !groupIds.has(parentId);
   });
+  const stepKey = (node: WorkflowNode) =>
+    stepOf(node.id) ?? Number.MAX_SAFE_INTEGER;
+  const byTopology = (left: WorkflowNode, right: WorkflowNode) =>
+    stepKey(left) - stepKey(right) ||
+    (draftIndex.get(left.id) ?? 0) - (draftIndex.get(right.id) ?? 0);
+
   topLevel.sort(
-    (left, right) =>
-      layerOf(left) - layerOf(right) ||
-      (draftIndex.get(left.id) ?? 0) - (draftIndex.get(right.id) ?? 0),
+    (left, right) => layerOf(left) - layerOf(right) || byTopology(left, right),
   );
 
   const walk = (node: WorkflowNode, depth: number, prefix: string) => {
     if (visited.has(node.id)) return;
     visited.add(node.id);
-    const children = node.kind === "group" ? childrenOf.get(node.id) ?? [] : [];
+    const children =
+      node.kind === "group"
+        ? [...(childrenOf.get(node.id) ?? [])].sort(byTopology)
+        : [];
     const collapsed = node.kind === "group" && collapsedGroups.value.has(node.id);
     rows.push({
       node,
@@ -283,7 +307,7 @@ function indentClass(depth: number): string {
         <div class="min-w-[760px]">
           <!-- 表头 -->
           <div
-            class="sticky top-0 z-10 grid h-7 grid-cols-[minmax(190px,1.5fr)_40px_84px_minmax(150px,1fr)_168px_48px_92px] items-center border-b border-zinc-200 bg-zinc-50 px-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-400 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-500"
+            class="sticky top-0 z-10 grid h-7 grid-cols-[minmax(190px,1.5fr)_56px_84px_minmax(150px,1fr)_168px_48px_92px] items-center border-b border-zinc-200 bg-zinc-50 px-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-400 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-500"
           >
             <span class="px-1">{{ t("workflow.text.name") }}</span>
             <span class="px-1 text-center">{{ t("workflow.text.layer") }}</span>
@@ -298,7 +322,7 @@ function indentClass(depth: number): string {
           <div
             v-for="row in treeRows"
             :key="row.node.id"
-            class="grid h-7 cursor-pointer grid-cols-[minmax(190px,1.5fr)_40px_84px_minmax(150px,1fr)_168px_48px_92px] items-center border-b border-zinc-100 px-2 text-xs transition-colors dark:border-zinc-800/60"
+            class="grid h-7 cursor-pointer grid-cols-[minmax(190px,1.5fr)_56px_84px_minmax(150px,1fr)_168px_48px_92px] items-center border-b border-zinc-100 px-2 text-xs transition-colors dark:border-zinc-800/60"
             :class="[
               row.node.id === props.selectedNodeId
                 ? 'bg-brand-50 dark:bg-brand-500/10'
@@ -340,7 +364,14 @@ function indentClass(depth: number): string {
                 class="flex h-4 w-4 shrink-0 items-center justify-center rounded"
                 :class="nodeKindMeta[row.node.kind].iconClass"
               >
+                <img
+                  v-if="iconOf(row.node)"
+                  :src="iconSrc(row.node)"
+                  alt=""
+                  class="h-3.5 w-3.5 rounded-sm object-contain"
+                />
                 <component
+                  v-else
                   :is="nodeKindMeta[row.node.kind].icon"
                   class="h-2.5 w-2.5"
                 />
@@ -370,8 +401,15 @@ function indentClass(depth: number): string {
               </template>
             </div>
 
-            <!-- 层 -->
-            <div class="px-1 text-center">
+            <!-- 层 + 执行步骤号 -->
+            <div class="flex items-center justify-center gap-1 px-1">
+              <span
+                v-if="stepOf(row.node.id)"
+                class="shrink-0 font-mono text-[10px] font-semibold text-brand-600 dark:text-brand-400"
+                :title="t('workflow.execIndex', { index: stepOf(row.node.id) ?? 0 })"
+              >
+                #{{ stepOf(row.node.id) }}
+              </span>
               <span
                 class="inline-flex h-4 min-w-4 items-center justify-center rounded bg-zinc-100 px-1 text-[10px] font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
               >

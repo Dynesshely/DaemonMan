@@ -36,6 +36,8 @@ export interface AppSettings {
   maxConcurrency: number;
   maxRunHistory: number;
   maxLogEntries: number;
+  /** 工作流编辑器撤销/重做历史层数（1..=10000） */
+  undoLimit: number;
   confirmTakeOver: boolean;
   confirmQuit: boolean;
 }
@@ -237,14 +239,15 @@ export interface SystemInfo {
   uptimeSecs: number;
 }
 
-/** 旧版 ProgressManager 配置导入结果。 */
-export interface LegacyImportResult {
-  workflowId: string;
-  workflowName: string;
-  nodeCount: number;
-  edgeCount: number;
-  warnings: string[];
-  replaced: boolean;
+/** 开始菜单里的可启动应用（新建启动应用时快速选择）。 */
+export interface StartMenuApp {
+  name: string;
+  /** `.lnk` 完整路径，可直接作为节点 app.path */
+  path: string;
+  /** 解析出的目标可执行文件（用于图标/预览） */
+  target: string | null;
+  args: string[];
+  location: "user" | "machine";
 }
 
 export interface LogEntry {

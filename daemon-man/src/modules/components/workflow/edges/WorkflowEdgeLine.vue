@@ -27,6 +27,8 @@ const theme = useThemeStore();
 const { t } = useI18n();
 
 const condition = computed(() => props.data?.edge?.condition ?? "success");
+/** true = 执行流（相邻层 success），false = 依赖跳线。 */
+const isFlow = computed(() => props.data?.flow ?? true);
 
 const geometry = computed(() =>
   getSmoothStepPath({
@@ -43,10 +45,20 @@ const geometry = computed(() =>
 
 const stroke = computed(() => {
   if (props.selected) return theme.isDark ? "#a5b4fc" : "#4338ca";
+  if (!isFlow.value) return theme.isDark ? "#71717a" : "#a1a1aa";
   return theme.isDark ? "#818cf8" : "#6366f1";
 });
 
-const strokeWidth = computed(() => (props.selected ? 2.5 : 2));
+const strokeWidth = computed(() => {
+  if (props.selected) return 2.5;
+  return isFlow.value ? 2.2 : 1.5;
+});
+
+const pathStyle = computed(() => ({
+  stroke: stroke.value,
+  strokeWidth: strokeWidth.value,
+  ...(isFlow.value ? {} : { strokeDasharray: "6 4" }),
+}));
 
 /** 默认的 success 条件不显示标签，只有 failure / always 才标出来。 */
 const label = computed(() =>
@@ -73,7 +85,7 @@ const labelBgStyle = computed(() => ({
     :id="id"
     :path="geometry[0]"
     :marker-end="markerEnd"
-    :style="{ stroke, strokeWidth }"
+    :style="pathStyle"
     :label="label"
     :label-x="geometry[1]"
     :label-y="geometry[2]"

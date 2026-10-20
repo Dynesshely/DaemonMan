@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, provide, ref, watch } from "vue";
 import {
   Panel,
   useVueFlow,
@@ -21,6 +21,7 @@ import { GitBranch, LayoutGrid, Maximize2, Minus, Plus } from "lucide-vue-next";
 import type {
   NodeKind,
   NodePosition,
+  StartMenuApp,
   Workflow,
   WorkflowEdge,
   WorkflowNode,
@@ -34,6 +35,7 @@ import { useWorkflowStore } from "@/modules/stores/workflows";
 
 import WorkflowEdgeLine from "./edges/WorkflowEdgeLine.vue";
 import { buildFlowEdge, buildFlowNode, createWorkflowNode, edgeIdFor } from "./factory";
+import { computeTopology } from "./graph";
 import {
   DEFAULT_GROUP_HEIGHT,
   DEFAULT_GROUP_WIDTH,
@@ -51,9 +53,13 @@ import {
 import { nodeKindMeta, nodeKindOrder } from "./meta";
 import WorkflowGroupNode from "./nodes/WorkflowGroupNode.vue";
 import WorkflowNodeCard from "./nodes/WorkflowNodeCard.vue";
-import type { WorkflowSelection } from "./types";
+import { WORKFLOW_STEPS, type WorkflowSelection } from "./types";
 
-const emit = defineEmits<{ "selection-change": [selection: WorkflowSelection] }>();
+const emit = defineEmits<{
+  "selection-change": [selection: WorkflowSelection];
+  /** 节点面板点了「启动应用」：请外层打开开始菜单选择器。 */
+  "pick-app": [];
+}>();
 
 /** 外部（比如从文本视图切回来）希望保持的选中节点。 */
 const props = withDefaults(
@@ -67,7 +73,6 @@ const theme = useThemeStore();
 const { t } = useI18n();
 
 const {
-  addEdges,
   addNodes,
   addSelectedEdges,
   addSelectedNodes,
@@ -100,6 +105,57 @@ const gridColor = computed(() => (theme.isDark ? "#27272a" : "#e4e4e7"));
 /** 固定引用，避免每次渲染都生成新对象 / 数组导致 Vue Flow 重复应用 props。 */
 const DEFAULT_VIEWPORT = { zoom: 1 };
 const DELETE_KEYS = ["Delete", "Backspace"];
+
+/** 执行步骤号（拓扑序），通过 provide 给节点卡片显示 `#N` 徽标。 */
+const stepOf = ref<Map<string, number>>(new Map());
+/** 执行层，用于区分「执行流」与「依赖跳线」。 */
+const layerMap = ref<Map<string, number>>(new Map());
+provide(WORKFLOW_STEPS, stepOf);
+
+function applyTopology(draft: Workflow) {
+  const topology = computeTopology(draft.nodes, draft.edges);
+  stepOf.value = topology.stepOf;
+  layerMap.value = topology.layerOf;
+}
+
+/** 相邻层 + success 才算执行流；跨层、同层、失败/总是都算依赖跳线。 */
+function edgeIsFlow(edge: WorkflowEdge): boolean {
+  if (edge.condition !== "success") return false;
+  const source = layerMap.value.get(edge.source);
+  const target = layerMap.value.get(edge.target);
+  if (source === undefined || target === undefined) return false;
+  return target === source + 1;
+}
+
+function buildEdgesFor(draft: Workflow): Edge[] {
+  return draft.edges.map((edge) =>
+    buildFlowEdge(edge, theme.isDark, edgeIsFlow(edge)),
+  );
+}
+
+/** 拓扑变化后重算步骤号与连线分类（保持边的选中态）。 */
+let refreshToken = 0;
+let suppressSelectionEmit = false;
+
+function refreshFlowEdges() {
+  const current = store.draft;
+  if (!current) return;
+  applyTopology(current);
+  const selectedIds = getSelectedEdges.value.map((edge) => edge.id);
+  const token = ++refreshToken;
+  // 重建期间先屏蔽选中回传，避免右栏属性面板被瞬间清空。
+  suppressSelectionEmit = true;
+  flowEdges.value = buildEdgesFor(current);
+  void nextTick(() => {
+    if (token !== refreshToken) return;
+    const edges = selectedIds
+      .map((id) => findEdge(id))
+      .filter((edge): edge is GraphEdge => Boolean(edge));
+    if (edges.length > 0) addSelectedEdges(edges);
+    suppressSelectionEmit = false;
+    emitSelection();
+  });
+}
 
 interface GroupBox {
   x: number;
@@ -451,6 +507,7 @@ function fitWhenReady(attempts = 4) {
 }
 
 function emitSelection() {
+  if (suppressSelectionEmit) return;
   const nodes = getSelectedNodes.value;
   const edges = getSelectedEdges.value;
   emit("selection-change", {
@@ -493,6 +550,13 @@ function rebuildFromDraft(next: Workflow | null) {
   }
 
   const selectedNodeIds = getSelectedNodes.value.map((node) => node.id);
+  // 撤销/重做会把画布整体重建，此时外部（属性面板）仍保持着选中节点，这里一并恢复。
+  if (
+    props.selectedNodeId &&
+    !selectedNodeIds.includes(props.selectedNodeId)
+  ) {
+    selectedNodeIds.push(props.selectedNodeId);
+  }
   const selectedEdgeIds = getSelectedEdges.value.map((edge) => edge.id);
 
   lastGroupSignature.clear();
@@ -509,7 +573,8 @@ function rebuildFromDraft(next: Workflow | null) {
   flowNodes.value = orderedNodes.map((node) =>
     buildFlowNode(node, initialBoxes.get(node.id)),
   );
-  flowEdges.value = next.edges.map((edge) => buildFlowEdge(edge, theme.isDark));
+  applyTopology(next);
+  flowEdges.value = buildEdgesFor(next);
 
   void nextTick(() => {
     // 重建会丢失内部选中态，这里恢复一下，避免保存后属性面板突然清空。
@@ -563,7 +628,17 @@ watch(
       }
     }
     syncGroupStructure();
+    refreshFlowEdges();
   },
+);
+
+// 连线增删 / 条件变化：重算执行流与依赖跳线的分类。
+watch(
+  () =>
+    (store.draft?.edges ?? [])
+      .map((edge) => `${edge.id}:${edge.source}:${edge.target}:${edge.condition}`)
+      .join("|"),
+  () => refreshFlowEdges(),
 );
 
 // 主题切换时重算连线箭头颜色。
@@ -571,9 +646,7 @@ watch(
   () => theme.isDark,
   () => {
     if (!store.draft) return;
-    flowEdges.value = store.draft.edges.map((edge) =>
-      buildFlowEdge(edge, theme.isDark),
-    );
+    flowEdges.value = buildEdgesFor(store.draft);
   },
 );
 
@@ -604,7 +677,8 @@ function onConnect(connection: Connection) {
     condition: "success",
   };
   current.edges.push(edge);
-  addEdges(buildFlowEdge(edge, theme.isDark));
+  // 拓扑变化后统一重算步骤号 + 连线分类（新边可能是执行流也可能是跳线）。
+  refreshFlowEdges();
 }
 
 /** Vue Flow 内置删除（Delete / Backspace）只会改内部 state，这里同步回 draft。 */
@@ -692,6 +766,31 @@ function addNode(kind: NodeKind) {
   });
 }
 
+/** 节点面板点击：启动应用走「开始菜单选择器」，其余类型直接落节点。 */
+function onPaletteClick(kind: NodeKind) {
+  if (kind === "application") {
+    emit("pick-app");
+    return;
+  }
+  addNode(kind);
+}
+
+/** 开始菜单选择器选中后创建 application 节点（名称/路径/参数直接来自快捷方式）。 */
+function addApplicationNode(app: StartMenuApp) {
+  const current = store.draft;
+  if (!current) return;
+  const node = createWorkflowNode("application", nextNodePosition());
+  node.name = app.name;
+  node.app.path = app.path;
+  node.app.args = [...app.args];
+  current.nodes.push(node);
+  addNodes(buildFlowNode(node));
+  void nextTick(() => {
+    const added = findNode(node.id);
+    if (added) addSelectedNodes([added]);
+  });
+}
+
 /** 删除分组时把直接子项的 parentId 置空（子节点保留）。 */
 function unbindGroupChildren(groupId: string) {
   const current = store.draft;
@@ -752,7 +851,14 @@ function fitViewToContent() {
   fitWhenReady(2);
 }
 
-defineExpose({ addNode, removeNodeById, removeEdgeById, autoLayout, fitViewToContent });
+defineExpose({
+  addNode,
+  addApplicationNode,
+  removeNodeById,
+  removeEdgeById,
+  autoLayout,
+  fitViewToContent,
+});
 </script>
 
 <template>
@@ -821,7 +927,7 @@ defineExpose({ addNode, removeNodeById, removeEdgeById, autoLayout, fitViewToCon
                 : 'flex-col items-start'
             "
             :title="t(nodeKindMeta[kind].hintKey)"
-            @click="addNode(kind)"
+            @click="onPaletteClick(kind)"
           >
             <span
               class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md"
@@ -880,6 +986,23 @@ defineExpose({ addNode, removeNodeById, removeEdgeById, autoLayout, fitViewToCon
           <LayoutGrid class="h-3.5 w-3.5" />
           <span class="text-[11px]">{{ t("workflow.autoLayout") }}</span>
         </BaseButton>
+      </Panel>
+
+      <!-- 连线图例 -->
+      <Panel
+        position="bottom-right"
+        class="flex flex-col gap-1 rounded-lg border border-zinc-200 bg-white/95 px-2 py-1.5 text-[10px] text-zinc-500 shadow-sm backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/95 dark:text-zinc-400"
+      >
+        <span class="inline-flex items-center gap-1.5">
+          <span class="h-0.5 w-5 shrink-0 rounded-full bg-brand-500" />
+          {{ t("workflow.edgeFlow") }}
+        </span>
+        <span class="inline-flex items-center gap-1.5">
+          <span
+            class="h-0 w-5 shrink-0 border-t-2 border-dashed border-zinc-400 dark:border-zinc-500"
+          />
+          {{ t("workflow.edgeDependency") }}
+        </span>
       </Panel>
     </VueFlow>
 

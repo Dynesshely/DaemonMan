@@ -6,10 +6,10 @@ import type {
   AppSettings,
   AutostartItem,
   FileIcon,
-  LegacyImportResult,
   LogEntry,
   ProcessInfo,
   ScriptContent,
+  StartMenuApp,
   SystemInfo,
   TakeOverResult,
   Workflow,
@@ -85,6 +85,9 @@ export const api = {
   getFileIcons: (paths: string[], size = 32) =>
     invoke<FileIcon[]>("get_file_icons", { paths, size }),
 
+  /** 列出开始菜单里的可见应用（新建启动应用时快速选择）。 */
+  listStartMenuApps: () => invoke<StartMenuApp[]>("list_start_menu_apps"),
+
   /** 右键「在资源管理器中显示」。 */
   revealAutostartItem: (itemId: string) =>
     invoke<string>("reveal_autostart_item", { itemId }),
@@ -111,10 +114,6 @@ export const api = {
   exportLogs: (path: string) => invoke<void>("export_logs", { path }),
   exportConfig: (path: string) => invoke<void>("export_config", { path }),
   importConfig: (path: string) => invoke<AppConfig>("import_config", { path }),
-
-  /** 读取旧版 ProgressManager 的 config.json 并转换为工作流。 */
-  importLegacyProgressManager: (path: string) =>
-    invoke<LegacyImportResult>("import_legacy_config", { path }),
 
   openConfigDir: () => invoke<void>("open_config_dir"),
   openLogDir: () => invoke<void>("open_log_dir"),

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, Play, Trash2 } from "lucide-vue-next";
+import { AppWindow, FolderOpen, Play, Trash2 } from "lucide-vue-next";
 
 import { api } from "@/api";
 import type { WorkflowNode } from "@/api";
@@ -24,7 +24,7 @@ import ToggleRow from "./ToggleRow.vue";
 import WorkflowStatusBadge from "./WorkflowStatusBadge.vue";
 
 const props = defineProps<{ node: WorkflowNode }>();
-const emit = defineEmits<{ delete: [] }>();
+const emit = defineEmits<{ delete: []; "pick-app": [] }>();
 
 const store = useWorkflowStore();
 const ui = useUiStore();
@@ -266,10 +266,19 @@ async function testLaunch() {
         <FormField :label="t('node.appPath')" :hint="t('node.appPathPlaceholder')">
           <input v-model="props.node.app.path" :class="inputClass" class="font-mono! text-xs!" />
         </FormField>
-        <div class="flex items-center gap-1.5">
+        <div class="flex flex-wrap items-center gap-1.5">
           <BaseButton variant="secondary" size="sm" @click="browsePath">
             <FolderOpen class="h-3.5 w-3.5" />
             {{ t("common.browse") }}
+          </BaseButton>
+          <BaseButton
+            variant="secondary"
+            size="sm"
+            :title="t('workflow.pickAppHint')"
+            @click="emit('pick-app')"
+          >
+            <AppWindow class="h-3.5 w-3.5" />
+            {{ t("workflow.pickApp") }}
           </BaseButton>
           <BaseButton
             variant="subtle"

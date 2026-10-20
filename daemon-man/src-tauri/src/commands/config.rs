@@ -32,6 +32,7 @@ pub fn save_settings(
     settings.max_concurrency = settings.max_concurrency.clamp(1, 32);
     settings.max_log_entries = settings.max_log_entries.clamp(200, 20_000);
     settings.max_run_history = settings.max_run_history.clamp(10, 500);
+    settings.undo_limit = settings.undo_limit.clamp(1, 10_000);
     settings.startup_grace_ms = settings.startup_grace_ms.min(600_000);
     settings.default_node_timeout_ms = settings.default_node_timeout_ms.min(3_600_000);
 

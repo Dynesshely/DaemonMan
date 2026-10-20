@@ -1,6 +1,6 @@
 //! 配置文件读写。
 //!
-//! 位置：`%USERPROFILE%\.daemon-man\config.json`（遵循需求文档 4.1.2）。
+//! 位置：`%USERPROFILE%\.daemonMan\config.json`。
 //! 写入使用「临时文件 + 原子替换」，并为旧文件保留 `.bak`。
 
 use std::fs;
@@ -11,10 +11,45 @@ use anyhow::{Context, Result};
 
 use crate::model::{now_iso, AppConfig, CONFIG_VERSION};
 
+/// 当前数据目录：`~/.daemonMan`。
 pub fn data_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
+        .join(".daemonMan")
+}
+
+/// 旧版本使用过的数据目录：`~/.daemon-man`（仅用于首次启动时自动迁移）。
+pub fn legacy_data_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join(".daemon-man")
+}
+
+/// 若新目录不存在而旧目录存在，则把旧数据整体迁移过来（配置 + 日志）。
+pub fn migrate_legacy_data_dir() {
+    let new_dir = data_dir();
+    let old_dir = legacy_data_dir();
+    if new_dir.exists() || !old_dir.exists() {
+        return;
+    }
+
+    if fs::rename(&old_dir, &new_dir).is_ok() {
+        return;
+    }
+
+    // 跨卷或被占用时退化为逐项复制，避免用户配置丢失。
+    let _ = fs::create_dir_all(&new_dir);
+    let _ = fs::copy(old_dir.join("config.json"), new_dir.join("config.json"));
+    let old_logs = old_dir.join("logs");
+    if old_logs.is_dir() {
+        let new_logs = new_dir.join("logs");
+        let _ = fs::create_dir_all(&new_logs);
+        if let Ok(entries) = fs::read_dir(&old_logs) {
+            for entry in entries.flatten() {
+                let _ = fs::copy(entry.path(), new_logs.join(entry.file_name()));
+            }
+        }
+    }
 }
 
 pub fn config_path() -> PathBuf {
@@ -34,6 +69,7 @@ pub fn backup_dir() -> PathBuf {
 }
 
 pub fn ensure_dirs() -> Result<()> {
+    migrate_legacy_data_dir();
     fs::create_dir_all(data_dir())?;
     fs::create_dir_all(log_dir())?;
     fs::create_dir_all(backup_dir())?;

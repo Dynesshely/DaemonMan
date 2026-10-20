@@ -3,6 +3,7 @@
 mod commands;
 mod config;
 mod engine;
+mod legacy;
 mod model;
 mod platform;
 mod state;
@@ -15,6 +16,50 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 use crate::model::{LogLevel, RunTrigger};
 use crate::state::AppState;
+
+/// 从旧版 ProgressManager 配置导入工作流（无窗口 CLI）。
+/// 用法：`DaemonMan.exe --import-legacy <config.json 路径>`。
+fn run_import_legacy(path: &str) -> i32 {
+    let converted = match legacy::convert_file(std::path::Path::new(path)) {
+        Ok(converted) => converted,
+        Err(error) => {
+            eprintln!("导入失败：{error:#}");
+            return 1;
+        }
+    };
+
+    let workflow = converted.workflow;
+    let nodes = workflow.nodes.len();
+    let edges = workflow.edges.len();
+    let name = workflow.name.clone();
+    let warnings = converted.warnings;
+
+    let mut app_config = config::load_or_init();
+    let replaced = legacy::import_into_config(&mut app_config, workflow);
+    if let Err(error) = config::save(&app_config) {
+        eprintln!("保存配置失败：{error:#}");
+        return 1;
+    }
+
+    println!("config: {}", config::config_path().display());
+    println!("workflow: {name}");
+    println!("nodes: {nodes}");
+    println!("edges: {edges}");
+    println!("replaced: {replaced}");
+    for warning in &warnings {
+        println!("warning: {warning}");
+    }
+    println!("import: ok");
+    0
+}
+
+fn import_legacy_arg(args: &[String]) -> Option<String> {
+    if let Some(index) = args.iter().position(|arg| arg == "--import-legacy") {
+        return args.get(index + 1).cloned();
+    }
+    args.iter()
+        .find_map(|arg| arg.strip_prefix("--import-legacy=").map(str::to_string))
+}
 
 /// 无窗口自检：验证配置、平台层扫描与进程枚举是否可用。
 /// 用法：`DaemonMan.exe --selftest`（退出码 0 表示自检通过）。
@@ -42,14 +87,43 @@ fn run_selftest() {
 
     let config = state.config();
     println!("workflows: {}", config.workflows.len());
+    for workflow in &config.workflows {
+        let validation = engine::validate(workflow);
+        println!(
+            "workflow: name={:?} nodes={} edges={} enabled={} valid={}",
+            workflow.name,
+            workflow.nodes.len(),
+            workflow.edges.len(),
+            workflow.enabled,
+            validation.ok
+        );
+        for error in &validation.errors {
+            println!("  error: {error}");
+        }
+    }
     println!("selftest: ok");
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    if std::env::args().any(|arg| arg == "--selftest") {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|arg| arg == "--selftest") {
         run_selftest();
         return;
+    }
+
+    if args
+        .iter()
+        .any(|arg| arg == "--import-legacy" || arg.starts_with("--import-legacy="))
+    {
+        match import_legacy_arg(&args) {
+            Some(path) => std::process::exit(run_import_legacy(&path)),
+            None => {
+                eprintln!("用法：DaemonMan.exe --import-legacy <旧版 config.json 路径>");
+                std::process::exit(2);
+            }
+        }
     }
 
     tauri::Builder::default()
@@ -136,27 +210,25 @@ pub fn run() {
                 );
             }
 
-            if launched_by_autostart {
-                if config.settings.run_workflows_on_start {
-                    let grace = config.settings.startup_grace_ms;
-                    let app_handle = handle.clone();
-                    let state_handle = state.clone();
-                    tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(grace)).await;
-                        state_handle.log(
-                            &app_handle,
-                            LogLevel::Info,
-                            "startup",
-                            format!("登录启动：开始执行启用中的工作流（等待 {grace}ms）"),
-                            None,
-                        );
-                        commands::workflow::run_all_enabled_impl(
-                            &app_handle,
-                            &state_handle,
-                            RunTrigger::Startup,
-                        );
-                    });
-                }
+            if launched_by_autostart && config.settings.run_workflows_on_start {
+                let grace = config.settings.startup_grace_ms;
+                let app_handle = handle.clone();
+                let state_handle = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(grace)).await;
+                    state_handle.log(
+                        &app_handle,
+                        LogLevel::Info,
+                        "startup",
+                        format!("登录启动：开始执行启用中的工作流（等待 {grace}ms）"),
+                        None,
+                    );
+                    commands::workflow::run_all_enabled_impl(
+                        &app_handle,
+                        &state_handle,
+                        RunTrigger::Startup,
+                    );
+                });
             }
 
             // 通知前端当前状态（前端可能在 setup 之后才挂载）。
@@ -202,6 +274,7 @@ pub fn run() {
             commands::system::export_logs,
             commands::system::export_config,
             commands::system::import_config,
+            commands::system::import_legacy_config,
             commands::system::open_config_dir,
             commands::system::open_log_dir,
             commands::system::quit_app,

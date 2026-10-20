@@ -12,7 +12,7 @@ DaemonMan 是旧 PowerShell 启动器（`ProgressManager`）的完全重写版�
 - **按图调度**：无入边节点并行启动，依赖边支持「成功后 / 失败后 / 总是」三种条件，失败可沿 failure 边做降级分支；运行状态实时推送到界面。
 - **进程与日志**：查看由 DaemonMan 启动的进程（PID/内存/CPU/运行时/所属工作流）并可结束；结构化日志支持级别筛选、实时滚动、导出。
 - **托盘常驻**：关闭窗口可隐藏到托盘；托盘菜单可打开主界面、运行全部启用工作流、退出。
-- **明暗主题 + 中英双语**，配置与日志持久化到 `~/.daemon-man/`。
+- **明暗主题 + 中英双语**，配置与日志持久化到 `~/.daemonMan/`。
 
 ## 技术栈
 
@@ -96,7 +96,7 @@ daemon-man/
 └── src-tauri/                 # Rust 后端
     └── src/
         ├── model.rs           # 配置 / 工作流 / 运行状态 / 自启动项数据模型
-        ├── config.rs          # ~/.daemon-man/config.json 原子读写
+        ├── config.rs          # ~/.daemonMan/config.json 原子读写
         ├── state.rs           # 共享状态（配置、运行记录、日志、取消标记、扫描缓存）
         ├── platform/          # Windows 平台层：注册表、启动文件夹、计划任务、服务、进程/窗口
         ├── engine/            # DAG 校验、调度执行、应用启动器
@@ -107,10 +107,44 @@ daemon-man/
 
 ## 数据与配置
 
-- 配置：`%USERPROFILE%\.daemon-man\config.json`（原子写入，保留 `.bak`）
-- 日志：`%USERPROFILE%\.daemon-man\logs\daemon-man.log`
+- 配置：`%USERPROFILE%\.daemonMan\config.json`（原子写入，保留 `.bak`）
+- 日志：`%USERPROFILE%\.daemonMan\logs\daemon-man.log`
 - 开机自启：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `DaemonMan` 值（`--autostart` 参数启动，默认隐藏窗口并延迟执行工作流）
+- 旧版本使用的 `~/.daemon-man` 目录会在首次启动时自动迁移到 `~/.daemonMan`（配置与日志）。
 - 自启动项开关不删除用户数据：注册表 Run 项通过 `Explorer\StartupApproved\Run` 的启用/禁用标记控制，启动文件夹项通过 `StartupApproved\StartupFolder` 控制，与任务管理器行为一致，可无损恢复。
+
+## 迁移旧版 ProgressManager 配置
+
+旧的 `ProgressManager\config.json`（嵌套分组 + `waiting` 依赖 + `launchOrder`/`latency` + `afterStartup.sendCloseWindow`）可以直接转换为 DaemonMan 工作流：
+
+```powershell
+# 方式一：设置 → 数据迁移 → 从 ProgressManager 导入（选择 config.json）
+# 方式二：命令行（无窗口，适合脚本化）
+.\src-tauri\target\release\daemon-man.exe --import-legacy "C:\path\to\ProgressManager\config.json"
+```
+
+转换规则：
+
+| 旧配置 | DaemonMan 工作流 |
+| --- | --- |
+| `type: "program"` | Application 节点（`skipIfRunning=true`） |
+| 分组（含带子项的 program） | 不生成节点，只保留结构 |
+| `options.launchOrder: "ordered"` | 子节点之间用 success 边串联 |
+| `options.launchOrder: "parallel"` | 子节点之间不建边（并行启动） |
+| `options.latency` | 在顺序子项之间插入 Delay 节点 |
+| `waiting: ["group | X"]` / `["program | Y"]` | 从被依赖项的「出口节点」连边到目标节点 |
+| `options.afterStartup.sendCloseWindow` | Application 节点的「启动后关闭主窗口」 |
+
+迁移生成的工作流名为 `ProgressManager 迁移`，默认标记为「登录时自动运行」；重复导入同名工作流会替换而不是重复创建。转换过程会保留原始路径（含 `.lnk`），遗留的相对路径/裸命令会在节点备注中提示补全。
+
+## 自启动管理
+
+列表支持两组 Tabs 组合筛选：
+
+- **按类别**：全部 / 注册表 / 启动文件夹 / 计划任务 / 系统服务（注册表 Run 与 RunOnce 归并）
+- **按位置**：全部位置 / 当前用户 / 系统级（`HKCU`、用户启动文件夹、按当前用户身份运行的计划任务 vs `HKLM`、公共启动文件夹、系统服务）
+
+与搜索、状态筛选（启用中 / 已停用 / 已接管）全部 AND；全选与批量接管只作用于当前可见行。
 
 ## 权限说明
 
@@ -139,3 +173,4 @@ daemon-man/
 - UWP / Store 应用的自启动任务（StartupTask）暂未纳入扫描。
 - 服务与系统级任务受权限限制，普通权限下会提示需要管理员。
 - 打包产物默认 NSIS；如需 MSI 可在 `tauri.conf.json` 的 `bundle.targets` 中调整。
+

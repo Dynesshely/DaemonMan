@@ -5,6 +5,7 @@ import type {
   AppConfig,
   AppSettings,
   AutostartItem,
+  LegacyImportResult,
   LogEntry,
   ProcessInfo,
   SystemInfo,
@@ -76,6 +77,11 @@ export const api = {
   exportLogs: (path: string) => invoke<void>("export_logs", { path }),
   exportConfig: (path: string) => invoke<void>("export_config", { path }),
   importConfig: (path: string) => invoke<AppConfig>("import_config", { path }),
+
+  /** 读取旧版 ProgressManager 的 config.json 并转换为工作流。 */
+  importLegacyProgressManager: (path: string) =>
+    invoke<LegacyImportResult>("import_legacy_config", { path }),
+
   openConfigDir: () => invoke<void>("open_config_dir"),
   openLogDir: () => invoke<void>("open_log_dir"),
   quitApp: () => invoke<void>("quit_app"),

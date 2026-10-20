@@ -7,6 +7,7 @@ import {
   Download,
   FolderOpen,
   Globe,
+  History,
   Info,
   Monitor,
   Moon,
@@ -20,7 +21,7 @@ import {
   Workflow,
 } from "lucide-vue-next";
 
-import type { AppSettings } from "@/api";
+import type { AppSettings, LegacyImportResult } from "@/api";
 import { api } from "@/api";
 import PageHeader from "@/modules/components/layout/PageHeader.vue";
 import BaseBadge from "@/modules/components/ui/BaseBadge.vue";
@@ -36,9 +37,11 @@ import { useI18n } from "@/modules/locales";
 import { useAppStore } from "@/modules/stores/app";
 import { useThemeStore, type ThemeMode } from "@/modules/stores/theme";
 import { useUiStore } from "@/modules/stores/ui";
+import { useWorkflowStore } from "@/modules/stores/workflows";
 
 const appStore = useAppStore();
 const themeStore = useThemeStore();
+const workflowStore = useWorkflowStore();
 const ui = useUiStore();
 const { t } = useI18n();
 
@@ -51,6 +54,9 @@ const importOpen = ref(false);
 const resetOpen = ref(false);
 const quitOpen = ref(false);
 const pendingImportPath = ref<string | null>(null);
+const legacyBusy = ref(false);
+const legacyPath = ref<string | null>(null);
+const legacyResult = ref<LegacyImportResult | null>(null);
 
 const DEFAULT_SETTINGS: AppSettings = {
   language: "zh-CN",
@@ -184,6 +190,43 @@ async function confirmImport() {
     ui.notify("error", t("error.invoke", { error: String(error) }));
   } finally {
     importBusy.value = false;
+  }
+}
+
+async function importLegacy() {
+  if (legacyBusy.value) return;
+  legacyBusy.value = true;
+  try {
+    const picked = await open({
+      title: t("settings.importLegacy"),
+      multiple: false,
+      directory: false,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!picked || typeof picked !== "string") return;
+    legacyPath.value = picked;
+    const result = await api.importLegacyProgressManager(picked);
+    legacyResult.value = result;
+    ui.notify(
+      "success",
+      t("settings.importLegacySuccess", {
+        name: result.workflowName,
+        nodes: result.nodeCount,
+        edges: result.edgeCount,
+      }),
+    );
+    if (result.warnings.length > 0) {
+      ui.notify(
+        "warn",
+        t("settings.importLegacyWarnings", { count: result.warnings.length }),
+      );
+    }
+    await workflowStore.load();
+    await appStore.refreshSystemInfo();
+  } catch (error) {
+    ui.notify("error", t("settings.importLegacyFailed", { error: String(error) }));
+  } finally {
+    legacyBusy.value = false;
   }
 }
 
@@ -512,6 +555,74 @@ onMounted(async () => {
               </BaseButton>
             </div>
           </div>
+        </div>
+      </SectionCard>
+
+      <!-- 数据迁移 -->
+      <SectionCard
+        class="lg:col-span-2"
+        :title="t('settings.migration')"
+        :description="t('settings.migrationDesc')"
+      >
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div class="min-w-0 max-w-2xl">
+            <p class="text-xs leading-relaxed text-zinc-600 dark:text-zinc-300">
+              {{ t("settings.importLegacyDesc") }}
+            </p>
+            <p
+              class="mt-1 text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-400"
+            >
+              {{ t("settings.legacyRepeatHint") }}
+            </p>
+            <p
+              v-if="legacyPath"
+              class="mt-1 truncate font-mono text-[11px] text-zinc-400 dark:text-zinc-500"
+              :title="legacyPath"
+            >
+              {{ t("settings.legacyFile") }}：{{ legacyPath }}
+            </p>
+          </div>
+          <BaseButton
+            variant="primary"
+            size="sm"
+            :loading="legacyBusy"
+            :disabled="legacyBusy"
+            @click="importLegacy"
+          >
+            <History v-if="!legacyBusy" class="h-3.5 w-3.5" />
+            {{ t("settings.importLegacy") }}
+          </BaseButton>
+        </div>
+
+        <div
+          v-if="legacyResult"
+          class="mt-3 rounded-xl border border-zinc-200 bg-zinc-50/60 px-3 py-2.5 dark:border-zinc-800 dark:bg-zinc-900/40"
+        >
+          <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+            <BaseBadge :variant="legacyResult.replaced ? 'warn' : 'success'">
+              {{
+                legacyResult.replaced
+                  ? t("settings.legacyReplaced")
+                  : t("settings.legacyCreated")
+              }}
+            </BaseBadge>
+            <span class="font-medium text-zinc-800 dark:text-zinc-100">
+              {{ legacyResult.workflowName }}
+            </span>
+            <span class="text-zinc-500 dark:text-zinc-400">
+              {{ t("workflow.nodeCount", { count: legacyResult.nodeCount }) }}
+              ·
+              {{ t("workflow.edgeCount", { count: legacyResult.edgeCount }) }}
+            </span>
+          </div>
+          <ul
+            v-if="legacyResult.warnings.length"
+            class="mt-2 list-disc space-y-0.5 pl-5 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300"
+          >
+            <li v-for="warning in legacyResult.warnings" :key="warning">
+              {{ warning }}
+            </li>
+          </ul>
         </div>
       </SectionCard>
 

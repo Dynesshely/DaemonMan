@@ -586,6 +586,18 @@ pub enum LogLevel {
     Success,
 }
 
+/// 旧版 ProgressManager 配置导入结果。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LegacyImportResult {
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub warnings: Vec<String>,
+    pub replaced: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogEntry {

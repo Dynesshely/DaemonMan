@@ -69,6 +69,8 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 
 配置写入采用「临时文件 + rename」原子替换，旧文件保留为 `config.json.bak`；解析失败会把坏文件备份为 `config.broken-<时间>.json` 并回退默认配置。
 
+配置文件位置为 `%USERPROFILE%\.daemonMan\config.json`。旧版本目录 `~/.daemon-man` 在首次启动时通过 `config::migrate_legacy_data_dir()` 自动迁移（优先整体 rename，失败则逐项复制配置与日志）。
+
 ## 3. 工作流执行语义
 
 1. **校验**（`engine::graph::validate`）：检测重复 id、悬空边、自环、环依赖（Kahn 算法），Application 节点缺 path 视为错误；空图与禁用节点为警告；输出拓扑序。
@@ -112,3 +114,27 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 
 - Rust：`cargo test --lib` 覆盖工作流图算法、配置容错、平台层纯函数；涉及真实注册表/服务的测试标记 `#[ignore]`。
 - 前端：`pnpm typecheck`（vue-tsc strict）与 `pnpm build`；编辑器交互依赖人工验证。
+
+## 7. 旧版配置迁移（legacy.rs）
+
+`legacy::convert_file()` 解析 ProgressManager 的 `config.json`（容忍 UTF-8 BOM），递归构建工作流：
+
+- 程序项 → Application 节点；带子项的程序同样先启动自身，再按 `launchOrder` 处理子项；
+- ordered：子项之间串联 success 边，`latency` 以 Delay 节点插入；
+- parallel：子项之间不建边；
+- `waiting` 在第二遍解析：`type | name` 通过注册表（HashMap）找到被依赖项的出口节点集合后连边；
+- 入口/出口语义：分组本身无节点，入口是第一个（或全部并行）子项，出口是最后一个（或全部并行）子项；
+- 结果用 `engine::validate` 做环检测，失败时写入 warning 而不产出坏配置。
+
+导入入口：`import_legacy_config` IPC（设置页「数据迁移」）与 `--import-legacy <path>` CLI；`import_into_config()` 对同名工作流做替换，保证重复导入幂等。
+
+## 8. 自启动管理的筛选模型
+
+前端 `components/startup/categories.ts` 负责把 `AutostartItem` 归入「类别」与「位置」两个维度：
+
+- 类别：registry（Run + RunOnce）/ startup-folder / scheduled-task / service；
+- 位置：由 source + scope + requiresAdmin 推导（`machine*`、公共启动文件夹、服务、非当前用户身份的计划任务 → 系统级，其余为当前用户）。
+
+两组 Tabs 与搜索、状态筛选是 AND 关系；计数徽标基于其它筛选条件的当前结果动态计算；全选与批量接管只作用于可见行。
+
+

@@ -206,6 +206,16 @@ export interface SystemInfo {
   uptimeSecs: number;
 }
 
+/** 旧版 ProgressManager 配置导入结果。 */
+export interface LegacyImportResult {
+  workflowId: string;
+  workflowName: string;
+  nodeCount: number;
+  edgeCount: number;
+  warnings: string[];
+  replaced: boolean;
+}
+
 export interface LogEntry {
   id: number;
   ts: string;

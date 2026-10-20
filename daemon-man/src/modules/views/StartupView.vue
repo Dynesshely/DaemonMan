@@ -4,6 +4,8 @@ import { useRouter } from "vue-router";
 import {
   Check,
   Filter,
+  Layers,
+  MonitorSmartphone,
   RefreshCw,
   Search,
   Settings,
@@ -17,8 +19,17 @@ import BaseButton from "@/modules/components/ui/BaseButton.vue";
 import BaseModal from "@/modules/components/ui/BaseModal.vue";
 import EmptyState from "@/modules/components/ui/EmptyState.vue";
 import SectionCard from "@/modules/components/ui/SectionCard.vue";
+import FilterTabs from "@/modules/components/startup/FilterTabs.vue";
 import StartupItemRow from "@/modules/components/startup/StartupItemRow.vue";
 import TakeOverModal from "@/modules/components/startup/TakeOverModal.vue";
+import {
+  CATEGORY_VALUES,
+  LOCATION_VALUES,
+  categoryOf,
+  locationOf,
+  type CategoryFilter,
+  type LocationFilter,
+} from "@/modules/components/startup/categories";
 import { inputClass } from "@/modules/components/ui/form";
 import { useI18n } from "@/modules/locales";
 import { useAppStore } from "@/modules/stores/app";
@@ -38,6 +49,8 @@ const { t, locale } = useI18n();
 
 const search = ref("");
 const filter = ref<FilterKind>("all");
+const category = ref<CategoryFilter>("all");
+const location = ref<LocationFilter>("all");
 const selected = ref<Set<string>>(new Set());
 const pending = ref<Set<string>>(new Set());
 const takeOverOpen = ref(false);
@@ -79,8 +92,67 @@ const filtered = computed<AutostartItem[]>(() => {
   });
 });
 
+/** 状态筛选 + 搜索后的基础结果（不含类别/位置 Tab）。 */
+const visible = computed<AutostartItem[]>(() =>
+  filtered.value.filter(
+    (item) =>
+      (category.value === "all" || categoryOf(item) === category.value) &&
+      (location.value === "all" || locationOf(item) === location.value),
+  ),
+);
+
+/** 类别 Tab 数量：基于「当前位置 Tab + 搜索 + 状态筛选」的结果。 */
+const categoryOptions = computed(() => {
+  const base = filtered.value.filter(
+    (item) => location.value === "all" || locationOf(item) === location.value,
+  );
+  const countOf = (value: CategoryFilter) =>
+    value === "all"
+      ? base.length
+      : base.filter((item) => categoryOf(item) === value).length;
+  return CATEGORY_VALUES.map((value) => ({
+    value,
+    label: t(`startup.category.${value}`),
+    count: countOf(value),
+  }));
+});
+
+/** 位置 Tab 数量：基于「当前类别 Tab + 搜索 + 状态筛选」的结果。 */
+const locationOptions = computed(() => {
+  const base = filtered.value.filter(
+    (item) => category.value === "all" || categoryOf(item) === category.value,
+  );
+  const countOf = (value: LocationFilter) =>
+    value === "all"
+      ? base.length
+      : base.filter((item) => locationOf(item) === value).length;
+  return LOCATION_VALUES.map((value) => ({
+    value,
+    label: t(`startup.location.${value}`),
+    count: countOf(value),
+  }));
+});
+
+const categoryModel = computed({
+  get: () => category.value as string,
+  set: (value: string) => {
+    if ((CATEGORY_VALUES as string[]).includes(value)) {
+      category.value = value as CategoryFilter;
+    }
+  },
+});
+
+const locationModel = computed({
+  get: () => location.value as string,
+  set: (value: string) => {
+    if ((LOCATION_VALUES as string[]).includes(value)) {
+      location.value = value as LocationFilter;
+    }
+  },
+});
+
 const selectableItems = computed(() =>
-  filtered.value.filter((item) => !item.isSelf && !item.takenOver),
+  visible.value.filter((item) => !item.isSelf && !item.takenOver),
 );
 
 const allSelected = computed(
@@ -89,8 +161,9 @@ const allSelected = computed(
     selectableItems.value.every((item) => selected.value.has(item.id)),
 );
 
+/** 只有当前可见行的选中项参与批量接管。 */
 const selectedItems = computed(() =>
-  autostartStore.items.filter((item) => selected.value.has(item.id)),
+  visible.value.filter((item) => selected.value.has(item.id)),
 );
 
 const elevated = computed(() => appStore.systemInfo?.elevated ?? false);
@@ -249,6 +322,17 @@ watch(
   },
 );
 
+// 切换类别/位置 Tab 时丢弃不可见行的选中状态，避免批量接管误伤。
+watch([category, location], () => {
+  const visibleIds = new Set(visible.value.map((item) => item.id));
+  const next = new Set(
+    [...selected.value].filter((id) => visibleIds.has(id)),
+  );
+  if (next.size !== selected.value.size) {
+    selected.value = next;
+  }
+});
+
 onMounted(async () => {
   await Promise.allSettled([
     appStore.refreshSystemInfo(),
@@ -364,11 +448,34 @@ onMounted(async () => {
       </div>
 
       <div
+        class="flex flex-col gap-2 border-b border-zinc-200/80 px-3 py-2.5 dark:border-zinc-800/80"
+      >
+        <div class="flex flex-wrap items-center gap-2">
+          <span
+            class="inline-flex shrink-0 items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400"
+          >
+            <Layers class="h-3 w-3" />
+            {{ t("startup.tabs.category") }}
+          </span>
+          <FilterTabs v-model="categoryModel" :options="categoryOptions" />
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <span
+            class="inline-flex shrink-0 items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400"
+          >
+            <MonitorSmartphone class="h-3 w-3" />
+            {{ t("startup.tabs.location") }}
+          </span>
+          <FilterTabs v-model="locationModel" :options="locationOptions" />
+        </div>
+      </div>
+
+      <div
         class="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-zinc-200/70 px-4 py-2 text-[11px] text-zinc-500 dark:border-zinc-800/70 dark:text-zinc-400"
       >
         <span class="inline-flex items-center gap-1">
           <Filter class="h-3 w-3" />
-          {{ t("startup.totalCount", { count: filtered.length }) }}
+          {{ t("startup.totalCount", { count: visible.length }) }}
         </span>
         <span v-if="selectedItems.length" class="text-brand-600 dark:text-brand-400">
           {{ t("startup.selected", { count: selectedItems.length }) }}
@@ -393,11 +500,11 @@ onMounted(async () => {
       </div>
 
       <div
-        v-else-if="filtered.length"
+        v-else-if="visible.length"
         class="divide-y divide-zinc-200/80 dark:divide-zinc-800/80"
       >
         <StartupItemRow
-          v-for="item in filtered"
+          v-for="item in visible"
           :key="item.id"
           :item="item"
           :selected="isSelected(item.id)"

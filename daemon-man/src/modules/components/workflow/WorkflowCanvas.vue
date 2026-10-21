@@ -2114,3 +2114,12 @@ defineExpose({
     </Teleport>
   </div>
 </template>
+<style scoped>
+/* 箭头、端点小圆点/小黄点需要压在卡片之上；连线本身已按节点障碍绕行。 */
+:deep(.vue-flow__edges) {
+  z-index: 2;
+}
+:deep(.vue-flow__nodes) {
+  z-index: 1;
+}
+</style>

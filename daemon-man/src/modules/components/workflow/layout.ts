@@ -501,6 +501,7 @@ function layoutUnitForest(
   pairs: Array<[string, string]>,
   sizeOf: SizeOf,
   compare: Compare,
+  alignParent: "center" | "top" = "center",
 ): ForestLayout {
   const graph = buildLocalGraph(units, pairs, compare);
   const byId = new Map(units.map((unit) => [unit.id, unit]));
@@ -608,9 +609,16 @@ function layoutUnitForest(
       cursorY += kidHeight + MIND_ROW_GAP;
     });
 
-    // 父节点垂直居中对齐子节点范围（并夹在自身子树高度内）。
-    const center = (firstChildTop + lastChildBottom) / 2;
-    let y = center - unitHeight / 2;
+    // 父节点默认垂直居中对齐子节点范围；「按连线」模式改为与第一个子节点顶部对齐，
+    // 一对多分叉（如 FlClash → v2rayN / Clash Verge）保持水平对齐更直观。
+    let y: number;
+    if (alignParent === "top") {
+      const firstKid = positions.get(kids[0]);
+      y = firstKid ? firstKid.y : top;
+    } else {
+      const center = (firstChildTop + lastChildBottom) / 2;
+      y = center - unitHeight / 2;
+    }
     y = Math.max(top, Math.min(y, top + height - unitHeight));
     positions.set(id, { x, y });
   };
@@ -714,6 +722,7 @@ function planSequentialGroup(
   childrenOf: Map<string, WorkflowNode[]>,
   sizeOf: SizeOf,
   compare: Compare,
+  alignParentTop: boolean,
 ): GroupPlan {
   const units = [...children].sort(compare);
   if (units.length === 0) return emptyPlan();
@@ -727,7 +736,13 @@ function planSequentialGroup(
     pairs.push([source, target]);
   }
 
-  const forest = layoutUnitForest(units, pairs, sizeOf, compare);
+  const forest = layoutUnitForest(
+    units,
+    pairs,
+    sizeOf,
+    compare,
+    alignParentTop ? "top" : "center",
+  );
   const positions = new Map<string, NodePosition>();
   let offsetY = 0;
   let contentWidth = 0;
@@ -813,7 +828,14 @@ export function computeGroupPlans(
     } else {
       // 按连线（graph）/ 顺序但不简洁：按子图拓扑做思维导图布局。
       const children = [...rawChildren].sort(compare);
-      plan = planSequentialGroup(children, edges, childrenOf, sizeOf, compare);
+      plan = planSequentialGroup(
+        children,
+        edges,
+        childrenOf,
+        sizeOf,
+        compare,
+        mode === "graph",
+      );
     }
     resolving.delete(group.id);
     plans.set(group.id, plan);

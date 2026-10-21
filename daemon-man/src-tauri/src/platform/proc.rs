@@ -703,6 +703,98 @@ const BROWSER_TITLE_SUFFIXES: [&str; 6] = [
     " - vivaldi",
 ];
 
+/// 浏览器安装的 PWA / Web App 快捷方式有时直接指向浏览器安装目录里的
+/// `chrome_proxy.exe` / `msedge_proxy.exe`（而不是浏览器本体），需要按安装路径
+/// 判断它属于哪个浏览器，并把代理进程与浏览器进程都纳入窗口归属候选。
+pub(crate) fn browser_process_for_target(
+    target: &str,
+    explicit_process_name: Option<&str>,
+) -> Option<(&'static str, &'static str)> {
+    let lower = target.to_ascii_lowercase().replace('/', "\\");
+    // 先看安装路径：Brave 的 PWA 快捷方式就叫 chrome_proxy.exe，
+    // 只能靠 `Brave-Browser` 目录区分，不能按文件名猜。
+    let from_path = if lower.contains("brave-browser") || lower.contains("\\brave\\") {
+        Some(("brave", "brave_proxy"))
+    } else if lower.contains("microsoft\\edge") || lower.contains("\\msedge") {
+        Some(("msedge", "msedge_proxy"))
+    } else if lower.contains("google\\chrome") || lower.contains("\\chrome\\application") {
+        Some(("chrome", "chrome_proxy"))
+    } else if lower.contains("chromium") {
+        Some(("chromium", "chromium_proxy"))
+    } else if lower.contains("\\opera") {
+        Some(("opera", "opera_proxy"))
+    } else if lower.contains("vivaldi") {
+        Some(("vivaldi", "vivaldi_proxy"))
+    } else {
+        None
+    };
+    if let Some(value) = from_path {
+        return Some(value);
+    }
+
+    let stem = process_name_from_path(target);
+    for candidate in [explicit_process_name, Some(stem.as_str())] {
+        let Some(candidate) = candidate else { continue };
+        let normalized = normalize_process_name(candidate);
+        if let Some(base) = proxy_browser_name(&normalized) {
+            return Some((base, proxy_stem(base)));
+        }
+        if is_browser_process_name(&normalized) {
+            if let Some(base) = browser_static_name(&normalized) {
+                return Some((base, proxy_stem(base)));
+            }
+        }
+    }
+    None
+}
+
+/// 把规范化后的浏览器进程名映射到 `'static` 字符串。
+fn browser_static_name(name: &str) -> Option<&'static str> {
+    match name {
+        "chrome" => Some("chrome"),
+        "msedge" => Some("msedge"),
+        "brave" => Some("brave"),
+        "chromium" => Some("chromium"),
+        "opera" => Some("opera"),
+        "vivaldi" => Some("vivaldi"),
+        _ => None,
+    }
+}
+
+fn proxy_stem(browser: &str) -> &'static str {
+    match browser {
+        "msedge" => "msedge_proxy",
+        "brave" => "brave_proxy",
+        "chromium" => "chromium_proxy",
+        "opera" => "opera_proxy",
+        "vivaldi" => "vivaldi_proxy",
+        _ => "chrome_proxy",
+    }
+}
+
+fn proxy_browser_name(name: &str) -> Option<&'static str> {
+    match name {
+        "chrome_proxy" => Some("chrome"),
+        "msedge_proxy" => Some("msedge"),
+        "brave_proxy" => Some("brave"),
+        "chromium_proxy" => Some("chromium"),
+        "opera_proxy" => Some("opera"),
+        "vivaldi_proxy" => Some("vivaldi"),
+        _ => None,
+    }
+}
+
+/// 浏览器 + 代理进程的 pid 并集（PWA 窗口可能属于其中任意一个）。
+fn browser_pids(browser: &str, proxy: &str) -> Vec<u32> {
+    let mut pids = process_pids(browser);
+    for pid in process_pids(proxy) {
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
 /// 是否是已知的浏览器进程名（忽略大小写与 `.exe`）。
 pub(crate) fn is_browser_process_name(name: &str) -> bool {
     let normalized = normalize_process_name(name);
@@ -834,22 +926,19 @@ pub fn find_running_app(spec: &AppLaunchSpec, display_name: &str) -> Option<u32>
         return None;
     }
 
-    // 浏览器判定同时看「目标 exe」与「显式 process_name」，
-    // 因为有些快捷方式会显式指定 processName=chrome。
-    let is_browser = is_browser_process_name(&exe_stem) || is_browser_process_name(&process_name);
-    let pids = process_pids(&process_name);
-
-    if !is_browser {
+    // 浏览器判定同时看「目标 exe / 安装路径」与「显式 process_name」：
+    // PWA 快捷方式可能指向 chrome_proxy.exe / msedge_proxy.exe，也可能显式指定
+    // processName=chrome。识别到浏览器后，窗口归属要同时覆盖浏览器本体与代理进程。
+    if let Some((browser, proxy)) = browser_process_for_target(target, explicit) {
+        let pids = browser_pids(browser, proxy);
+        if normalize_display_name(display_name).chars().count() >= 2 {
+            return browser_window_pid(&pids, display_name);
+        }
+        // 没有可用显示名时退回「浏览器本体在跑就算在跑」（与旧行为一致）。
         return pids.first().copied();
     }
 
-    // 浏览器 + 有效显示名 → 用窗口标题识别具体的 PWA/Web App。
-    if normalize_display_name(display_name).chars().count() >= 2 {
-        return browser_window_pid(&pids, display_name);
-    }
-
-    // 没有可用显示名时退回「浏览器本体在跑就算在跑」（与旧行为一致）。
-    pids.first().copied()
+    process_pids(&process_name).first().copied()
 }
 
 /// 列出系统进程。
@@ -1265,6 +1354,38 @@ mod tests {
         for name in ["firefox", "chrome_proxy", "msedgewebview2", "explorer", ""] {
             assert!(!is_browser_process_name(name), "{name} 不应识别为浏览器");
         }
+    }
+
+    #[test]
+    fn browser_proxy_target_mapping() {
+        // Brave 的 PWA 快捷方式指向 Brave 安装目录里的 chrome_proxy.exe。
+        assert_eq!(
+            browser_process_for_target(
+                r"C:\Users\me\AppData\Local\BraveSoftware\Brave-Browser\Application\chrome_proxy.exe",
+                None
+            ),
+            Some(("brave", "brave_proxy"))
+        );
+        assert_eq!(
+            browser_process_for_target(
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge_proxy.exe",
+                None
+            ),
+            Some(("msedge", "msedge_proxy"))
+        );
+        assert_eq!(
+            browser_process_for_target(
+                r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe",
+                None
+            ),
+            Some(("chrome", "chrome_proxy"))
+        );
+        // 普通浏览器本体 + 显式 processName。
+        assert_eq!(
+            browser_process_for_target(r"C:\Program Files\Google\Chrome\Application\chrome.exe", Some("chrome")),
+            Some(("chrome", "chrome_proxy"))
+        );
+        assert_eq!(browser_process_for_target(r"C:\Windows\notepad.exe", None), None);
     }
 
     #[test]

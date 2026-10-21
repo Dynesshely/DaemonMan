@@ -246,6 +246,131 @@ function scheduleEdgeRouting() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// 分组边框自适应：运行状态徽标会让卡片变高，分组容器必须始终包住所有后代。
+// ---------------------------------------------------------------------------
+
+let groupFitFrame = 0;
+
+function numericNodeSize(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : fallback;
+}
+
+function groupDepth(node: WorkflowNode, draft: Workflow): number {
+  let depth = 0;
+  let current: WorkflowNode | undefined = node;
+  const seen = new Set<string>();
+  while (current?.parentId && !seen.has(current.id)) {
+    seen.add(current.id);
+    const parent = draft.nodes.find((item) => item.id === current?.parentId);
+    if (!parent) break;
+    depth += 1;
+    current = parent;
+  }
+  return depth;
+}
+
+function descendantsOf(groupId: string, draft: Workflow): WorkflowNode[] {
+  const result: WorkflowNode[] = [];
+  const walk = (parentId: string) => {
+    for (const node of draft.nodes) {
+      if (node.parentId !== parentId) continue;
+      result.push(node);
+      if (node.kind === "group") walk(node.id);
+    }
+  };
+  walk(groupId);
+  return result;
+}
+
+/** 按后代节点的实际量测尺寸扩展分组容器（只改画布几何，不改 draft）。 */
+function fitGroupsToChildren() {
+  if (groupFitFrame || unmounted) return;
+  groupFitFrame = window.requestAnimationFrame(() => {
+    groupFitFrame = 0;
+    const draft = store.draft;
+    if (!draft) return;
+    const lookup = new Map(flowNodes.value.map((node) => [node.id, node]));
+    const groups = draft.nodes
+      .filter((node) => node.kind === "group")
+      .slice()
+      .sort((left, right) => groupDepth(right, draft) - groupDepth(left, draft));
+
+    for (const group of groups) {
+      const children = descendantsOf(group.id, draft);
+      const groupNode = lookup.get(group.id);
+      if (!groupNode || children.length === 0) continue;
+
+      let maxRight = Number.NEGATIVE_INFINITY;
+      let maxBottom = Number.NEGATIVE_INFINITY;
+      for (const child of children) {
+        const node = lookup.get(child.id);
+        if (!node) continue;
+        const measured = findNode(node.id)?.dimensions;
+        const width = measured?.width || numericNodeSize(node.width, NODE_WIDTH);
+        const height = measured?.height || numericNodeSize(node.height, NODE_HEIGHT);
+        maxRight = Math.max(maxRight, node.position.x + width);
+        maxBottom = Math.max(maxBottom, node.position.y + height);
+      }
+      if (!Number.isFinite(maxRight) || !Number.isFinite(maxBottom)) continue;
+
+      const width = Math.max(
+        DEFAULT_GROUP_WIDTH,
+        maxRight - groupNode.position.x + GROUP_PADDING,
+      );
+      const height = Math.max(
+        GROUP_HEADER + GROUP_PADDING,
+        maxBottom - groupNode.position.y + GROUP_PADDING,
+      );
+      const groupMeasured = findNode(group.id)?.dimensions;
+      const currentWidth =
+        groupMeasured?.width ?? numericNodeSize(groupNode.width, 0);
+      const currentHeight =
+        groupMeasured?.height ?? numericNodeSize(groupNode.height, 0);
+      if (
+        Math.abs(width - currentWidth) < 1 &&
+        Math.abs(height - currentHeight) < 1
+      ) {
+        continue;
+      }
+      updateNode(group.id, {
+        width,
+        height,
+        style: {
+          ...(groupNode.style ?? {}),
+          width: `${width}px`,
+          height: `${height}px`,
+        },
+      });
+    }
+  });
+}
+
+// 运行状态变化、节点量测尺寸变化都可能撑高卡片，触发分组容器重新包络。
+watch(
+  () =>
+    store.runs
+      .map((run) =>
+        Object.values(run.nodes)
+          .map((node) => node.status)
+          .join(","),
+      )
+      .join("|"),
+  () => fitGroupsToChildren(),
+);
+watch(
+  () =>
+    flowNodes.value
+      .map((node) => {
+        const measured = findNode(node.id)?.dimensions;
+        return `${node.id}:${measured?.width ?? 0}x${measured?.height ?? 0}`;
+      })
+      .join("|"),
+  () => fitGroupsToChildren(),
+);
+
 function applyTopology(draft: Workflow) {
   const pills = computeDelayPills(draft.nodes, draft.edges);
   if (pills.size === 0) {
@@ -1033,6 +1158,10 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   for (const timer of outcomeTimers) window.clearInterval(timer);
   outcomeTimers.clear();
+  if (groupFitFrame) {
+    window.cancelAnimationFrame(groupFitFrame);
+    groupFitFrame = 0;
+  }
   unmounted = true;
   routingDisabled = true;
   if (routingFrame) {

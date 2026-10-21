@@ -37,6 +37,7 @@ import type {
   Workflow,
   WorkflowEdge,
   WorkflowNode,
+  WorkflowRun,
 } from "@/api";
 import BaseButton from "@/modules/components/ui/BaseButton.vue";
 import EmptyState from "@/modules/components/ui/EmptyState.vue";
@@ -858,22 +859,28 @@ async function runNodeNow() {
   if (runningNodeId.value !== null) return;
 
   const isGroup = node.kind === "group";
+  const displayName = node.name || t(nodeKindMeta[node.kind].labelKey);
   runningNodeId.value = node.id;
   try {
     const run = isGroup
       ? await runSingleGroup(current, node.id)
       : await runSingleNode(current, node.id);
     store.applyRun(run);
-    ui.notify(
-      "success",
-      isGroup
-        ? t("workflow.runGroupStarted", {
-            name: node.name || t("node.kind.group"),
-          })
-        : t("workflow.runNodeStarted", {
-            name: node.name || t(nodeKindMeta[node.kind].labelKey),
-          }),
-    );
+    let startToastId: number | undefined;
+    if (isGroup) {
+      ui.notify(
+        "success",
+        t("workflow.runGroupStarted", {
+          name: displayName,
+        }),
+      );
+    } else {
+      startToastId = ui.notify(
+        "info",
+        t("workflow.runNodeRunning", { name: displayName }),
+      );
+    }
+    watchRunOutcome(run, isGroup, displayName, startToastId);
   } catch (error) {
     ui.notify(
       "error",
@@ -884,6 +891,65 @@ async function runNodeNow() {
   } finally {
     runningNodeId.value = null;
   }
+}
+
+/**
+ * 单点/分组执行结束后，如果节点因为“进程已存在”被跳过，给出明显提示。
+ * 运行状态由全局 workflow:run 事件写入 store，这里轮询到终态即可。
+ */
+const outcomeTimers = new Set<number>();
+
+function watchRunOutcome(
+  run: WorkflowRun,
+  isGroup: boolean,
+  name: string,
+  startToastId?: number,
+) {
+  let tries = 0;
+  const timer = window.setInterval(() => {
+    const current = store.runs.find((item) => item.runId === run.runId);
+    if (!current) return;
+    if (current.status === "running") {
+      tries += 1;
+      if (tries > 240) {
+        window.clearInterval(timer);
+        outcomeTimers.delete(timer);
+      }
+      return;
+    }
+    window.clearInterval(timer);
+    outcomeTimers.delete(timer);
+    if (startToastId !== undefined) ui.dismiss(startToastId);
+    const skipped = Object.values(current.nodes).filter(
+      (item) => item.status === "skipped-existing",
+    );
+    if (skipped.length > 0) {
+      if (isGroup) {
+        ui.notify(
+          "warn",
+          t("workflow.groupSkippedExisting", {
+            name,
+            count: skipped.length,
+          }),
+          8000,
+        );
+        return;
+      }
+      const pid = skipped[0].pid;
+      ui.notify(
+        "warn",
+        pid
+          ? t("workflow.runNodeSkippedExisting", { name, pid })
+          : t("workflow.runNodeSkippedExistingNoPid", { name }),
+        8000,
+      );
+      return;
+    }
+    if (!isGroup) {
+      ui.notify("success", t("workflow.runNodeFinished", { name }));
+    }
+  }, 250);
+  outcomeTimers.add(timer);
 }
 
 // ---------------------------------------------------------------------------
@@ -965,6 +1031,8 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  for (const timer of outcomeTimers) window.clearInterval(timer);
+  outcomeTimers.clear();
   unmounted = true;
   routingDisabled = true;
   if (routingFrame) {

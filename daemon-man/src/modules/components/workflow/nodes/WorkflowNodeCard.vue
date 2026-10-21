@@ -63,6 +63,14 @@ const summary = computed(() => {
 const borderClass = computed(() =>
   status.value ? nodeStatusBorder[status.value] : nodeStatusBorder.pending,
 );
+
+/** 跳过已存在进程时，卡片内给出明确原因与 PID。 */
+const skippedHint = computed(() => {
+  const pid = runState.value?.pid;
+  return pid
+    ? t("node.skippedExistingHint", { pid })
+    : t("node.skippedExistingHintNoPid");
+});
 </script>
 
 <template>
@@ -131,6 +139,22 @@ const borderClass = computed(() =>
           :title="t('common.disabled')"
         />
       </div>
+    </div>
+
+    <div
+      v-if="status === 'skipped-existing'"
+      class="mt-2 flex items-center gap-1.5 rounded-md border border-teal-200/80 bg-teal-50 px-2 py-1 text-[10px] font-medium text-teal-700 dark:border-teal-500/30 dark:bg-teal-500/10 dark:text-teal-300"
+      role="status"
+      :title="skippedHint"
+    >
+      <Ban class="h-3 w-3 shrink-0" />
+      <span class="truncate">{{ t("node.skippedExistingBadge") }}</span>
+      <span
+        v-if="runState?.pid"
+        class="ml-auto shrink-0 font-mono text-[9px] opacity-80"
+      >
+        PID {{ runState.pid }}
+      </span>
     </div>
 
     <Handle

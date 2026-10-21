@@ -71,7 +71,7 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 
 **工作流单独存储**：`config.json` 只包含 `version / settings / overrides / updatedAt`，每个工作流独立保存为 `workflows/<id>.json`（原子写 + `.bak`）。`AppConfig.workflows` 只是运行时视图，`#[serde(skip_serializing)]` 不写回 config.json；启动时若发现旧配置内嵌 `workflows`，会自动拆分到独立文件并清空字段。工作流保存/删除/复制/接管都会同步写/删对应文件；导出配置时用 `ExportBundle` 把 settings、overrides 与全部工作流打成一个 JSON，导入时先整体替换 `workflows/` 再写 config。
 
-**生产与开发实例共存**：生产数据目录 `~/.daemonMan`，开发构建（未启用 `custom-protocol` feature）使用 `~/.dev-daemonMan`。开发实例首次启动且自身配置不存在时，只读复制生产 `config.json` 与 `workflows/*.json`；单实例插件只在生产构建启用，DaemonMan 自身的开机自启值名在开发实例下为 `DaemonManDev`，避免覆盖生产自启；开发实例还使用独立的 WebView2 用户数据目录（`%LOCALAPPDATA%\com.daemonman.app.dev\EBWebView`），避免与生产实例的 WebView2 profile 互斥。`DAEMONMAN_DATA_DIR` 环境变量可覆盖目录（自动化测试用）。
+**生产与开发实例共存**：生产数据目录 `~/.daemonMan`，开发构建（debug profile）使用 `~/.dev-daemonMan`。开发实例首次启动且自身配置不存在时，只读复制生产 `config.json` 与 `workflows/*.json`；单实例插件只在生产构建（release）启用，DaemonMan 自身的开机自启值名在开发实例下为 `DaemonManDev`，避免覆盖生产自启；开发实例还使用独立的 WebView2 用户数据目录（`%LOCALAPPDATA%\com.daemonman.app.dev\EBWebView` 或独立 identifier 的 profile），避免与生产实例的 WebView2 profile 互斥。`DAEMONMAN_DATA_DIR` 环境变量可覆盖目录（自动化测试用）。
 
 旧版本目录 `~/.daemon-man` 在首次启动时通过 `config::migrate_legacy_data_dir()` 自动迁移（优先整体 rename，失败则逐项复制配置与日志）。
 

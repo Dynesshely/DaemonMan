@@ -58,13 +58,13 @@ cargo check
 cargo clippy --all-targets
 cargo test --lib
 
-# 手动打包（等价于 pnpm tauri build，必须启用 custom-protocol 才会内嵌前端资源）
-cargo build --release --features custom-protocol --bin daemon-man
+# 手动打包（release profile 即生产模式）
+cargo build --release --bin daemon-man
 ```
 
-> 注意：Tauri 2 的 dev/生产模式由 `custom-protocol` feature 决定，而不是 Cargo profile。
-> 不带该 feature 的构建（包括 `cargo build --release`）会加载 `devUrl`，需要同时运行
-> `pnpm dev`；`pnpm tauri build` 会自动启用该 feature。
+> 注意：Tauri 2 的 dev/生产模式由 Cargo profile 决定：`pnpm tauri dev` / `cargo run`（debug）
+> 使用 `~/.dev-daemonMan` 并加载 `devUrl`；`pnpm tauri build` / `cargo build --release` 使用
+> 生产数据目录并内嵌前端资源。`custom-protocol` feature 仅为兼容旧命令保留，不再用于判定。
 
 开发/自动化测试时可用 `DAEMONMAN_DATA_DIR` 环境变量把配置目录指向临时位置，隔离真实用户配置：
 
@@ -127,7 +127,7 @@ daemon-man/
 ## 数据与配置
 
 - **生产实例**数据目录：`%USERPROFILE%\.daemonMan\`
-- **开发实例**数据目录：`%USERPROFILE%\.dev-daemonMan\`（`pnpm tauri dev` / 不带 `custom-protocol` 的构建）。开发实例首次启动会只读复制生产配置（`config.json` + `workflows/*.json`），之后互不影响；单实例限制只在生产构建启用，且开发实例使用独立的 WebView2 用户数据目录，因此开发/生产实例可以同时打开。
+- **开发实例**数据目录：`%USERPROFILE%\.dev-daemonMan\`（`pnpm tauri dev` / debug 构建）。开发实例首次启动会只读复制生产配置（`config.json` + `workflows/*.json`），之后互不影响；单实例限制只在生产构建（release）启用，且开发实例使用独立的 WebView2 用户数据目录，因此开发/生产实例可以同时打开。
 - 配置：`<数据目录>\config.json`（设置与自启动接管记录，原子写入，保留 `.bak`）
 - **每个工作流单独存储**：`<数据目录>\workflows\<id>.json`（原子写入，保留 `.bak`）；旧版本内嵌在 `config.json` 的工作流会在首次启动时自动拆分。导出配置时会把所有工作流打包进同一个 JSON，导入时再拆分回文件。
 - 日志：`<数据目录>\logs\daemon-man.log`

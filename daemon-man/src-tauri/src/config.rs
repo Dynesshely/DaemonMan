@@ -12,12 +12,12 @@ use anyhow::{Context, Result};
 
 use crate::model::{now_iso, AppConfig, AppSettings, AutostartOverride, CONFIG_VERSION, Workflow};
 
-/// 是否为开发实例（未启用 `custom-protocol` feature）。
+/// 是否为开发实例（debug 构建）。
 ///
-/// 生产构建（`pnpm tauri build` / 带 `--features custom-protocol`）会内嵌前端资源，
-/// 开发构建（`pnpm tauri dev` 等）需要 dev server，两者用不同数据目录共存。
+/// Tauri 2 的 `tauri build` 不一定传 `custom-protocol` feature，因此不能用它判断
+/// dev/prod；直接以编译 profile 为准：`cargo run`/`tauri dev` 是 debug，正式安装包是 release。
 pub fn is_dev() -> bool {
-    !cfg!(feature = "custom-protocol")
+    cfg!(debug_assertions)
 }
 
 /// 当前数据目录：生产 `~/.daemonMan`，开发 `~/.dev-daemonMan`。

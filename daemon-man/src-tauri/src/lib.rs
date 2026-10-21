@@ -93,7 +93,7 @@ pub fn run() {
     // 开发实例另用独立的 application identifier（tauri.dev.conf.json），
     // 配合窗口的 dataDirectory 使用不同的 WebView2 用户数据目录，避免 profile 互斥。
     let builder = tauri::Builder::default();
-    #[cfg(feature = "custom-protocol")]
+    #[cfg(not(debug_assertions))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
         tray::show_main(app);
         let state = app.state::<Arc<AppState>>().inner().clone();

@@ -373,33 +373,54 @@ function buildGapCandidates(
     });
   }
 
-  // 纵向排列（目标在下方）：走「源底部靠右 → 目标顶部靠左」的斜线直连。
-  // 普通边仅在同一列时启用；顺序展示边（compact 分组的 seq 边）允许跨列，
-  // 这样行末 → 下一行行首不用从组外绕一大圈。
+  // 纵向排列（目标在下方）。
+  // - 同一列：走「源底部靠右 → 目标顶部靠左」的斜线直连；
+  // - 顺序展示边的跨列行间连接（一行多个节点后换行）：同样用小黄点端点，
+  //   但改为「下 → 横 → 下」的正交走法，避免大跨度斜线穿过中间内容。
   const below = target.y >= source.y + source.height + 2;
-  const verticallyStacked =
-    below && (Math.abs(target.x - source.x) <= 2 || allowDiagonal);
-  if (verticallyStacked) {
+  const columnAligned = Math.abs(target.x - source.x) <= 2;
+  if (below && (columnAligned || allowDiagonal)) {
     const insetX = Math.min(44, source.width * 0.22, target.width * 0.22);
-    const insetY = 0;
     const start: Point = [
       source.x + source.width - insetX,
-      source.y + source.height - insetY,
+      source.y + source.height,
     ];
-    const end: Point = [target.x + insetX, target.y + insetY];
-    candidates.push({
-      points: [start, end],
-      kind: "gap",
-      penalty: -20,
-      corners: { start, end },
-      label: {
-        x: (start[0] + end[0]) / 2,
-        y: (start[1] + end[1]) / 2,
-        axis: "horizontal",
-        min: Math.min(start[0], end[0]) + 48,
-        max: Math.max(start[0], end[0]) - 48,
-      },
-    });
+    const end: Point = [target.x + insetX, target.y];
+    if (columnAligned) {
+      candidates.push({
+        points: [start, end],
+        kind: "gap",
+        penalty: -20,
+        corners: { start, end },
+        label: {
+          x: (start[0] + end[0]) / 2,
+          y: (start[1] + end[1]) / 2,
+          axis: "horizontal",
+          min: Math.min(start[0], end[0]) + 48,
+          max: Math.max(start[0], end[0]) - 48,
+        },
+      });
+    } else {
+      const midY = (start[1] + end[1]) / 2;
+      candidates.push({
+        points: [
+          start,
+          [start[0], midY],
+          [end[0], midY],
+          end,
+        ],
+        kind: "gap",
+        penalty: -20,
+        corners: { start, end },
+        label: {
+          x: (start[0] + end[0]) / 2,
+          y: midY,
+          axis: "horizontal",
+          min: Math.min(start[0], end[0]) + 48,
+          max: Math.max(start[0], end[0]) - 48,
+        },
+      });
+    }
   }
   return candidates;
 }

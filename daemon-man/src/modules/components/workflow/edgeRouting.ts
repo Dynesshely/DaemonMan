@@ -366,14 +366,19 @@ function buildGapCandidates(
     });
   }
 
-  // 纵向排列（同一列、目标在下方）：走「源右下角 → 目标左上角」的斜线直连，
-  // 不再绕到右/左中点再拐弯。这是用户指定的特殊点位（非常规 handle）。
+  // 纵向排列（同一列、目标在下方）：走「源底部靠右 → 目标顶部靠左」的斜线直连。
+  // 端点不是严格角点：沿水平方向内缩一段距离，垂直方向略微离开边框，形成“特殊点位”。
   const verticallyStacked =
     Math.abs(target.x - source.x) <= 2 &&
     target.y >= source.y + source.height + 2;
   if (verticallyStacked) {
-    const start: Point = [source.x + source.width, source.y + source.height];
-    const end: Point = [target.x, target.y];
+    const insetX = Math.min(44, source.width * 0.22, target.width * 0.22);
+    const insetY = 0;
+    const start: Point = [
+      source.x + source.width - insetX,
+      source.y + source.height - insetY,
+    ];
+    const end: Point = [target.x + insetX, target.y + insetY];
     candidates.push({
       points: [start, end],
       kind: "gap",

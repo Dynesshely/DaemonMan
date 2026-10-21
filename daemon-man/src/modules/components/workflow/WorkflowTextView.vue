@@ -22,6 +22,7 @@ import { useWorkflowStore } from "@/modules/stores/workflows";
 import { buildAdjacency, computeTopology } from "./graph";
 import { aggregateStatus, buildGroupChildren } from "./layout";
 import { buildDelayLayoutGraph, computeDelayPills } from "./delayPill";
+import { groupModeOf } from "./shared";
 import {
   edgeConditionLabel,
   nodeKindMeta,
@@ -63,6 +64,18 @@ const isEmpty = computed(() => nodes.value.length === 0);
 
 function stepOf(nodeId: string): number | null {
   return stepTopology.value.stepOf.get(nodeId) ?? null;
+}
+
+/** 分组模式文案 / 是否并行（文本视图分组行展示）。 */
+function isParallelGroup(node: WorkflowNode): boolean {
+  return groupModeOf(node) === "parallel";
+}
+
+function groupModeLabel(node: WorkflowNode): string {
+  const mode = groupModeOf(node);
+  if (mode === "parallel") return t("node.groupModeShortParallel");
+  if (mode === "graph") return t("node.groupModeShortGraph");
+  return t("node.groupModeShortSequence");
 }
 
 /** 应用节点的真实 exe/.lnk 图标（视图层已批量 ensure）。 */
@@ -406,16 +419,13 @@ function indentClass(depth: number): string {
                 <span
                   class="shrink-0 rounded-full px-1.5 text-[10px] font-medium"
                   :class="
-                    row.node.groupParallel
+                    isParallelGroup(row.node)
                       ? 'bg-violet-500/15 text-violet-700 dark:bg-violet-400/20 dark:text-violet-200'
                       : 'bg-teal-500/15 text-teal-700 dark:bg-teal-400/20 dark:text-teal-200'
                   "
+                  :title="t('node.groupModeHint')"
                 >
-                  {{
-                    row.node.groupParallel
-                      ? t("workflow.text.parallelGroup")
-                      : t("workflow.text.sequentialGroup")
-                  }}
+                  {{ groupModeLabel(row.node) }}
                 </span>
                 <span
                   class="shrink-0 text-[10px] text-zinc-400 dark:text-zinc-500"

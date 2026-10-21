@@ -102,9 +102,17 @@ export interface WorkflowNode {
   note: string;
   /** 所属分组节点 id（仅用于展示与排版） */
   parentId: string | null;
-  /** 分组节点：子项是否并行（紧凑排版） */
+  /** 分组节点：子项是否并行（兼容字段；新逻辑用 groupMode） */
   groupParallel: boolean;
+  /** 分组启动模式：sequence 顺序 / parallel 并行 / graph 按连线；旧数据为 null 时按 groupParallel 推导 */
+  groupMode: GroupMode | null;
+  /** 分组级延迟：顺序模式下应用于组内相邻节点之间，覆盖组内连线延时 */
+  groupDelayMs: number;
+  /** 顺序分组是否简洁展示（紧凑换行、隐藏组内连线、拖拽排序） */
+  groupCompact: boolean;
 }
+
+export type GroupMode = "sequence" | "parallel" | "graph";
 
 export interface WorkflowEdge {
   id: string;

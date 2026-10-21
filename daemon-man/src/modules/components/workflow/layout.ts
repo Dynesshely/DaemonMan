@@ -7,6 +7,7 @@ import type {
 
 import { computeTopology } from "./graph";
 import { buildDelayLayoutGraph, computeDelayPills } from "./delayPill";
+import { groupModeOf, isCompactGroup } from "./shared";
 
 /** 节点卡片尺寸估算（实际尺寸以 Vue Flow 量测为准，这里用于布局与空分组占位）。 */
 export const NODE_WIDTH = 224;
@@ -20,13 +21,9 @@ export const GROUP_HEADER = 30;
 export const DEFAULT_GROUP_WIDTH = 240;
 export const DEFAULT_GROUP_HEIGHT = 120;
 
-/** 并行分组：3 列紧凑网格。 */
-export const PARALLEL_COLUMNS = 3;
-export const PARALLEL_GAP_X = 16;
-export const PARALLEL_GAP_Y = 20;
-
-/** 顺序分组：子项纵向紧凑排列（兼容旧引用）。 */
-export const SEQUENTIAL_GAP_Y = 12;
+/** 分组内网格（简洁顺序 / 并行）：cell 间留出连线通道。 */
+const GRID_GAP_X = 44;
+const GRID_GAP_Y = 40;
 
 /** 自动排列顶层的基础间距 / 原点。 */
 export const LAYOUT_COLUMN_GAP = 80;
@@ -135,10 +132,58 @@ function emptyPlan(): GroupPlan {
   };
 }
 
-function parallelMetrics(
+/**
+ * 网格列数：按**像素宽高比**选优（卡片 224×68 是横向的，纯按数量 sqrt 会让容器很扁）。
+ * 枚举 cols=1..n，rows=ceil(n/cols)，比较整组容器宽高 `cols*cellW+(cols-1)*gapX` 与
+ * `rows*cellH+(rows-1)*gapY`，取 |log(width/height)| 最小（再用 |width-height| 破平局）。
+ */
+function chooseGridColumns(
+  count: number,
+  cellWidth: number,
+  cellHeight: number,
+): number {
+  if (count <= 1) return 1;
+  const baseWidth = GROUP_PADDING * 2;
+  const baseHeight = GROUP_HEADER + GROUP_PADDING * 2;
+  let bestColumns = 1;
+  let bestScore = Number.POSITIVE_INFINITY;
+  let bestDiff = Number.POSITIVE_INFINITY;
+  for (let columns = 1; columns <= count; columns += 1) {
+    const rows = Math.ceil(count / columns);
+    const width =
+      baseWidth + columns * cellWidth + Math.max(0, columns - 1) * GRID_GAP_X;
+    const height =
+      baseHeight + rows * cellHeight + Math.max(0, rows - 1) * GRID_GAP_Y;
+    const ratio = width / Math.max(1, height);
+    const score = Math.abs(Math.log(ratio));
+    const diff = Math.abs(width - height);
+    if (
+      score < bestScore - 1e-9 ||
+      (Math.abs(score - bestScore) <= 1e-9 && diff < bestDiff - 1e-9)
+    ) {
+      bestScore = score;
+      bestDiff = diff;
+      bestColumns = columns;
+    }
+  }
+  return bestColumns;
+}
+
+/**
+ * 分组内统一网格：
+ * - `columnFirst = false`：按行填充（逐行从左到右，顶部对齐）——顺序简洁展示用；
+ * - `columnFirst = true`：按列填充（每列从上到下，列从左到右，顶部对齐）——并行分组用，
+ *   这样同一列的节点纵向连续，列末→下一列首不会绕大圈。
+ * 列数由 `chooseGridColumns` 按像素宽高比选优，目标是分组容器接近 1:1。
+ */
+function planGrid(
   children: WorkflowNode[],
   sizeOf: SizeOf,
-): { cellWidth: number; cellHeight: number; columns: number; rows: number } {
+  columnFirst: boolean,
+): GroupPlan {
+  const count = children.length;
+  if (count === 0) return emptyPlan();
+
   let cellWidth = NODE_WIDTH;
   let cellHeight = NODE_HEIGHT;
   for (const child of children) {
@@ -146,43 +191,32 @@ function parallelMetrics(
     cellWidth = Math.max(cellWidth, size.width);
     cellHeight = Math.max(cellHeight, size.height);
   }
-  return {
-    cellWidth,
-    cellHeight,
-    columns: Math.min(PARALLEL_COLUMNS, children.length),
-    rows: Math.ceil(children.length / PARALLEL_COLUMNS),
-  };
-}
 
-/** 并行分组：保持 3 列紧凑网格。 */
-function planParallelGroup(
-  children: WorkflowNode[],
-  sizeOf: SizeOf,
-): GroupPlan {
-  const metrics = parallelMetrics(children, sizeOf);
+  const columns = chooseGridColumns(count, cellWidth, cellHeight);
+  const rows = Math.ceil(count / columns);
   const positions = new Map<string, NodePosition>();
   children.forEach((child, index) => {
+    const column = columnFirst
+      ? Math.min(columns - 1, Math.floor(index / rows))
+      : index % columns;
+    const row = columnFirst ? index % rows : Math.floor(index / columns);
     positions.set(child.id, {
-      x:
-        GROUP_PADDING +
-        (index % PARALLEL_COLUMNS) * (metrics.cellWidth + PARALLEL_GAP_X),
-      y:
-        GROUP_HEADER +
-        GROUP_PADDING +
-        Math.floor(index / PARALLEL_COLUMNS) * (metrics.cellHeight + PARALLEL_GAP_Y),
+      x: GROUP_PADDING + column * (cellWidth + GRID_GAP_X),
+      y: GROUP_HEADER + GROUP_PADDING + row * (cellHeight + GRID_GAP_Y),
     });
   });
+
   return {
     size: {
       width:
         GROUP_PADDING * 2 +
-        metrics.columns * metrics.cellWidth +
-        Math.max(0, metrics.columns - 1) * PARALLEL_GAP_X,
+        columns * cellWidth +
+        Math.max(0, columns - 1) * GRID_GAP_X,
       height:
         GROUP_HEADER +
         GROUP_PADDING * 2 +
-        metrics.rows * metrics.cellHeight +
-        Math.max(0, metrics.rows - 1) * PARALLEL_GAP_Y,
+        rows * cellHeight +
+        Math.max(0, rows - 1) * GRID_GAP_Y,
     },
     children: positions,
   };
@@ -338,10 +372,10 @@ function wrapTreeColumns(
   const columnEnd = (level: number) =>
     columnStart(level) + (widthByLevel.get(level) ?? NODE_WIDTH);
 
-  const buildChunks = (columnsPerRow: number): WrapChunk[] => {
+  const buildChunksFromGroups = (groups: number[][]): WrapChunk[] => {
     const chunks: WrapChunk[] = [];
-    for (let index = 0; index < levels.length; index += columnsPerRow) {
-      const chunkLevels = levels.slice(index, index + columnsPerRow);
+    for (const chunkLevels of groups) {
+      if (chunkLevels.length === 0) continue;
       const ids: string[] = [];
       for (const level of chunkLevels) ids.push(...(byLevel.get(level) ?? []));
       let minY = Number.POSITIVE_INFINITY;
@@ -363,6 +397,14 @@ function wrapTreeColumns(
       });
     }
     return chunks;
+  };
+
+  const buildChunks = (columnsPerRow: number): WrapChunk[] => {
+    const groups: number[][] = [];
+    for (let index = 0; index < levels.length; index += columnsPerRow) {
+      groups.push(levels.slice(index, index + columnsPerRow));
+    }
+    return buildChunksFromGroups(groups);
   };
 
   const measure = (chunks: WrapChunk[]) => {
@@ -389,16 +431,26 @@ function wrapTreeColumns(
 
   let bestChunks = noWrapChunks;
   let bestScore = Number.POSITIVE_INFINITY;
+  const candidates: WrapChunk[][] = [];
+  // 等分折行：每行 N 列。
   for (let columns = levels.length; columns >= 1; columns -= 1) {
-    const chunks = buildChunks(columns);
+    candidates.push(buildChunks(columns));
+  }
+  // 两段切分：大块根树（如几个近似正方形的分组）等分未必最接近目标比例。
+  for (let split = 1; split < levels.length; split += 1) {
+    candidates.push(
+      buildChunksFromGroups([levels.slice(0, split), levels.slice(split)]),
+    );
+  }
+
+  for (const chunks of candidates) {
     const bounds = measure(chunks);
     const aspect = bounds.height > 0
       ? bounds.width / bounds.height
       : Number.POSITIVE_INFINITY;
     // 越接近目标比例越好；折行越多给一点点惩罚，避免无谓碎片化。
     const score =
-      Math.abs(aspect - TREE_TARGET_ASPECT) +
-      (levels.length - columns) * 0.01;
+      Math.abs(aspect - TREE_TARGET_ASPECT) + (chunks.length - 1) * 0.02;
     if (score < bestScore) {
       bestScore = score;
       bestChunks = chunks;
@@ -721,10 +773,14 @@ export function computeGroupPlans(
   nodes: WorkflowNode[],
   edges: WorkflowEdge[],
 ): Map<string, GroupPlan> {
-  const { childrenOf } = buildGroupChildren(nodes);
-  const topology = computeTopology(nodes, edges);
+  // 折叠成药丸的延时节点不渲染，也不占分组网格槽位。
+  const pills = computeDelayPills(nodes, edges);
+  const visibleNodes =
+    pills.size === 0 ? nodes : nodes.filter((node) => !pills.has(node.id));
+  const { childrenOf } = buildGroupChildren(visibleNodes);
+  const topology = computeTopology(visibleNodes, edges);
   const stepOf = topology.stepOf;
-  const draftIndex = new Map(nodes.map((node, index) => [node.id, index]));
+  const draftIndex = new Map(visibleNodes.map((node, index) => [node.id, index]));
   const compare: Compare = (left, right) =>
     (stepOf.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
       (stepOf.get(right.id) ?? Number.MAX_SAFE_INTEGER) ||
@@ -743,13 +799,20 @@ export function computeGroupPlans(
     if (resolving.has(group.id)) return emptyPlan();
 
     resolving.add(group.id);
-    const children = [...(childrenOf.get(group.id) ?? [])].sort(compare);
+    const rawChildren = childrenOf.get(group.id) ?? [];
+    const mode = groupModeOf(group);
     let plan: GroupPlan;
-    if (children.length === 0) {
+    if (rawChildren.length === 0) {
       plan = emptyPlan();
-    } else if (group.groupParallel) {
-      plan = planParallelGroup(children, sizeOf);
+    } else if (mode === "parallel") {
+      // 并行：列优先网格（每列自上而下、列从左到右）。
+      plan = planGrid(rawChildren, sizeOf, true);
+    } else if (mode === "sequence" && isCompactGroup(group)) {
+      // 顺序 + 简洁展示：按 workflow.nodes 顺序的行优先 Wrap 网格。
+      plan = planGrid(rawChildren, sizeOf, false);
     } else {
+      // 按连线（graph）/ 顺序但不简洁：按子图拓扑做思维导图布局。
+      const children = [...rawChildren].sort(compare);
       plan = planSequentialGroup(children, edges, childrenOf, sizeOf, compare);
     }
     resolving.delete(group.id);
@@ -757,7 +820,7 @@ export function computeGroupPlans(
     return plan;
   }
 
-  for (const node of nodes) {
+  for (const node of visibleNodes) {
     if (node.kind === "group") resolve(node);
   }
   return plans;

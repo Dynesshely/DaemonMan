@@ -77,7 +77,12 @@ import {
 import { nodeKindMeta, nodeKindOrder } from "./meta";
 import WorkflowGroupNode from "./nodes/WorkflowGroupNode.vue";
 import WorkflowNodeCard from "./nodes/WorkflowNodeCard.vue";
-import { errorText } from "./shared";
+import {
+  errorText,
+  compactAncestorOf,
+  groupModeOf,
+  isCompactGroup,
+} from "./shared";
 import {
   WORKFLOW_EDGE_ROUTES,
   WORKFLOW_SELECTED_NODE,
@@ -284,10 +289,24 @@ function delayLabelOfEdge(
 function buildEdgesFor(draft: Workflow): Edge[] {
   const pills = computeDelayPills(draft.nodes, draft.edges);
   const labels = delayLabelOfEdge(draft, pills);
+  // 简洁展示的顺序分组隐藏组内连线（含延时合成边），只保留跨组连线。
+  const compactCache = new Map<string, string | null>();
+  const compactOf = (id: string): string | null => {
+    if (compactCache.has(id)) return compactCache.get(id) ?? null;
+    const group = compactAncestorOf(id, draft.nodes);
+    compactCache.set(id, group);
+    return group;
+  };
   // 候选延时的两条边合并成一条 source→target 的合成边，药丸渲染在它的标签上。
-  return foldDelayEdges(draft.edges, pills).map((edge) =>
-    buildFlowEdge(edge, theme.isDark, edgeIsFlow(edge), labels.get(edge.id)),
-  );
+  return foldDelayEdges(draft.edges, pills)
+    .filter((edge) => {
+      const sourceGroup = compactOf(edge.source);
+      const targetGroup = compactOf(edge.target);
+      return !(sourceGroup && targetGroup && sourceGroup === targetGroup);
+    })
+    .map((edge) =>
+      buildFlowEdge(edge, theme.isDark, edgeIsFlow(edge), labels.get(edge.id)),
+    );
 }
 
 /** 拓扑变化后重算步骤号与连线分类（保持边的选中态）。 */
@@ -624,6 +643,11 @@ function layoutChildrenOf(
  * 载入/切换工作流时建立结构快照（不做任何 draft 写入，避免一打开就变成「未保存」），
  * 只把派生出的分组边界同步到画布。
  */
+function groupSignatureOf(group: WorkflowNode): string {
+  const mode = groupModeOf(group);
+  return mode === "sequence" && isCompactGroup(group) ? `${mode}-compact` : mode;
+}
+
 function primeGroupState() {
   const draft = store.draft;
   if (!draft) return;
@@ -637,7 +661,7 @@ function primeGroupState() {
     const children = draft.nodes.filter((node) => node.parentId === group.id);
     lastGroupSignature.set(
       group.id,
-      `${group.groupParallel ? "p" : "s"}:${children
+      `${groupSignatureOf(group)}:${children
         .map((child) => child.id)
         .join(",")}`,
     );
@@ -649,6 +673,23 @@ function primeGroupState() {
         : null;
     lastParentOf.set(node.id, parent);
   }
+
+  // 简洁展示分组：载入时把子项摆到网格槽位（只写画布 store，不改 draft，避免一打开就变未保存）。
+  const groupById = new Map(groups.map((group) => [group.id, group]));
+  const applied = new Set<string>();
+  const applyRecursive = (group: WorkflowNode) => {
+    if (applied.has(group.id)) return;
+    applied.add(group.id);
+    if (isCompactGroup(group)) applyCompactGrid(group);
+    for (const group2 of groups) {
+      if (group2.parentId === group.id) applyRecursive(group2);
+    }
+  };
+  for (const group of groups) {
+    const parent = group.parentId ? groupById.get(group.parentId) : null;
+    if (!parent) applyRecursive(group);
+  }
+  for (const group of groups) applyRecursive(group);
 
   updateGroupGeometry();
 }
@@ -667,7 +708,7 @@ function syncGroupStructure() {
 
   for (const group of groups) {
     const children = draft.nodes.filter((node) => node.parentId === group.id);
-    const signature = `${group.groupParallel ? "p" : "s"}:${children
+    const signature = `${groupSignatureOf(group)}:${children
       .map((child) => child.id)
       .join(",")}`;
     const prev = lastGroupSignature.get(group.id);
@@ -1083,7 +1124,7 @@ function rebuildFromDraft(next: Workflow | null) {
 watch(() => store.draft, (next) => rebuildFromDraft(next), { immediate: true });
 
 // 节点类型切换：kind 就是画布节点 type，直接就地更新 store 中的节点；
-// 同时检测分组归属 / 并行开关变化，触发组内重排与容器边界重算。
+// 同时检测分组归属 / 模式（顺序/并行/按连线 + 简洁展示）变化，触发组内重排与容器边界重算。
 watch(
   () =>
     (store.draft?.nodes ?? [])
@@ -1091,7 +1132,7 @@ watch(
         (node) =>
           `${node.id}:${node.kind}:${node.enabled ? "1" : "0"}:${
             node.parentId ?? "-"
-          }:${node.kind === "group" ? (node.groupParallel ? "p" : "s") : ""}`,
+          }:${node.kind === "group" ? groupSignatureOf(node) : ""}`,
       )
       .join("|"),
   () => {
@@ -1218,6 +1259,114 @@ function onEdgesChange(changes: EdgeChange[]) {
   scheduleEdgeRouting();
 }
 
+/** 简洁展示分组：按网格计划把子项摆到槽位（只写 flow store，不改 draft）。 */
+function applyCompactGrid(
+  group: WorkflowNode,
+  origin?: { x: number; y: number },
+) {
+  const draft = store.draft;
+  if (!draft) return;
+  const plan = computeGroupPlans(draft.nodes, draft.edges).get(group.id);
+  if (!plan) return;
+  const box = origin ?? groupBoxes.value.get(group.id);
+  const flowGroup = findNode(group.id);
+  const left = box?.x ?? Math.round(flowGroup?.position.x ?? group.position.x);
+  const top = box?.y ?? Math.round(flowGroup?.position.y ?? group.position.y);
+  for (const [childId, relative] of plan.children) {
+    updateNode(childId, {
+      position: { x: Math.round(left + relative.x), y: Math.round(top + relative.y) },
+    });
+  }
+}
+
+/** 节点所属的「简洁展示」顺序分组（网格锁定 / 拖拽排序用）。 */
+function compactGroupParentOf(nodeId: string): WorkflowNode | null {
+  const draft = store.draft;
+  if (!draft) return null;
+  const groupId = compactAncestorOf(nodeId, draft.nodes);
+  if (!groupId) return null;
+  return draft.nodes.find((node) => node.id === groupId) ?? null;
+}
+
+/** 分组里「可见」的直接子项（折叠成药丸的延时节点不占网格槽位）。 */
+function compactVisibleChildren(group: WorkflowNode): WorkflowNode[] {
+  const draft = store.draft;
+  if (!draft) return [];
+  const pills = computeDelayPills(draft.nodes, draft.edges);
+  return draft.nodes.filter(
+    (node) => node.parentId === group.id && !pills.has(node.id),
+  );
+}
+
+/** 按落点找最近的网格槽位（返回可见直接子项序列里的目标下标）。 */
+function nearestCompactSlotIndex(group: WorkflowNode, draggedId: string): number {
+  const draft = store.draft;
+  if (!draft) return 0;
+  const children = compactVisibleChildren(group);
+  if (children.length === 0) return 0;
+  const plan = computeGroupPlans(draft.nodes, draft.edges).get(group.id);
+  const box = groupBoxes.value.get(group.id);
+  const left = box?.x ?? Math.round(group.position.x);
+  const top = box?.y ?? Math.round(group.position.y);
+  const draggedFlow = findNode(draggedId);
+  if (!draggedFlow) return 0;
+  const draggedCenterX =
+    draggedFlow.position.x + (draggedFlow.dimensions.width || NODE_WIDTH) / 2;
+  const draggedCenterY =
+    draggedFlow.position.y + (draggedFlow.dimensions.height || NODE_HEIGHT) / 2;
+
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  children.forEach((child, index) => {
+    const relative = plan?.children.get(child.id);
+    if (!relative) return;
+    const childFlow = findNode(child.id);
+    const width = childFlow?.dimensions.width || NODE_WIDTH;
+    const height = childFlow?.dimensions.height || NODE_HEIGHT;
+    const centerX = left + relative.x + width / 2;
+    const centerY = top + relative.y + height / 2;
+    const distance = Math.hypot(centerX - draggedCenterX, centerY - draggedCenterY);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  });
+  return bestIndex;
+}
+
+/** 重排分组直接子项在 workflow.nodes 中的顺序（其它节点保持相对位置）。 */
+function reorderGroupChild(
+  group: WorkflowNode,
+  nodeId: string,
+  targetIndex: number,
+): boolean {
+  const draft = store.draft;
+  if (!draft) return false;
+  const children = compactVisibleChildren(group);
+  const currentIndex = children.findIndex((node) => node.id === nodeId);
+  if (currentIndex < 0) return false;
+  const clamped = Math.max(0, Math.min(targetIndex, children.length - 1));
+  if (clamped === currentIndex) return false;
+
+  const order = children.map((node) => node.id);
+  order.splice(currentIndex, 1);
+  order.splice(clamped, 0, nodeId);
+
+  const pills = computeDelayPills(draft.nodes, draft.edges);
+  const slots: number[] = [];
+  draft.nodes.forEach((node, index) => {
+    if (node.parentId === group.id && !pills.has(node.id)) slots.push(index);
+  });
+  const nextNodes = [...draft.nodes];
+  slots.forEach((slot, orderIndex) => {
+    const node = draft.nodes.find((item) => item.id === order[orderIndex]);
+    if (node) nextNodes[slot] = node;
+  });
+  // 只调换分组子项在数组中的顺序：走现有深度 watch → 一次撤销记录。
+  draft.nodes = nextNodes;
+  return true;
+}
+
 function onNodeDragStart(event: NodeDragEvent) {
   if (event.node.type !== "group") {
     groupDragState = null;
@@ -1269,7 +1418,13 @@ function onNodeDrag(event: NodeDragEvent) {
     return;
   }
   if (event.nodes.some((node) => node.type !== "group")) {
-    scheduleGroupGeometry();
+    // 简洁展示分组里的节点：拖动期间不收敛分组边界（松手后按槽位吸附/重排）。
+    const compactChild = event.nodes.some(
+      (node) => node.type !== "group" && compactGroupParentOf(node.id),
+    );
+    // 跨组连线仍然跟着节点走，只有分组边界保持不动。
+    if (compactChild) scheduleEdgeRouting();
+    else scheduleGroupGeometry();
   }
 }
 
@@ -1321,6 +1476,27 @@ function onNodeDragStop(event: NodeDragEvent) {
     persistGroupPositions();
     scheduleEdgeRouting();
     return;
+  }
+
+  // 简洁展示顺序分组：按落点最近的槽位重排组内顺序，再吸附回网格（一次撤销记录）。
+  const compactDragged = event.nodes.find(
+    (dragged) =>
+      dragged.type !== "group" &&
+      current.nodes.some(
+        (item) => item.id === dragged.id && compactGroupParentOf(dragged.id),
+      ),
+  );
+  if (compactDragged) {
+    const group = compactGroupParentOf(compactDragged.id);
+    if (group) {
+      const slot = nearestCompactSlotIndex(group, compactDragged.id);
+      reorderGroupChild(group, compactDragged.id, slot);
+      layoutChildrenOf(group);
+      updateGroupGeometry();
+      persistGroupPositions();
+      scheduleEdgeRouting();
+      return;
+    }
   }
 
   for (const dragged of event.nodes) {

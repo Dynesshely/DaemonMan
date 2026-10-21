@@ -8,9 +8,10 @@ const props = withDefaults(
     hint?: string;
     modelValue: number;
     min?: number;
+    max?: number;
     step?: number;
   }>(),
-  { min: 0, step: 100 },
+  { min: 0, max: undefined, step: 100 },
 );
 
 const emit = defineEmits<{ "update:modelValue": [value: number] }>();
@@ -18,10 +19,10 @@ const emit = defineEmits<{ "update:modelValue": [value: number] }>();
 function onInput(event: Event) {
   const raw = (event.target as HTMLInputElement).value;
   const parsed = Number(raw);
-  emit(
-    "update:modelValue",
-    Number.isFinite(parsed) ? Math.max(props.min, Math.round(parsed)) : props.min,
-  );
+  let value = Number.isFinite(parsed) ? Math.round(parsed) : props.min;
+  value = Math.max(props.min, value);
+  if (typeof props.max === "number") value = Math.min(props.max, value);
+  emit("update:modelValue", value);
 }
 </script>
 
@@ -31,6 +32,7 @@ function onInput(event: Event) {
       type="number"
       :value="modelValue"
       :min="min"
+      :max="max"
       :step="step"
       :class="inputClass"
       class="tabular"

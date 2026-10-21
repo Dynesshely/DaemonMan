@@ -285,6 +285,18 @@ impl Default for ScriptSpec {
     }
 }
 
+/// 分组启动模式：
+/// - Sequence：按组内顺序依次启动，忽略组内连线（保留连线以便切回其它模式）；
+/// - Parallel：组内节点同时启动，忽略组内连线；
+/// - Graph：按组内连线依赖执行（旧行为）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupMode {
+    Sequence,
+    Parallel,
+    Graph,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkflowNode {
@@ -301,8 +313,14 @@ pub struct WorkflowNode {
     pub note: String,
     /// 所属分组节点 id（仅用于展示与排版；执行顺序仍由 edges 决定）
     pub parent_id: Option<String>,
-    /// 分组节点：子项是否并行（用于紧凑排版与文本视图标记）
+    /// 分组节点：子项是否并行（用于紧凑排版与文本视图标记；兼容字段，新代码用 group_mode）
     pub group_parallel: bool,
+    /// 分组节点的启动模式（旧配置缺省时由 group_parallel 推导）
+    pub group_mode: Option<GroupMode>,
+    /// 分组级延迟：顺序模式下应用于组内相邻节点之间，覆盖组内连线上的延时
+    pub group_delay_ms: u64,
+    /// 顺序分组是否使用简洁展示（紧凑换行、隐藏组内连线、拖拽排序）
+    pub group_compact: bool,
 }
 
 impl Default for WorkflowNode {
@@ -320,6 +338,9 @@ impl Default for WorkflowNode {
             note: String::new(),
             parent_id: None,
             group_parallel: false,
+            group_mode: None,
+            group_delay_ms: 0,
+            group_compact: true,
         }
     }
 }

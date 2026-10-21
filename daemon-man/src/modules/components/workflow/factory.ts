@@ -66,6 +66,9 @@ export function createWorkflowNode(
     note: "",
     parentId: null,
     groupParallel: false,
+    groupMode: null,
+    groupDelayMs: 0,
+    groupCompact: true,
   };
 }
 

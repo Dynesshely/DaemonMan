@@ -34,8 +34,8 @@ use tokio::task::JoinSet;
 
 use crate::engine::{graph, launcher};
 use crate::model::{
-    now_iso, EdgeCondition, LogLevel, NodeKind, NodeRunState, NodeStatus, RunStatus, RunTrigger,
-    ScriptSpec, Workflow, WorkflowEdge, WorkflowNode, WorkflowRun,
+    now_iso, EdgeCondition, GroupMode, LogLevel, NodeKind, NodeRunState, NodeStatus, RunStatus,
+    RunTrigger, ScriptSpec, Workflow, WorkflowEdge, WorkflowNode, WorkflowRun,
 };
 use crate::platform;
 use crate::state::AppState;
@@ -230,6 +230,10 @@ pub fn spawn_workflow_run(
     workflow: Workflow,
     request: RunRequest,
 ) -> String {
+    // 按分组模式生成「有效执行图」（纯副本，不写回持久化数据）。
+    // 单点执行 / 分组执行的子工作流不含分组节点，这里是 no-op。
+    let workflow = effective_workflow(&workflow);
+
     let run_id = uuid::Uuid::new_v4().to_string();
     let initial = build_initial_run(&workflow, &run_id, request.trigger);
 
@@ -356,16 +360,17 @@ fn build_single_node_workflow(workflow: &Workflow, node: &WorkflowNode) -> Workf
 ///   `run.workflow_id` 仍是原工作流 id、节点 id 不变。
 ///
 /// 返回 run id（与 [`spawn_single_node_run`] 一致）。
-// commands 层的 `run_single_group` 尚未接入（Lead 负责），接入后这条 allow 可移除。
-#[allow(dead_code)]
 pub fn spawn_group_run(
     app: AppHandle,
     state: Arc<AppState>,
     workflow: Workflow,
     group_id: &str,
 ) -> Result<String, String> {
-    let group = resolve_group_node(&workflow, group_id)?;
-    let mini = build_group_workflow(&workflow, group)?;
+    // 先按分组模式生成有效执行图，再从中抽取目标分组：
+    // 这样分组启动遵循自身的顺序/并行语义，合成延迟节点也会一并执行。
+    let effective = effective_workflow(&workflow);
+    let group = resolve_group_node(&effective, group_id)?;
+    let mini = build_group_workflow(&effective, group)?;
 
     Ok(spawn_workflow_run(
         app,
@@ -379,7 +384,6 @@ pub fn spawn_group_run(
 }
 
 /// 分组校验：节点必须存在且 `kind == Group`。
-#[allow(dead_code)]
 fn resolve_group_node<'a>(
     workflow: &'a Workflow,
     group_id: &str,
@@ -398,9 +402,14 @@ fn resolve_group_node<'a>(
 /// 收集分组下所有可执行后代节点的 id（按 `workflow.nodes` 原顺序）。
 ///
 /// 沿 `parent_id` 链展开嵌套分组；分组节点本身不进入结果。
-/// `visited` 用于防御 `parent_id` 成环的异常数据，避免死循环。
-#[allow(dead_code)]
 fn collect_group_node_ids(workflow: &Workflow, group_id: &str) -> Vec<String> {
+    collect_descendant_ids(&workflow.nodes, group_id)
+}
+
+/// [`collect_group_node_ids`] 的节点切片版本（有效图变换里 `nodes` 会追加合成延迟节点）。
+///
+/// `visited` 用于防御 `parent_id` 成环的异常数据，避免死循环。
+fn collect_descendant_ids(nodes: &[WorkflowNode], group_id: &str) -> Vec<String> {
     let mut executable: HashSet<String> = HashSet::new();
     let mut pending: Vec<String> = vec![group_id.to_string()];
     let mut visited: HashSet<String> = HashSet::new();
@@ -409,7 +418,7 @@ fn collect_group_node_ids(workflow: &Workflow, group_id: &str) -> Vec<String> {
         if !visited.insert(parent.clone()) {
             continue;
         }
-        for node in &workflow.nodes {
+        for node in nodes {
             if node.parent_id.as_deref() != Some(parent.as_str()) {
                 continue;
             }
@@ -421,8 +430,7 @@ fn collect_group_node_ids(workflow: &Workflow, group_id: &str) -> Vec<String> {
         }
     }
 
-    workflow
-        .nodes
+    nodes
         .iter()
         .filter(|node| executable.contains(&node.id))
         .map(|node| node.id.clone())
@@ -430,7 +438,6 @@ fn collect_group_node_ids(workflow: &Workflow, group_id: &str) -> Vec<String> {
 }
 
 /// 构造「分组子工作流」：后代可执行节点强制启用，只保留分组内部的边。
-#[allow(dead_code)]
 fn build_group_workflow(workflow: &Workflow, group: &WorkflowNode) -> Result<Workflow, String> {
     let member_ids: HashSet<String> = collect_group_node_ids(workflow, &group.id)
         .into_iter()
@@ -468,6 +475,293 @@ fn build_group_workflow(workflow: &Workflow, group: &WorkflowNode) -> Result<Wor
         edges,
         ..workflow.clone()
     })
+}
+
+// ---------------------------------------------------------------------------
+// 有效执行图：按分组模式（Sequence / Parallel / Graph）改写运行时副本
+// ---------------------------------------------------------------------------
+
+/// 分组的有效执行模式：新数据用 `group_mode`，旧数据由 `group_parallel` 推导
+/// （`true` → Parallel，`false` → Sequence）。
+pub fn effective_group_mode(group: &WorkflowNode) -> GroupMode {
+    match group.group_mode {
+        Some(mode) => mode,
+        None if group.group_parallel => GroupMode::Parallel,
+        None => GroupMode::Sequence,
+    }
+}
+
+/// 计算「有效执行图」：按分组模式改写运行时副本，**不修改持久化数据**。
+///
+/// 连线归属按「两端节点的最近公共分组」判定（见 [`lca_group`]），只有归属于某个分组的
+/// 连线才受该分组模式影响，跨组/顶层连线保持原样：
+/// - `Sequence`：删掉组内连线，按直接子项在 `nodes` 中的顺序串联（前一项出口 → 后一项入口，
+///   success 边）；嵌套分组作为一个单元递归应用自身模式；跳过「连线延时」候选 delay 节点
+///   （见 [`is_wire_delay_candidate`]）；`group_delay_ms > 0` 时在相邻单元之间插入合成
+///   delay 节点（id `group-delay:<group>:<index>`，`parent_id` = 该分组）；
+/// - `Parallel`：删掉组内连线（子项同时启动）；
+/// - `Graph`：保持原连线。
+///
+/// 处理顺序自底向上（嵌套分组先处理），因此外层分组把嵌套分组当作单元时，
+/// 其入口/出口已经由内层模式确定。
+pub fn effective_workflow(workflow: &Workflow) -> Workflow {
+    let groups: Vec<WorkflowNode> = workflow
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Group)
+        .cloned()
+        .collect();
+    if groups.is_empty() {
+        return workflow.clone();
+    }
+
+    // 父子关系与节点类型索引（`nodes` 追加合成节点后会同步更新）。
+    let mut parent: HashMap<String, Option<String>> = workflow
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.parent_id.clone()))
+        .collect();
+    let mut kinds: HashMap<String, NodeKind> = workflow
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.kind))
+        .collect();
+
+    // 自底向上：嵌套深的分组先处理（稳定排序，同深度保持 nodes 顺序）。
+    let mut ordered = groups;
+    ordered.sort_by_key(|group| {
+        std::cmp::Reverse(ancestor_group_ids(&parent, &kinds, &group.id).len())
+    });
+
+    let mut nodes: Vec<WorkflowNode> = workflow.nodes.clone();
+    let mut edges: Vec<WorkflowEdge> = workflow.edges.clone();
+
+    for group in &ordered {
+        let mode = effective_group_mode(group);
+        if mode == GroupMode::Graph {
+            continue;
+        }
+
+        // 只移除归属于该分组的连线；跨组/顶层连线保持原样。
+        edges.retain(|edge| lca_group(&parent, &kinds, edge).as_deref() != Some(group.id.as_str()));
+
+        if mode == GroupMode::Parallel {
+            continue;
+        }
+
+        // -- Sequence：直接子项按 nodes 顺序串联 --------------------------------
+        // 先移除「连线延时」候选节点：它们代表连线上的延时，顺序模式由 group_delay_ms
+        // 统一表达；保留它们在图上会多执行一次。只移除两条边都归属本分组的候选，
+        // 避免留下悬空边。
+        let wire_delay_ids: Vec<String> = nodes
+            .iter()
+            .filter(|node| node.parent_id.as_deref() == Some(group.id.as_str()))
+            .filter(|node| is_wire_delay_candidate(workflow, node))
+            .filter(|node| {
+                workflow
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.source == node.id || edge.target == node.id)
+                    .all(|edge| {
+                        lca_group(&parent, &kinds, edge).as_deref() == Some(group.id.as_str())
+                    })
+            })
+            .map(|node| node.id.clone())
+            .collect();
+        if !wire_delay_ids.is_empty() {
+            nodes.retain(|node| !wire_delay_ids.contains(&node.id));
+            edges.retain(|edge| {
+                !wire_delay_ids.contains(&edge.source) && !wire_delay_ids.contains(&edge.target)
+            });
+        }
+
+        let units: Vec<WorkflowNode> = nodes
+            .iter()
+            .filter(|node| node.parent_id.as_deref() == Some(group.id.as_str()))
+            .cloned()
+            .collect();
+        if units.len() < 2 {
+            continue;
+        }
+
+        for (pair_index, pair) in units.windows(2).enumerate() {
+            let exits = unit_exits(&nodes, &edges, &pair[0]);
+            let entries = unit_entries(&nodes, &edges, &pair[1]);
+
+            if group.group_delay_ms > 0 {
+                let synth = synth_group_delay(group, pair_index);
+                let synth_id = synth.id.clone();
+                parent.insert(synth_id.clone(), Some(group.id.clone()));
+                kinds.insert(synth_id.clone(), NodeKind::Delay);
+                nodes.push(synth);
+
+                for exit in &exits {
+                    edges.push(sequenced_edge(exit, &synth_id));
+                }
+                for entry in &entries {
+                    edges.push(sequenced_edge(&synth_id, entry));
+                }
+            } else {
+                for exit in &exits {
+                    for entry in &entries {
+                        edges.push(sequenced_edge(exit, entry));
+                    }
+                }
+            }
+        }
+    }
+
+    Workflow {
+        nodes,
+        edges,
+        ..workflow.clone()
+    }
+}
+
+/// 节点所属分组链（由近到远，只包含分组节点）。`guard` 防御 `parent_id` 成环。
+fn ancestor_group_ids(
+    parent: &HashMap<String, Option<String>>,
+    kinds: &HashMap<String, NodeKind>,
+    node_id: &str,
+) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = parent.get(node_id).cloned().flatten();
+    let mut guard = 0usize;
+    while let Some(group_id) = current {
+        if kinds.get(&group_id).copied() == Some(NodeKind::Group) {
+            result.push(group_id.clone());
+        }
+        current = parent.get(&group_id).cloned().flatten();
+        guard += 1;
+        if guard > 512 {
+            break;
+        }
+    }
+    result
+}
+
+/// 连线两端节点的最近公共分组；`None` 表示跨组/顶层连线。
+fn lca_group(
+    parent: &HashMap<String, Option<String>>,
+    kinds: &HashMap<String, NodeKind>,
+    edge: &WorkflowEdge,
+) -> Option<String> {
+    let source_chain = ancestor_group_ids(parent, kinds, &edge.source);
+    let target_chain = ancestor_group_ids(parent, kinds, &edge.target);
+    source_chain
+        .iter()
+        .zip(target_chain.iter())
+        .find(|(left, right)| left == right)
+        .map(|(group_id, _)| group_id.clone())
+}
+
+/// 单元在当前边集上的入口：子树内没有「内部入边」的可执行节点。
+///
+/// 普通节点本身就是入口；嵌套分组取子树内无内部入边的节点（循环等异常时退回全部）。
+fn unit_entries(
+    nodes: &[WorkflowNode],
+    edges: &[WorkflowEdge],
+    unit: &WorkflowNode,
+) -> Vec<String> {
+    if unit.kind != NodeKind::Group {
+        return vec![unit.id.clone()];
+    }
+    let members = collect_descendant_ids(nodes, &unit.id);
+    let member_set: HashSet<&str> = members.iter().map(|id| id.as_str()).collect();
+    let entries: Vec<String> = members
+        .iter()
+        .filter(|member| {
+            !edges
+                .iter()
+                .any(|edge| member_set.contains(edge.source.as_str()) && &edge.target == *member)
+        })
+        .cloned()
+        .collect();
+    if entries.is_empty() {
+        members
+    } else {
+        entries
+    }
+}
+
+/// 单元在当前边集上的出口：子树内没有「内部出边」的可执行节点。
+fn unit_exits(
+    nodes: &[WorkflowNode],
+    edges: &[WorkflowEdge],
+    unit: &WorkflowNode,
+) -> Vec<String> {
+    if unit.kind != NodeKind::Group {
+        return vec![unit.id.clone()];
+    }
+    let members = collect_descendant_ids(nodes, &unit.id);
+    let member_set: HashSet<&str> = members.iter().map(|id| id.as_str()).collect();
+    let exits: Vec<String> = members
+        .iter()
+        .filter(|member| {
+            !edges
+                .iter()
+                .any(|edge| &edge.source == *member && member_set.contains(edge.target.as_str()))
+        })
+        .cloned()
+        .collect();
+    if exits.is_empty() {
+        members
+    } else {
+        exits
+    }
+}
+
+/// 合成「分组延迟」节点：只存在于运行时副本，不写回 workflow。
+fn synth_group_delay(group: &WorkflowNode, index: usize) -> WorkflowNode {
+    let delay_ms = group.group_delay_ms;
+    WorkflowNode {
+        id: format!("group-delay:{}:{}", group.id, index),
+        name: format!("分组延迟 {delay_ms} ms"),
+        kind: NodeKind::Delay,
+        enabled: true,
+        delay_ms,
+        parent_id: Some(group.id.clone()),
+        note: "由分组顺序模式在运行时生成".to_string(),
+        ..Default::default()
+    }
+}
+
+/// 顺序模式下相邻单元之间的连线（success）。
+fn sequenced_edge(source: &str, target: &str) -> WorkflowEdge {
+    WorkflowEdge {
+        id: format!("group-seq:{source}->{target}"),
+        source: source.to_string(),
+        target: target.to_string(),
+        condition: EdgeCondition::Success,
+    }
+}
+
+/// 「连线延时」候选：组内 `kind=Delay`、恰好 1 入 1 出且两条都是 success 边。
+///
+/// 这类节点在原始图里代表连线上的延时；顺序模式由 `group_delay_ms` 统一控制，
+/// 因此不作为顺序单元。组内独立 delay（边数不符）仍作为单元保留。
+fn is_wire_delay_candidate(workflow: &Workflow, node: &WorkflowNode) -> bool {
+    if node.kind != NodeKind::Delay {
+        return false;
+    }
+    let incoming = workflow
+        .edges
+        .iter()
+        .filter(|edge| edge.target == node.id)
+        .count();
+    let outgoing = workflow
+        .edges
+        .iter()
+        .filter(|edge| edge.source == node.id)
+        .count();
+    if incoming != 1 || outgoing != 1 {
+        return false;
+    }
+    workflow
+        .edges
+        .iter()
+        .filter(|edge| edge.target == node.id || edge.source == node.id)
+        .all(|edge| edge.condition == EdgeCondition::Success)
 }
 
 fn build_initial_run(workflow: &Workflow, run_id: &str, trigger: RunTrigger) -> WorkflowRun {
@@ -1581,6 +1875,21 @@ mod tests {
         group
     }
 
+    /// 指定模式与组延迟的分组节点。
+    fn group_with_mode(id: &str, mode: GroupMode, delay_ms: u64) -> WorkflowNode {
+        let mut group = group_node(id);
+        group.group_mode = Some(mode);
+        group.group_delay_ms = delay_ms;
+        group
+    }
+
+    fn has_edge(workflow: &Workflow, source: &str, target: &str) -> bool {
+        workflow
+            .edges
+            .iter()
+            .any(|edge| edge.source == source && edge.target == target)
+    }
+
     fn edge(source: &str, target: &str, condition: EdgeCondition) -> WorkflowEdge {
         WorkflowEdge {
             id: format!("{source}->{target}"),
@@ -1720,6 +2029,205 @@ mod tests {
         let group = resolve_group_node(&workflow, "empty").expect("空分组应存在");
         let empty = build_group_workflow(&workflow, group).unwrap_err();
         assert!(empty.contains("没有可执行节点"), "实际：{empty}");
+    }
+
+    // -- 有效执行图（分组模式） ---------------------------------------------
+
+    #[test]
+    fn sequence_ignores_inner_edges_and_chains_children() {
+        // 组内 a、b、c 按 nodes 顺序；原有内部连线故意画成 c→a、a→c。
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![
+                group_with_mode("g", GroupMode::Sequence, 0),
+                child_node("a", "g"),
+                child_node("b", "g"),
+                child_node("c", "g"),
+                node("outside"),
+            ],
+            edges: vec![
+                // c 的入边 success、出边 failure → 不是「连线延时」候选，仍然是顺序单元。
+                edge("c", "a", EdgeCondition::Failure),
+                edge("a", "c", EdgeCondition::Success),
+                edge("outside", "a", EdgeCondition::Success),
+            ],
+            ..Default::default()
+        };
+
+        let effective = effective_workflow(&workflow);
+
+        // 组内连线被替换为按 nodes 顺序的串联。
+        assert!(has_edge(&effective, "a", "b"));
+        assert!(has_edge(&effective, "b", "c"));
+        assert!(!has_edge(&effective, "c", "a"));
+        assert!(!has_edge(&effective, "a", "c"));
+        // 跨组边保留。
+        assert!(has_edge(&effective, "outside", "a"));
+        // 持久化数据未被修改。
+        assert_eq!(workflow.edges.len(), 3);
+    }
+
+    #[test]
+    fn sequence_inserts_synthetic_group_delay() {
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![
+                group_with_mode("g", GroupMode::Sequence, 500),
+                child_node("a", "g"),
+                child_node("b", "g"),
+            ],
+            ..Default::default()
+        };
+
+        let effective = effective_workflow(&workflow);
+
+        let synthetics: Vec<&WorkflowNode> = effective
+            .nodes
+            .iter()
+            .filter(|node| node.id.starts_with("group-delay:"))
+            .collect();
+        assert_eq!(synthetics.len(), 1, "相邻两个单元之间插入一个合成延迟节点");
+        let synth = synthetics[0];
+        assert_eq!(synth.kind, NodeKind::Delay);
+        assert_eq!(synth.delay_ms, 500);
+        assert_eq!(synth.parent_id.as_deref(), Some("g"));
+        assert!(synth.name.contains("分组延迟"), "名称：{}", synth.name);
+
+        // a → 合成延迟 → b
+        assert!(has_edge(&effective, "a", &synth.id));
+        assert!(has_edge(&effective, &synth.id, "b"));
+        assert!(!has_edge(&effective, "a", "b"));
+        // 合成节点不写回原工作流。
+        assert_eq!(workflow.nodes.len(), 3);
+    }
+
+    #[test]
+    fn sequence_skips_wire_delay_candidates() {
+        // 组内 a、d(Delay)、b，d 在原图中 1 入 1 出且都是 success → 连线延时候选，跳过。
+        let mut wire_delay = child_node("d", "g");
+        wire_delay.kind = NodeKind::Delay;
+        wire_delay.delay_ms = 300;
+
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![
+                group_with_mode("g", GroupMode::Sequence, 0),
+                child_node("a", "g"),
+                wire_delay,
+                child_node("b", "g"),
+            ],
+            // 故意与 nodes 顺序相反，便于区分「跳过」与「串联」。
+            edges: vec![
+                edge("b", "d", EdgeCondition::Success),
+                edge("d", "a", EdgeCondition::Success),
+            ],
+            ..Default::default()
+        };
+
+        let effective = effective_workflow(&workflow);
+
+        // 连线延时候选被移除（由 group_delay_ms 统一表达），单元只剩 a、b → 直接串联。
+        assert!(!effective.nodes.iter().any(|node| node.id == "d"));
+        assert!(has_edge(&effective, "a", "b"));
+        assert!(!has_edge(&effective, "a", "d"));
+        assert!(!has_edge(&effective, "d", "b"));
+        // 原工作流（持久化数据）保持不变。
+        assert!(workflow.nodes.iter().any(|node| node.id == "d"));
+    }
+
+    #[test]
+    fn parallel_drops_inner_edges_only() {
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![
+                group_with_mode("g", GroupMode::Parallel, 0),
+                child_node("a", "g"),
+                child_node("b", "g"),
+                node("outside"),
+            ],
+            edges: vec![
+                edge("a", "b", EdgeCondition::Success),
+                edge("outside", "a", EdgeCondition::Success),
+            ],
+            ..Default::default()
+        };
+
+        let effective = effective_workflow(&workflow);
+
+        // 组内连线被忽略（子项同时启动），跨组边保留。
+        assert!(!has_edge(&effective, "a", "b"));
+        assert!(has_edge(&effective, "outside", "a"));
+        assert_eq!(effective.nodes.len(), workflow.nodes.len());
+    }
+
+    #[test]
+    fn graph_mode_keeps_original_edges() {
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![
+                group_with_mode("g", GroupMode::Graph, 800),
+                child_node("a", "g"),
+                child_node("b", "g"),
+            ],
+            edges: vec![edge("b", "a", EdgeCondition::Success)],
+            ..Default::default()
+        };
+
+        let effective = effective_workflow(&workflow);
+
+        // 保持原有连线，不串联、不插入合成延迟。
+        assert!(has_edge(&effective, "b", "a"));
+        assert!(!has_edge(&effective, "a", "b"));
+        assert_eq!(effective.edges.len(), workflow.edges.len());
+        assert_eq!(effective.nodes.len(), workflow.nodes.len());
+    }
+
+    #[test]
+    fn nested_group_is_one_unit_in_outer_sequence() {
+        // 外层 g(Sequence)：直接子项是嵌套组 h(Sequence, 含 a、b) 和 c。
+        let workflow = Workflow {
+            id: "wf".to_string(),
+            name: "示例".to_string(),
+            nodes: vec![
+                group_with_mode("g", GroupMode::Sequence, 0),
+                nested_group("h", "g"),
+                child_node("a", "h"),
+                child_node("b", "h"),
+                child_node("c", "g"),
+            ],
+            edges: vec![edge("a", "b", EdgeCondition::Success)],
+            ..Default::default()
+        };
+
+        let effective = effective_workflow(&workflow);
+
+        // h 内部按自身 Sequence 串联；外层把 h 当作一个单元，用 h 的出口（b）接 c。
+        assert!(has_edge(&effective, "a", "b"));
+        assert!(has_edge(&effective, "b", "c"));
+    }
+
+    #[test]
+    fn group_mode_falls_back_to_group_parallel() {
+        let mut parallel = group_node("p");
+        parallel.group_parallel = true;
+        parallel.group_mode = None;
+        assert_eq!(effective_group_mode(&parallel), GroupMode::Parallel);
+
+        let mut sequence = group_node("s");
+        sequence.group_parallel = false;
+        sequence.group_mode = None;
+        assert_eq!(effective_group_mode(&sequence), GroupMode::Sequence);
+
+        // 显式模式优先于兼容字段。
+        let mut explicit = group_node("e");
+        explicit.group_mode = Some(GroupMode::Graph);
+        explicit.group_parallel = true;
+        assert_eq!(effective_group_mode(&explicit), GroupMode::Graph);
     }
 
     #[test]

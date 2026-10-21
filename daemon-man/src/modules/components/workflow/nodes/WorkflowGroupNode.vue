@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { Ban, Boxes } from "lucide-vue-next";
+import { Ban, Boxes, Clock } from "lucide-vue-next";
 
 import type { NodeStatus } from "@/api";
 import { useI18n } from "@/modules/locales";
 import { useWorkflowStore } from "@/modules/stores/workflows";
+import { formatMs } from "@/modules/utils/format";
 
 import { aggregateStatus } from "../layout";
 import { nodeStatusDot } from "../meta";
+import { groupModeOf, isCompactGroup } from "../shared";
 import type { FlowNodeData } from "../types";
 
 defineOptions({ inheritAttrs: false });
@@ -49,12 +51,14 @@ const aggregated = computed<NodeStatus>(() => {
 });
 
 const disabled = computed(() => !node.value.enabled);
+const mode = computed(() => groupModeOf(node.value));
+const compact = computed(() => isCompactGroup(node.value));
 
 /**
- * 分组配色：顺序分组 = teal，并行分组 = violet（边框/底色/标题/徽标/选中 ring 全区分）。
+ * 分组配色：顺序 / 按连线 = teal，并行分组 = violet（边框/底色/标题/徽标/选中 ring 全区分）。
  */
 const palette = computed(() =>
-  node.value.groupParallel
+  mode.value === "parallel"
     ? {
         container: props.selected
           ? "border-violet-500/80 bg-violet-500/[0.07] dark:border-violet-400/70 dark:bg-violet-400/[0.09] ring-2 ring-violet-500/50 dark:ring-violet-400/50"
@@ -83,10 +87,24 @@ const palette = computed(() =>
       },
 );
 
-const parallelLabel = computed(() =>
-  node.value.groupParallel
-    ? t("workflow.text.parallelGroup")
-    : t("workflow.text.sequentialGroup"),
+/** 组头徽标：模式（顺序 / 并行 / 按连线），简洁展示时追加 compact 提示。 */
+const modeLabel = computed(() =>
+  mode.value === "parallel"
+    ? t("node.groupModeShortParallel")
+    : mode.value === "graph"
+      ? t("node.groupModeShortGraph")
+      : t("node.groupModeShortSequence"),
+);
+
+const modeBadgeTitle = computed(() =>
+  compact.value ? t("node.groupCompactHint") : t("node.groupModeHint"),
+);
+
+/** 顺序分组设置了组延迟时，组头显示（覆盖组内连线延时）。 */
+const delayLabel = computed(() =>
+  mode.value === "sequence" && node.value.groupDelayMs > 0
+    ? formatMs(node.value.groupDelayMs)
+    : null,
 );
 </script>
 
@@ -116,8 +134,18 @@ const parallelLabel = computed(() =>
       <span
         class="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
         :class="palette.badge"
+        :title="modeBadgeTitle"
       >
-        {{ parallelLabel }}
+        {{ modeLabel }}
+      </span>
+      <span
+        v-if="delayLabel"
+        class="flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+        :class="palette.badge"
+        :title="t('node.groupDelayHint')"
+      >
+        <Clock class="h-2.5 w-2.5" />
+        {{ delayLabel }}
       </span>
       <span class="shrink-0 text-[10px]" :class="palette.subtle">
         {{ t("workflow.nodeCount", { count: children.length }) }}

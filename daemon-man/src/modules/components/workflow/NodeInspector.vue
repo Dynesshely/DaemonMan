@@ -4,7 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { AppWindow, FolderOpen, Play, Trash2 } from "lucide-vue-next";
 
 import { api } from "@/api";
-import type { WorkflowNode } from "@/api";
+import type { GroupMode, WorkflowNode } from "@/api";
 import BaseButton from "@/modules/components/ui/BaseButton.vue";
 import FormField from "@/modules/components/ui/FormField.vue";
 import {
@@ -20,7 +20,13 @@ import { formatDuration } from "@/modules/utils/format";
 import { nodeKindMeta } from "./meta";
 import { computeDelayPills } from "./delayPill";
 import NumberField from "./NumberField.vue";
-import { errorText, fieldGroupClass, sectionLabelClass } from "./shared";
+import {
+  applyGroupMode,
+  errorText,
+  fieldGroupClass,
+  groupModeOf,
+  sectionLabelClass,
+} from "./shared";
 import ToggleRow from "./ToggleRow.vue";
 import WorkflowStatusBadge from "./WorkflowStatusBadge.vue";
 
@@ -41,6 +47,13 @@ const edgeDelayPill = computed(() => {
   if (!draft) return null;
   return computeDelayPills(draft.nodes, draft.edges).get(props.node.id) ?? null;
 });
+
+/** 分组模式：旧数据按 groupParallel 推导；切到顺序模式默认开启简洁展示。 */
+const groupMode = computed<GroupMode>({
+  get: () => groupModeOf(props.node),
+  set: (value) => applyGroupMode(props.node, value),
+});
+const isSequenceGroup = computed(() => groupMode.value === "sequence");
 
 const argsText = computed({
   get: () => props.node.app.args.join("\n"),
@@ -389,14 +402,28 @@ async function testLaunch() {
       </template>
 
       <template v-else>
-        <p class="text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-400">
-          {{ t("node.groupHint") }}
-        </p>
-        <ToggleRow
-          v-model="props.node.groupParallel"
-          :label="t('node.groupParallel')"
-          :hint="t('node.groupParallelHint')"
-        />
+        <FormField :label="t('node.groupMode')" :hint="t('node.groupModeHint')">
+          <select v-model="groupMode" :class="selectClass">
+            <option value="sequence">{{ t("node.groupModeSequence") }}</option>
+            <option value="parallel">{{ t("node.groupModeParallel") }}</option>
+            <option value="graph">{{ t("node.groupModeGraph") }}</option>
+          </select>
+        </FormField>
+        <template v-if="isSequenceGroup">
+          <ToggleRow
+            v-model="props.node.groupCompact"
+            :label="t('node.groupCompact')"
+            :hint="t('node.groupCompactHint')"
+          />
+          <NumberField
+            v-model="props.node.groupDelayMs"
+            :label="t('node.groupDelay')"
+            :hint="t('node.groupDelayHint')"
+            :min="0"
+            :max="600000"
+            :step="100"
+          />
+        </template>
         <div
           :class="fieldGroupClass"
           class="flex items-center justify-between gap-2 text-[11px] text-zinc-500 dark:text-zinc-400"

@@ -9,7 +9,7 @@ use tauri::{AppHandle, State};
 use crate::config;
 use crate::engine::{self, RunRequest};
 use crate::model::{
-    now_iso, AppLaunchSpec, LogLevel, NodeKind, RunTrigger, Workflow, WorkflowNode,
+    now_iso, AppLaunchSpec, GroupMode, LogLevel, NodeKind, RunTrigger, Workflow, WorkflowNode,
     WorkflowRun, WorkflowValidation,
 };
 use crate::state::AppState;
@@ -77,6 +77,15 @@ fn normalize(mut workflow: Workflow) -> Workflow {
         if node.kind == NodeKind::Group {
             node.enabled = true;
             node.app = AppLaunchSpec::default();
+            // 旧配置没有 group_mode：由 group_parallel 推导（并行/顺序），并保持兼容字段同步。
+            let mode = node.group_mode.unwrap_or(if node.group_parallel {
+                GroupMode::Parallel
+            } else {
+                GroupMode::Sequence
+            });
+            node.group_mode = Some(mode);
+            node.group_parallel = mode == GroupMode::Parallel;
+            node.group_delay_ms = node.group_delay_ms.min(600_000);
         }
     }
 
@@ -232,7 +241,8 @@ pub fn duplicate_workflow(
 
 #[tauri::command]
 pub fn validate_workflow(workflow: Workflow) -> WorkflowValidation {
-    engine::validate(&workflow)
+    // 分组顺序/并行模式会忽略组内连线，校验应以实际执行图为准。
+    engine::validate(&engine::effective_workflow(&workflow))
 }
 
 #[tauri::command]
@@ -248,7 +258,7 @@ pub fn run_workflow(
         .cloned()
         .ok_or_else(|| "工作流不存在".to_string())?;
 
-    let validation = engine::validate(&workflow);
+    let validation = engine::validate(&engine::effective_workflow(&workflow));
     if !validation.ok {
         return Err(format!("工作流无法运行：{}", validation.errors.join("；")));
     }
@@ -308,7 +318,7 @@ pub fn run_all_enabled_impl(
     let mut runs = Vec::new();
 
     for workflow in enabled {
-        let validation = engine::validate(&workflow);
+        let validation = engine::validate(&engine::effective_workflow(&workflow));
         if !validation.ok {
             state.log(
                 app,

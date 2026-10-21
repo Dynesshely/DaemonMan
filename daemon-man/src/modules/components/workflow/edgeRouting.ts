@@ -35,6 +35,10 @@ export interface EdgeRoute {
   path: string;
   labelX: number;
   labelY: number;
+  /** 终点与最后一段方向（供画布顶层箭头叠加层使用）。 */
+  endX?: number;
+  endY?: number;
+  endAngle?: number;
   /** 纵向排列的特殊斜线：端点画在卡片角上（源右下 / 目标左上）。 */
   cornerStart?: Point;
   cornerEnd?: Point;
@@ -679,10 +683,16 @@ export function computeEdgeRoutes(
     }
 
     if (!bestCandidate) continue;
+    const points = bestCandidate.points;
+    const end = points[points.length - 1];
+    const prev = points[points.length - 2] ?? end;
     const route: EdgeRoute = {
-      path: buildRoundedPath(bestCandidate.points, resolved.radius),
+      path: buildRoundedPath(points, resolved.radius),
       labelX: Math.round(bestCandidate.label.x * 10) / 10,
       labelY: Math.round(bestCandidate.label.y * 10) / 10,
+      endX: end[0],
+      endY: end[1],
+      endAngle: Math.atan2(end[1] - prev[1], end[0] - prev[0]),
       ...(bestCandidate.corners
         ? {
             cornerStart: bestCandidate.corners.start,

@@ -139,6 +139,68 @@ const isEmpty = computed(
   () => !!draft.value && draft.value.nodes.length === 0,
 );
 
+/** 画布顶层叠加层：只画箭头与特殊端点圆点，保证不被节点卡片盖住。 */
+interface EdgeOverlayMarker {
+  id: string;
+  arrow: string;
+  color: string;
+  dots: Array<[number, number]>;
+}
+
+const edgeOverlayMarkers = computed<EdgeOverlayMarker[]>(() => {
+  const dark = theme.isDark;
+  const markers: EdgeOverlayMarker[] = [];
+  for (const edge of flowEdges.value) {
+    const route = edgeRoutes.value.get(edge.id);
+    if (
+      !route ||
+      route.endX === undefined ||
+      route.endY === undefined ||
+      route.endAngle === undefined
+    ) {
+      continue;
+    }
+    const data = edge.data as FlowEdgeData | undefined;
+    const flow = data?.flow ?? true;
+    const selected = Boolean((edge as Edge & { selected?: boolean }).selected);
+    const color = selected
+      ? dark
+        ? "#a5b4fc"
+        : "#4338ca"
+      : flow
+        ? dark
+          ? "#818cf8"
+          : "#6366f1"
+        : dark
+          ? "#71717a"
+          : "#a1a1aa";
+    const size = 9;
+    const half = 5;
+    const cos = Math.cos(route.endAngle);
+    const sin = Math.sin(route.endAngle);
+    const baseX = route.endX - cos * size;
+    const baseY = route.endY - sin * size;
+    const px = -sin * half;
+    const py = cos * half;
+    const dots: Array<[number, number]> = [];
+    if (route.cornerStart && route.cornerEnd) {
+      dots.push(route.cornerStart, route.cornerEnd);
+    }
+    markers.push({
+      id: edge.id,
+      arrow: `${route.endX},${route.endY} ${baseX + px},${baseY + py} ${baseX - px},${baseY - py}`,
+      color,
+      dots,
+    });
+  }
+  return markers;
+});
+
+const edgeOverlayStyle = computed(() => ({
+  transform: `translate(${viewport.value.x}px, ${viewport.value.y}px) scale(${viewport.value.zoom})`,
+  transformOrigin: "0 0",
+}));
+
 const gridColor = computed(() => (theme.isDark ? "#27272a" : "#e4e4e7"));
 
 /** 固定引用，避免每次渲染都生成新对象 / 数组导致 Vue Flow 重复应用 props。 */
@@ -2083,6 +2145,28 @@ defineExpose({
       </div>
     </div>
 
+    <!-- 顶层叠加：箭头与特殊端点圆点绘制在节点之上，连线本身仍在节点层下方。 -->
+    <svg
+      v-if="!isEmpty"
+      class="pointer-events-none absolute inset-0 z-10 h-full w-full overflow-visible"
+      :style="edgeOverlayStyle"
+      aria-hidden="true"
+    >
+      <g v-for="marker in edgeOverlayMarkers" :key="marker.id">
+        <polygon :points="marker.arrow" :fill="marker.color" />
+        <circle
+          v-for="(dot, index) in marker.dots"
+          :key="index"
+          :cx="dot[0]"
+          :cy="dot[1]"
+          r="3.6"
+          :fill="theme.isDark ? '#fbbf24' : '#d97706'"
+          :stroke="theme.isDark ? '#0a0a0a' : '#ffffff'"
+          stroke-width="1"
+        />
+      </g>
+    </svg>
+
     <!-- 节点右键菜单：单点执行 -->
     <Teleport to="body">
       <div
@@ -2114,12 +2198,3 @@ defineExpose({
     </Teleport>
   </div>
 </template>
-<style scoped>
-/* 箭头、端点小圆点/小黄点需要压在卡片之上；连线本身已按节点障碍绕行。 */
-:deep(.vue-flow__edges) {
-  z-index: 2;
-}
-:deep(.vue-flow__nodes) {
-  z-index: 1;
-}
-</style>

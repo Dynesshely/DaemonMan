@@ -26,6 +26,8 @@ export interface RoutingEdgeInput {
   targetId: string;
   /** 是否为折叠了延时药丸的合成边（需要标签坐标）。 */
   hasLabel?: boolean;
+  /** 顺序展示边：允许目标在下方但不同列时也走「小黄点」斜线（更短）。 */
+  verticalCorner?: boolean;
 }
 
 export interface EdgeRoute {
@@ -303,6 +305,7 @@ function buildGapCandidates(
   target: RoutingNode,
   lane: { index: number; count: number },
   preferCorridor: boolean,
+  allowDiagonal: boolean,
   options: Required<RoutingOptions>,
 ): Candidate[] {
   const { stub, laneGap } = options;
@@ -366,11 +369,12 @@ function buildGapCandidates(
     });
   }
 
-  // 纵向排列（同一列、目标在下方）：走「源底部靠右 → 目标顶部靠左」的斜线直连。
-  // 端点不是严格角点：沿水平方向内缩一段距离，垂直方向略微离开边框，形成“特殊点位”。
+  // 纵向排列（目标在下方）：走「源底部靠右 → 目标顶部靠左」的斜线直连。
+  // 普通边仅在同一列时启用；顺序展示边（compact 分组的 seq 边）允许跨列，
+  // 这样行末 → 下一行行首不用从组外绕一大圈。
+  const below = target.y >= source.y + source.height + 2;
   const verticallyStacked =
-    Math.abs(target.x - source.x) <= 2 &&
-    target.y >= source.y + source.height + 2;
+    below && (Math.abs(target.x - source.x) <= 2 || allowDiagonal);
   if (verticallyStacked) {
     const insetX = Math.min(44, source.width * 0.22, target.width * 0.22);
     const insetY = 0;
@@ -627,6 +631,7 @@ export function computeEdgeRoutes(
       target,
       lane,
       preferCorridor,
+      Boolean(edge.verticalCorner),
       resolved,
     );
     for (const candidate of gapCandidates) {

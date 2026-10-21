@@ -232,6 +232,7 @@ function computeRoutesNow() {
       sourceId: edge.source,
       targetId: edge.target,
       hasLabel: Boolean((edge.data as FlowEdgeData | undefined)?.delayNodeId),
+      verticalCorner: Boolean((edge.data as FlowEdgeData | undefined)?.sequence),
     }));
   edgeRoutes.value = computeEdgeRoutes(nodes, inputs);
 }

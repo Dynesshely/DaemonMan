@@ -102,6 +102,23 @@ const delayLabelStyle = computed(() => ({
   transform: `translate(-50%, -50%) translate(${labelX.value}px, ${labelY.value}px)`,
   pointerEvents: "none" as const,
 }));
+
+/** 纵向排列的特殊斜线端点：在角上画小圆点，提示非常规连接点。 */
+const cornerDots = computed(() => {
+  const start = route.value?.cornerStart;
+  const end = route.value?.cornerEnd;
+  if (!start || !end) return [];
+  return [
+    { cx: start[0], cy: start[1] },
+    { cx: end[0], cy: end[1] },
+  ];
+});
+
+const cornerDotStyle = computed(() => ({
+  fill: props.selected ? "#fde68a" : "#fbbf24",
+  stroke: theme.isDark ? "#0a0a0a" : "#ffffff",
+  strokeWidth: 1,
+}));
 </script>
 
 <template>
@@ -116,6 +133,17 @@ const delayLabelStyle = computed(() => ({
     :label-style="labelStyle"
     :label-bg-style="labelBgStyle"
   />
+
+  <g v-if="cornerDots.length" pointer-events="none">
+    <circle
+      v-for="(dot, index) in cornerDots"
+      :key="index"
+      :cx="dot.cx"
+      :cy="dot.cy"
+      r="3.6"
+      :style="cornerDotStyle"
+    />
+  </g>
 
   <EdgeLabelRenderer v-if="delayNodeId">
     <div class="nodrag nopan" :style="delayLabelStyle">

@@ -33,6 +33,9 @@ export interface EdgeRoute {
   path: string;
   labelX: number;
   labelY: number;
+  /** 纵向排列的特殊斜线：端点画在卡片角上（源右下 / 目标左上）。 */
+  cornerStart?: Point;
+  cornerEnd?: Point;
 }
 
 export interface RoutingOptions {
@@ -70,6 +73,8 @@ interface Candidate {
     min: number;
     max: number;
   };
+  /** 纵向斜线特殊点位（源右下角 → 目标左上角）。 */
+  corners?: { start: Point; end: Point };
 }
 
 interface OrderedEdge {
@@ -157,7 +162,7 @@ function computeCorridorLanes(nodes: RoutingNode[]): number[] {
   return lanes;
 }
 
-/** 线段（水平或垂直）是否穿过障碍矩形（严格相交，留 EPSILON 容差）。 */
+/** 线段（水平、垂直或斜线）是否穿过障碍矩形（留 EPSILON 容差）。 */
 function segmentHitsRect(a: Point, b: Point, rect: RectObstacle): boolean {
   if (Math.abs(a[1] - b[1]) < 0.5) {
     const y = a[1];
@@ -170,14 +175,45 @@ function segmentHitsRect(a: Point, b: Point, rect: RectObstacle): boolean {
       minX < rect.right - EPSILON
     );
   }
-  const x = a[0];
-  const minY = Math.min(a[1], b[1]);
-  const maxY = Math.max(a[1], b[1]);
+  if (Math.abs(a[0] - b[0]) < 0.5) {
+    const x = a[0];
+    const minY = Math.min(a[1], b[1]);
+    const maxY = Math.max(a[1], b[1]);
+    return (
+      x > rect.left + EPSILON &&
+      x < rect.right - EPSILON &&
+      maxY > rect.top + EPSILON &&
+      minY < rect.bottom - EPSILON
+    );
+  }
+  // 斜线：Liang-Barsky 裁剪，判断线段是否与矩形内部相交。
+  const left = rect.left + EPSILON;
+  const right = rect.right - EPSILON;
+  const top = rect.top + EPSILON;
+  const bottom = rect.bottom - EPSILON;
+  if (left >= right || top >= bottom) return false;
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  let t0 = 0;
+  let t1 = 1;
+  const clip = (p: number, q: number): boolean => {
+    if (Math.abs(p) < 1e-9) return q >= 0;
+    const r = q / p;
+    if (p < 0) {
+      if (r > t1) return false;
+      if (r > t0) t0 = r;
+    } else {
+      if (r < t0) return false;
+      if (r < t1) t1 = r;
+    }
+    return true;
+  };
   return (
-    x > rect.left + EPSILON &&
-    x < rect.right - EPSILON &&
-    maxY > rect.top + EPSILON &&
-    minY < rect.bottom - EPSILON
+    clip(-dx, a[0] - left) &&
+    clip(dx, right - a[0]) &&
+    clip(-dy, a[1] - top) &&
+    clip(dy, bottom - a[1]) &&
+    t0 < t1
   );
 }
 
@@ -326,6 +362,29 @@ function buildGapCandidates(
         axis: "horizontal",
         min: sourcePoint[0] + 52,
         max: targetPoint[0] - 52,
+      },
+    });
+  }
+
+  // 纵向排列（同一列、目标在下方）：走「源右下角 → 目标左上角」的斜线直连，
+  // 不再绕到右/左中点再拐弯。这是用户指定的特殊点位（非常规 handle）。
+  const verticallyStacked =
+    Math.abs(target.x - source.x) <= 2 &&
+    target.y >= source.y + source.height + 2;
+  if (verticallyStacked) {
+    const start: Point = [source.x + source.width, source.y + source.height];
+    const end: Point = [target.x, target.y];
+    candidates.push({
+      points: [start, end],
+      kind: "gap",
+      penalty: -20,
+      corners: { start, end },
+      label: {
+        x: (start[0] + end[0]) / 2,
+        y: (start[1] + end[1]) / 2,
+        axis: "horizontal",
+        min: Math.min(start[0], end[0]) + 48,
+        max: Math.max(start[0], end[0]) - 48,
       },
     });
   }
@@ -614,6 +673,12 @@ export function computeEdgeRoutes(
       path: buildRoundedPath(bestCandidate.points, resolved.radius),
       labelX: Math.round(bestCandidate.label.x * 10) / 10,
       labelY: Math.round(bestCandidate.label.y * 10) / 10,
+      ...(bestCandidate.corners
+        ? {
+            cornerStart: bestCandidate.corners.start,
+            cornerEnd: bestCandidate.corners.end,
+          }
+        : {}),
     };
     routes.set(edge.id, route);
     internals.push({ route, label: bestCandidate.label });

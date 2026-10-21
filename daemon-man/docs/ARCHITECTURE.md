@@ -98,7 +98,7 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
    - **Graph**：保持原连线。
    边归属用「两端节点最近公共分组」判定，跨组/顶层边始终保留；`group_mode` 缺省时按 `group_parallel` 推导。`validate_workflow`/运行前校验都基于有效执行图，组内被忽略的连线不会误判为环。
 9. **进程父进程**：普通启动走 `CreateProcessW + STARTUPINFOEXW`，用 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 把父进程指向当前 shell（`GetShellWindow` 所属 explorer），使工作流启动的进程不挂在 DaemonMan 进程树下；属性列表/句柄失败或 `CREATE_BREAKAWAY_FROM_JOB` 不被允许时按「去 breakaway → 普通 CreateProcess」回退。管理员启动仍由 ShellExecuteEx(runas) 处理。
-10. **已运行检测**：`platform::proc::find_running_app(spec, display_name)` 先解析 `.lnk` 目标；若目标是浏览器（chrome/msedge/brave/chromium/opera/vivaldi）或其代理（`chrome_proxy.exe` / `msedge_proxy.exe` 等），按安装路径判断浏览器归属，并把浏览器本体与代理进程的 pid 都作为窗口归属候选；再枚举可见顶层窗口，按窗口标题与节点显示名打分匹配，过滤「 - Google Chrome」「 - Microsoft Edge」等普通标签页标题，从而识别 PWA/Web App。无法精确读取命令行 `--app-id`（windows crate 未导出对应 API），标题匹配可能对无浏览器后缀的标签页产生误判，取舍为「宁可跳过也不重复开窗」。
+10. **已运行检测**：`platform::proc::find_running_app(spec, display_name)` 先解析 `.lnk` 目标与参数；若目标是浏览器（chrome/msedge/brave/chromium/opera/vivaldi）或其代理（`chrome_proxy.exe` / `msedge_proxy.exe` 等），按安装路径判断浏览器归属，并把浏览器本体与代理进程的 pid 都作为窗口归属候选。随后区分两类节点：**浏览器应用**（Chrome/Edge/Edge Beta、Chrome profile 快捷方式等）按安装目录匹配进程，进程在跑即视为已存在；**PWA/Web App**（proxy 快捷方式或带 `--app-id` / `--app=`）必须匹配到对应可见窗口才算存在，普通标签页标题会被过滤。无法精确读取命令行 `--app-id`（windows crate 未导出对应 API），标题匹配可能对无浏览器后缀的标签页产生误判，取舍为「宁可跳过也不重复开窗」。
 
 ## 4. 自启动接管
 

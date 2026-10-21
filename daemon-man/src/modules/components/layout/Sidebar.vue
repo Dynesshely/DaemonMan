@@ -3,7 +3,6 @@ import { computed } from "vue";
 import { useRoute } from "vue-router";
 import {
   Activity,
-  CircleDot,
   GitBranch,
   LayoutDashboard,
   Rocket,
@@ -53,11 +52,11 @@ const elevated = computed(() => appStore.systemInfo?.elevated ?? false);
   >
     <!-- 品牌 -->
     <div class="flex h-14 items-center gap-2.5 px-4">
-      <div
-        class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-sm shadow-brand-600/30"
-      >
-        <CircleDot class="h-4.5 w-4.5" />
-      </div>
+      <img
+        src="@/assets/logo.svg"
+        alt="DaemonMan"
+        class="h-8 w-8 shrink-0 rounded-lg shadow-sm ring-1 ring-black/5 dark:ring-white/10"
+      />
       <div v-if="!collapsed" class="min-w-0">
         <p class="truncate text-sm font-semibold tracking-tight">DaemonMan</p>
         <p class="truncate text-[10px] text-zinc-400 dark:text-zinc-500">

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="DaemonMan">
+  <rect x="24" y="24" width="976" height="976" rx="224" fill="#4338CA"/>
+  <path
+    d="M271 242 H512 A269 269 0 0 1 512 782 H271 A28 28 0 0 1 243 754 V270 A28 28 0 0 1 271 242 Z"
+    fill="#F8FAFC"
+  />
+  <path
+    d="M545 410 L545 614 L700 512 Z"
+    fill="#2DD4BF"
+    stroke="#2DD4BF"
+    stroke-width="52"
+    stroke-linejoin="round"
+  />
+</svg>

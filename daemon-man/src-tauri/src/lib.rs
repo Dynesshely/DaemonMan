@@ -90,15 +90,8 @@ pub fn run() {
     }
 
     // 单实例插件只在生产构建启用：开发实例要能和正在运行的生产实例同时打开。
-    // 同时给开发实例单独的 WebView2 用户数据目录，否则两个进程共用 WebView2 profile 会启动失败
-    // （0x8007139F 组或资源状态不正确）。
-    if config::is_dev() {
-        if let Some(local) = dirs::data_local_dir() {
-            let folder = local.join("com.daemonman.app.dev").join("EBWebView");
-            let _ = std::fs::create_dir_all(&folder);
-            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &folder);
-        }
-    }
+    // 开发实例另用独立的 application identifier（tauri.dev.conf.json），
+    // 配合窗口的 dataDirectory 使用不同的 WebView2 用户数据目录，避免 profile 互斥。
     let builder = tauri::Builder::default();
     #[cfg(feature = "custom-protocol")]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {

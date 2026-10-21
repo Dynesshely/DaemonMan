@@ -90,7 +90,7 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
    - `script`：`cmd /C <command>`，返回码非 0 可按配置视为失败。
 4. **状态与取消**：任何状态变化都 `state.upsert_run` 并 emit `workflow:run`（payload 为完整 `WorkflowRun`）；取消通过 `state.run_flag(run_id)`（`Arc<AtomicBool>`）协作式生效：未执行的节点标记为 cancelled，已启动的进程不强制结束。
 5. **失败传播**：失败/取消会让 `success` 边的下游节点变为 `skipped`，但 `failure`/`always` 边继续执行，从而支持降级分支。
-6. **单点执行**：`engine::spawn_single_node_run` 校验节点存在且非分组、强制 `enabled=true`，用只含该节点的最小工作流（edges 清空、沿用原 workflow id/name/skip_existing）复用同一执行器，便于调试；不校验整张图，未保存的草稿也能单点运行。节点 id 保持不变，前端按 `run.workflowId + nodeId` 显示状态。
+6. **单点执行**：`engine::spawn_single_node_run` 校验节点存在且非分组、强制 `enabled=true`，用只含该节点的最小工作流（edges 清空、沿用原 workflow id/name，并把 `skip_existing_processes` 置真以遵循节点的「已存在则跳过」）复用同一执行器，便于调试；不校验整张图，未保存的草稿也能单点运行。节点 id 保持不变，前端按 `run.workflowId + nodeId` 显示状态。
 7. **分组单点执行**：`engine::spawn_group_run` 递归收集分组内所有后代可执行节点（含嵌套组、排除分组节点本身），强制 `enabled=true`，只保留两端都在集合内的边；沿用原 workflow id/name/skip_existing，走同一执行器产生完整运行记录，便于整体调试一个分组。
 8. **分组模式与有效执行图**：`engine::effective_workflow` 在运行时生成副本（不写回）：
    - **Sequence**：移除该分组管辖的连线，按直接子项在 `nodes` 中的顺序串联（嵌套组作为一个单元递归）；跳过「连线延时」候选 delay 节点；`group_delay_ms > 0` 时在相邻单元间插入合成 Delay 节点（id `group-delay:<group>:<index>`，名称「分组延迟 N ms」）；
@@ -152,7 +152,7 @@ GUI 始终以普通权限运行。需要管理员权限的单个操作（启用/
 - 每个可执行节点计算 `layer`（1 + max(上游层)）与 `拓扑序`（Kahn 出队顺序）。顶层单元按层分列，同层按拓扑序排列；顺序分组内子项按拓扑序排列（延时节点位于其真实前后节点之间），并行分组用三列紧凑网格。
 - 自动排列采用「单元图 + 思维导图森林」：顶层单元（分组/未分组节点）先按拓扑分层，再以主父关系构造森林，父节点在左、子节点向右纵向展开并垂直居中；多棵树按面积估算目标宽度水平换行，使整体保持 landscape；分组内部同算法，分组尺寸与子项坐标同源。列间距按延时标签宽度留白（约 132px），保证 88px 药丸标签落在卡片间隙。
 - 连线路由：`edgeRouting.ts` 生成正交路径（圆角 10）——优先走列间隙，竖直段按源/目标 y 排序分配 lane；碰撞时改用行间水平通道或整图外侧绕行，避开非端点卡片；跨列长边优先通道以减少交叉；`WorkflowEdgeLine` 使用路由给出的 path/labelX/labelY，延时药丸始终落在连线上。**纵向排列**（同列、目标在下方）的节点改用特殊点位：从源卡片底部靠右、到目标卡片顶部靠左画斜线直连（端点从角点内缩，两端渲染小圆点），不再绕到左右中点。
-- 分组模式与网格：顺序分组默认简洁展示，子项按 `workflow.nodes` 顺序行优先 Wrap，列数按「容器像素宽高比接近 1:1」枚举选优（不是 `ceil(sqrt(n))`），隐藏组内连线、位置锁定，拖拽节点落点取最近槽位并重排数组顺序；并行分组列优先（`col=floor(i/rows), row=i mod rows`），同样按近方形选列数；按连线模式沿用思维导图布局。
+- 分组模式与网格：顺序分组默认简洁展示，子项按 `workflow.nodes` 顺序行优先 Wrap，列数按「容器像素宽高比接近 1:1」枚举选优（不是 `ceil(sqrt(n))`），隐藏原始组内连线、位置锁定，拖拽节点落点取最近槽位并重排数组顺序；简洁模式下额外按执行顺序为相邻子项绘制合成展示边（`seq:<group>:<i>`，仅画布数据，不写回、不可选/删除/编辑）；并行分组列优先（`col=floor(i/rows), row=i mod rows`），同样按近方形选列数；按连线模式沿用思维导图布局。
 - 组内延迟：顺序模式下 `group_delay_ms` 覆盖组内连线延时，组头显示延迟徽标。
 - 分组配色：顺序/按连线分组 teal、并行分组 violet（边框/底色/标题/徽标/选中 ring 区分），文本视图同步并显示模式。
 - 连线延时：只有一个入边/一个出边且条件均为 success 的 delay 节点视为「连线延时」；自动排列时从布局图折叠、两条边合并为一条 source→target 的合成边（`delay:<sourceEdgeId>:<targetEdgeId>`），画布完全不渲染该延时节点，改由自定义边用 `EdgeLabelRenderer` 在 `getSmoothStepPath` 的 labelX/labelY 渲染标签，因此标签必然位于连线上、不会浮空或绕线。点击合成边（标签区域 `pointer-events:none`，点击落到边的交互路径）会选中隐藏的延时节点，右侧可编辑延时；删除合成边等价于删除其折叠的两条原始边，延时恢复为普通卡片。相邻的两个延时节点不折叠，避免合成边引用不可见节点。

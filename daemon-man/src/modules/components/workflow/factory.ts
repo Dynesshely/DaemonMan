@@ -112,12 +112,19 @@ export interface DelayEdgeLabel {
   delayMs: number;
 }
 
+/** 纯展示合成边的构造选项（不写 draft，不可选中/删除/聚焦）。 */
+export interface DisplayEdgeOptions {
+  /** sequence=true 表示「简洁顺序分组的执行顺序连线」。 */
+  sequence?: boolean;
+}
+
 /** draft 中的边 -> 画布连线（flow=true 执行流，false 依赖跳线；延时折叠边带药丸数据）。 */
 export function buildFlowEdge(
   edge: WorkflowEdge,
   dark: boolean,
   flow = true,
   delay?: DelayEdgeLabel,
+  display?: DisplayEdgeOptions,
 ): Edge<FlowEdgeData> {
   const color = flow
     ? dark
@@ -126,14 +133,26 @@ export function buildFlowEdge(
     : dark
       ? "#71717a"
       : "#a1a1aa";
+  const displayOnly = Boolean(display);
   return {
     id: edge.id,
     source: edge.source,
     target: edge.target,
     type: "workflow",
-    data: delay
-      ? { edge, flow, delayNodeId: delay.delayNodeId, delayMs: delay.delayMs }
-      : { edge, flow },
+    data: {
+      edge,
+      flow,
+      ...(delay
+        ? { delayNodeId: delay.delayNodeId, delayMs: delay.delayMs }
+        : {}),
+      ...(displayOnly
+        ? { displayOnly: true, sequence: Boolean(display?.sequence) }
+        : {}),
+    },
+    // 展示边不参与任何交互，避免被选中/删除/编辑。
+    ...(displayOnly
+      ? { selectable: false, deletable: false, focusable: false }
+      : {}),
     markerEnd: {
       type: MarkerType.ArrowClosed,
       color,

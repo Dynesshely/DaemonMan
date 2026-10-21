@@ -337,12 +337,16 @@ fn resolve_single_node<'a>(
 
 /// 构造「只含一个节点」的最小工作流：节点克隆后强制 `enabled = true`，
 /// `edges` 清空，其余字段沿用原工作流。
+///
+/// 单点执行也遵循节点自身的启动配置：把工作流级开关置为 true，让 launcher
+/// 按 `node.app.skip_if_running` 判断「已存在则跳过」（与正常工作流一致）。
 fn build_single_node_workflow(workflow: &Workflow, node: &WorkflowNode) -> Workflow {
     let mut single = node.clone();
     single.enabled = true;
     Workflow {
         nodes: vec![single],
         edges: Vec::new(),
+        skip_existing_processes: true,
         ..workflow.clone()
     }
 }
@@ -1924,7 +1928,9 @@ mod tests {
         // 身份沿用原工作流，run.workflow_id 才不会变。
         assert_eq!(mini.id, "wf-7");
         assert_eq!(mini.name, "原工作流");
-        assert!(!mini.skip_existing_processes);
+        // 单点执行也遵循节点自身的「已存在则跳过」配置：工作流级开关置真，
+        // 由 node.app.skip_if_running 决定是否跳过。
+        assert!(mini.skip_existing_processes);
     }
 
     #[test]

@@ -24,6 +24,10 @@ export interface FlowEdgeData {
   delayNodeId?: string;
   /** 延时毫秒数（药丸文案）。 */
   delayMs?: number;
+  /** true = 纯展示的合成边（不写 draft，不参与拓扑/删除/选中）。 */
+  displayOnly?: boolean;
+  /** true = 简洁顺序分组的「执行顺序」连线（displayOnly 的一种）。 */
+  sequence?: boolean;
 }
 
 /** 画布向下游节点卡片提供「执行步骤号」。 */

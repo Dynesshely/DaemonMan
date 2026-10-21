@@ -298,7 +298,7 @@ function buildEdgesFor(draft: Workflow): Edge[] {
     return group;
   };
   // 候选延时的两条边合并成一条 source→target 的合成边，药丸渲染在它的标签上。
-  return foldDelayEdges(draft.edges, pills)
+  const edges = foldDelayEdges(draft.edges, pills)
     .filter((edge) => {
       const sourceGroup = compactOf(edge.source);
       const targetGroup = compactOf(edge.target);
@@ -307,6 +307,34 @@ function buildEdgesFor(draft: Workflow): Edge[] {
     .map((edge) =>
       buildFlowEdge(edge, theme.isDark, edgeIsFlow(edge), labels.get(edge.id)),
     );
+
+  // 简洁展示的顺序分组：按 workflow.nodes 顺序给相邻可见子项补一条「执行顺序」展示边。
+  // 只存在于画布，不写 draft、不参与拓扑/步骤/删除；延时药丸与嵌套分组不参与连线。
+  for (const group of draft.nodes) {
+    if (group.kind !== "group" || !isCompactGroup(group)) continue;
+    const participants = draft.nodes.filter(
+      (node) =>
+        node.parentId === group.id &&
+        node.kind !== "group" &&
+        !pills.has(node.id),
+    );
+    for (let index = 1; index < participants.length; index += 1) {
+      const source = participants[index - 1];
+      const target = participants[index];
+      const synthetic: WorkflowEdge = {
+        id: `seq:${group.id}:${index}`,
+        source: source.id,
+        target: target.id,
+        condition: "success",
+      };
+      edges.push(
+        buildFlowEdge(synthetic, theme.isDark, true, undefined, {
+          sequence: true,
+        }),
+      );
+    }
+  }
+  return edges;
 }
 
 /** 拓扑变化后重算步骤号与连线分类（保持边的选中态）。 */
@@ -1194,9 +1222,25 @@ function onConnect(connection: Connection) {
 }
 
 /** 点击连线：若该边折叠了延时药丸，则改为选中延时节点，右栏可直接改延时。 */
+/** 纯展示合成边（简洁顺序连线）不参与点击选中/编辑。 */
+function isDisplayOnlyEdge(edgeId: string): boolean {
+  // 合成边统一用 `seq:` 前缀；即使已经从 flowEdges 移除也能识别。
+  if (edgeId.startsWith("seq:")) return true;
+  return flowEdges.value.some(
+    (edge) =>
+      edge.id === edgeId &&
+      (edge.data as { displayOnly?: boolean } | undefined)?.displayOnly === true,
+  );
+}
+
+/** 点击连线：若该边折叠了延时药丸，则改为选中延时节点，右栏可直接改延时。 */
 function onEdgeClick(event: EdgeMouseEvent) {
-  const delayNodeId = (event.edge.data as { delayNodeId?: string } | undefined)
-    ?.delayNodeId;
+  const data = event.edge.data as
+    | { delayNodeId?: string; displayOnly?: boolean }
+    | undefined;
+  // 纯展示的「执行顺序」连线不响应点击（不选中、不编辑）。
+  if (data?.displayOnly) return;
+  const delayNodeId = data?.delayNodeId;
   if (!delayNodeId) return;
   // Vue Flow 会在 click 内先选中边；这里下一拍清掉边选中，改为「隐藏选中」该延时节点。
   void nextTick(() => {
@@ -1252,7 +1296,9 @@ function onEdgesChange(changes: EdgeChange[]) {
   if (!current) return;
   const removedIds = changes
     .filter((change): change is EdgeRemoveChange => change.type === "remove")
-    .map((change) => change.id);
+    .map((change) => change.id)
+    // 展示用的合成边删不掉：忽略其删除变更，draft 不会被波及。
+    .filter((id) => !isDisplayOnlyEdge(id));
   if (removedIds.length === 0) return;
   const removed = expandRemovedEdgeIds(removedIds, current);
   current.edges = current.edges.filter((edge) => !removed.has(edge.id));
@@ -1603,6 +1649,8 @@ function removeNodeById(id: string) {
 }
 
 function removeEdgeById(id: string) {
+  // 展示用合成边没有对应的 draft 边，直接忽略。
+  if (isDisplayOnlyEdge(id)) return;
   const current = store.draft;
   if (current) {
     const removed = expandRemovedEdgeIds([id], current);

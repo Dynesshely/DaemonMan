@@ -1,14 +1,10 @@
 <script setup lang="ts">
 import { computed, inject } from "vue";
-import {
-  BaseEdge,
-  EdgeLabelRenderer,
-  getSmoothStepPath,
-} from "@vue-flow/core";
+import { BaseEdge, EdgeLabelRenderer } from "@vue-flow/core";
 import type { Position } from "@vue-flow/core";
 
 import type { FlowEdgeData } from "../types";
-import { WORKFLOW_SELECTED_NODE } from "../types";
+import { WORKFLOW_EDGE_ROUTES, WORKFLOW_SELECTED_NODE } from "../types";
 import { edgeConditionLabel } from "../meta";
 import WorkflowDelayPill from "../nodes/WorkflowDelayPill.vue";
 import { useI18n } from "@/modules/locales";
@@ -36,17 +32,24 @@ const condition = computed(() => props.data?.edge?.condition ?? "success");
 /** true = 执行流（相邻层 success），false = 依赖跳线。 */
 const isFlow = computed(() => props.data?.flow ?? true);
 
-const geometry = computed(() =>
-  getSmoothStepPath({
-    sourceX: props.sourceX,
-    sourceY: props.sourceY,
-    sourcePosition: props.sourcePosition,
-    targetX: props.targetX,
-    targetY: props.targetY,
-    targetPosition: props.targetPosition,
-    borderRadius: 18,
-    offset: 22,
-  }),
+/**
+ * 路由结果由画布统一计算（见 edgeRouting.ts），这里只负责取用：
+ * 尚未算好时用一条简单的正交兜底路径，避免首帧空白。
+ */
+const routes = inject(WORKFLOW_EDGE_ROUTES, null);
+const route = computed(() => routes?.value.get(props.id) ?? null);
+
+const fallbackPath = computed(() => {
+  const midX = Math.round(((props.sourceX + props.targetX) / 2) * 10) / 10;
+  return `M ${props.sourceX} ${props.sourceY} L ${midX} ${props.sourceY} L ${midX} ${props.targetY} L ${props.targetX} ${props.targetY}`;
+});
+
+const path = computed(() => route.value?.path ?? fallbackPath.value);
+const labelX = computed(
+  () => route.value?.labelX ?? (props.sourceX + props.targetX) / 2,
+);
+const labelY = computed(
+  () => route.value?.labelY ?? (props.sourceY + props.targetY) / 2,
 );
 
 const stroke = computed(() => {
@@ -85,7 +88,7 @@ const labelBgStyle = computed(() => ({
   strokeWidth: 1,
 }));
 
-/** 折叠了延时药丸的边：在连线中点渲染药丸标签。 */
+/** 折叠了延时药丸的边：在路由算出的标签点渲染药丸。 */
 const delayNodeId = computed(() => props.data?.delayNodeId ?? null);
 const delayMs = computed(() => props.data?.delayMs ?? 0);
 
@@ -96,7 +99,7 @@ const delaySelected = computed(
 
 const delayLabelStyle = computed(() => ({
   position: "absolute" as const,
-  transform: `translate(-50%, -50%) translate(${geometry.value[1]}px, ${geometry.value[2]}px)`,
+  transform: `translate(-50%, -50%) translate(${labelX.value}px, ${labelY.value}px)`,
   pointerEvents: "none" as const,
 }));
 </script>
@@ -104,12 +107,12 @@ const delayLabelStyle = computed(() => ({
 <template>
   <BaseEdge
     :id="id"
-    :path="geometry[0]"
+    :path="path"
     :marker-end="markerEnd"
     :style="pathStyle"
     :label="label"
-    :label-x="geometry[1]"
-    :label-y="geometry[2]"
+    :label-x="labelX"
+    :label-y="labelY"
     :label-style="labelStyle"
     :label-bg-style="labelBgStyle"
   />

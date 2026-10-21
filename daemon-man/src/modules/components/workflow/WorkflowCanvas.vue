@@ -54,6 +54,7 @@ import {
   foldDelayEdges,
   type DelayPillInfo,
 } from "./delayPill";
+import { computeEdgeRoutes, type EdgeRoute } from "./edgeRouting";
 import {
   buildFlowEdge,
   buildFlowNode,
@@ -78,8 +79,10 @@ import WorkflowGroupNode from "./nodes/WorkflowGroupNode.vue";
 import WorkflowNodeCard from "./nodes/WorkflowNodeCard.vue";
 import { errorText } from "./shared";
 import {
+  WORKFLOW_EDGE_ROUTES,
   WORKFLOW_SELECTED_NODE,
   WORKFLOW_STEPS,
+  type FlowEdgeData,
   type WorkflowSelection,
 } from "./types";
 
@@ -108,6 +111,7 @@ const {
   findEdge,
   findNode,
   fitView,
+  getNodes,
   getSelectedEdges,
   getSelectedNodes,
   removeEdges,
@@ -185,6 +189,55 @@ const activeSelectedNodeId = computed(
   () => hiddenSelectedNodeId.value ?? props.selectedNodeId ?? null,
 );
 provide(WORKFLOW_SELECTED_NODE, activeSelectedNodeId);
+
+// ---------------------------------------------------------------------------
+// 边路由：正交折线 + 圆角 + lane 分配 + 节点障碍规避（纯函数见 edgeRouting.ts）
+// 节点位置/尺寸或边变化后按帧节流重算，50–100 条边仍是毫秒级。
+// ---------------------------------------------------------------------------
+const edgeRoutes = ref<Map<string, EdgeRoute>>(new Map());
+provide(WORKFLOW_EDGE_ROUTES, edgeRoutes);
+
+let routingFrame = 0;
+let routingDisabled = false;
+let lastRouteAt = 0;
+
+function computeRoutesNow() {
+  if (routingDisabled) return;
+  lastRouteAt = performance.now();
+  const nodes = getNodes.value
+    .filter((node) => node.type !== "group")
+    .map((node) => ({
+      id: node.id,
+      x: node.position.x,
+      y: node.position.y,
+      width: node.dimensions.width > 0 ? node.dimensions.width : NODE_WIDTH,
+      height: node.dimensions.height > 0 ? node.dimensions.height : NODE_HEIGHT,
+    }));
+  if (nodes.length === 0) {
+    if (edgeRoutes.value.size > 0) edgeRoutes.value = new Map();
+    return;
+  }
+  const visibleIds = new Set(nodes.map((node) => node.id));
+  const inputs = flowEdges.value
+    .filter(
+      (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
+    )
+    .map((edge) => ({
+      id: edge.id,
+      sourceId: edge.source,
+      targetId: edge.target,
+      hasLabel: Boolean((edge.data as FlowEdgeData | undefined)?.delayNodeId),
+    }));
+  edgeRoutes.value = computeEdgeRoutes(nodes, inputs);
+}
+
+function scheduleEdgeRouting() {
+  if (routingDisabled || routingFrame) return;
+  routingFrame = window.requestAnimationFrame(() => {
+    routingFrame = 0;
+    computeRoutesNow();
+  });
+}
 
 function applyTopology(draft: Workflow) {
   const pills = computeDelayPills(draft.nodes, draft.edges);
@@ -297,6 +350,7 @@ function refreshFlowEdges() {
   // 重建期间先屏蔽选中回传，避免右栏属性面板被瞬间清空。
   suppressSelectionEmit = true;
   flowEdges.value = buildEdgesFor(current);
+  scheduleEdgeRouting();
   void nextTick(() => {
     if (token !== refreshToken) return;
     const edges = selectedIds
@@ -517,6 +571,9 @@ function scheduleGroupGeometry() {
     geometryFrame = 0;
     if (unmounted) return;
     updateGroupGeometry();
+    // 节点位置变了，边路由跟着这一帧一起重算，避免连线晚一帧才对上。
+    // 拖动期间限制到 ~40fps，给渲染留出时间（拖动结束后会再补一次精确结果）。
+    if (performance.now() - lastRouteAt >= 24) computeRoutesNow();
   });
 }
 
@@ -805,6 +862,7 @@ async function handleFileDrop(
   });
 
   addNodes(created.map((node) => buildFlowNode(node)));
+  scheduleEdgeRouting();
   const last = created[created.length - 1];
   if (last) {
     void nextTick(() => {
@@ -838,6 +896,11 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   unmounted = true;
+  routingDisabled = true;
+  if (routingFrame) {
+    window.cancelAnimationFrame(routingFrame);
+    routingFrame = 0;
+  }
   dragDisposed = true;
   dragUnlisten?.();
   dragUnlisten = null;
@@ -978,6 +1041,7 @@ function rebuildFromDraft(next: Workflow | null) {
   );
   applyTopology(next);
   flowEdges.value = buildEdgesFor(next);
+  scheduleEdgeRouting();
 
   void nextTick(() => {
     // 重建会丢失内部选中态，这里恢复一下，避免保存后属性面板突然清空。
@@ -1062,6 +1126,7 @@ watch([getSelectedNodes, getSelectedEdges], () => emitSelection(), {
 
 function onInit() {
   applySelectedNode(props.selectedNodeId);
+  scheduleEdgeRouting();
   if ((store.draft?.nodes.length ?? 0) > 0) {
     fitWhenReady();
   }
@@ -1150,6 +1215,7 @@ function onEdgesChange(changes: EdgeChange[]) {
   if (removedIds.length === 0) return;
   const removed = expandRemovedEdgeIds(removedIds, current);
   current.edges = current.edges.filter((edge) => !removed.has(edge.id));
+  scheduleEdgeRouting();
 }
 
 function onNodeDragStart(event: NodeDragEvent) {
@@ -1253,6 +1319,7 @@ function onNodeDragStop(event: NodeDragEvent) {
     draggingGroupId.value = null;
     updateGroupGeometry();
     persistGroupPositions();
+    scheduleEdgeRouting();
     return;
   }
 
@@ -1267,6 +1334,7 @@ function onNodeDragStop(event: NodeDragEvent) {
   }
   updateGroupGeometry();
   persistGroupPositions();
+  scheduleEdgeRouting();
 }
 
 /** 新节点落在视口中心附近，并按已有节点数量做一点错位。 */
@@ -1293,6 +1361,7 @@ function addNode(kind: NodeKind) {
     kind === "group" ? `新分组 ${index}` : `${t(meta.labelKey)} ${index}`;
   current.nodes.push(node);
   addNodes(buildFlowNode(node));
+  scheduleEdgeRouting();
   if (kind === "group") {
     scheduleGroupGeometry();
     void nextTick(() => persistGroupPositions());
@@ -1322,6 +1391,7 @@ function addApplicationNode(app: StartMenuApp) {
   node.app.args = [...app.args];
   current.nodes.push(node);
   addNodes(buildFlowNode(node));
+  scheduleEdgeRouting();
   void nextTick(() => {
     const added = findNode(node.id);
     if (added) addSelectedNodes([added]);
@@ -1352,6 +1422,7 @@ function removeNodeById(id: string) {
   }
   removeNodes([id]);
   scheduleGroupGeometry();
+  scheduleEdgeRouting();
   void nextTick(() => persistGroupPositions());
 }
 
@@ -1362,6 +1433,7 @@ function removeEdgeById(id: string) {
     current.edges = current.edges.filter((edge) => !removed.has(edge.id));
   }
   removeEdges([id]);
+  scheduleEdgeRouting();
 }
 
 /** 自动排列（landscape 思维导图）：按拓扑展开、同层水平排开，写回 draft（可撤销）。 */
@@ -1381,6 +1453,7 @@ function autoLayout() {
     // 分组容器以子节点实际位置为准，这里再收敛一次并持久化。
     updateGroupGeometry();
     persistGroupPositions();
+    computeRoutesNow();
     fitWhenReady(2);
   });
 }

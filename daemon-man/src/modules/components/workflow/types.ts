@@ -1,6 +1,7 @@
 import type { Component, InjectionKey, Ref } from "vue";
 
 import type { NodeKind, WorkflowEdge, WorkflowNode } from "@/api";
+import type { EdgeRoute } from "./edgeRouting";
 
 /**
  * Vue Flow 自定义节点的 `data`。
@@ -32,6 +33,10 @@ export const WORKFLOW_STEPS: InjectionKey<Ref<Map<string, number>>> =
 /** 画布向下游边组件提供「当前选中的节点 id」（折叠药丸不渲染节点，需要外部选中态高亮）。 */
 export const WORKFLOW_SELECTED_NODE: InjectionKey<Ref<string | null>> =
   Symbol("workflow-selected-node");
+
+/** 画布向下游边组件提供「一轮算好的边路由」（正交 path + 标签坐标）。 */
+export const WORKFLOW_EDGE_ROUTES: InjectionKey<Ref<Map<string, EdgeRoute>>> =
+  Symbol("workflow-edge-routes");
 
 /** 四种节点类型的展示元数据（图标、i18n key、强调色）。 */
 export interface NodeKindMeta {

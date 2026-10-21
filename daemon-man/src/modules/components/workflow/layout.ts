@@ -35,12 +35,13 @@ export const LAYOUT_ORIGIN_X = 80;
 export const LAYOUT_ORIGIN_Y = 60;
 
 /** 思维导图：层间横向间距 / 兄弟子树纵向间距 / 多个根之间。 */
-const MIND_COLUMN_GAP = 56;
-const MIND_ROW_GAP = 24;
-const MIND_ROOT_GAP = 40;
+// 列间距要能容纳 88px 宽的延时药丸标签（居中后两侧仍有空隙）。
+const MIND_COLUMN_GAP = 132;
+const MIND_ROW_GAP = 32;
+const MIND_ROOT_GAP = 56;
 
-/** 长链换行：一行最多先按列数扫描，折行后的行间距。 */
-const WRAP_ROW_GAP = 40;
+/** 长链换行：一行最多先按列数扫描，折行后的行间距（留出连线/标签通道）。 */
+const WRAP_ROW_GAP = 72;
 
 /** 单棵根树的目标宽高比；落在可接受区间内就不折行。 */
 const TREE_TARGET_ASPECT = 1.9;
@@ -50,8 +51,8 @@ const TREE_NO_WRAP_MAX_ASPECT = 2.6;
 const MIN_WRAP_LEVELS = 4;
 
 /** 顶层多棵「根树」排布：行内间距 / 行间距 / 最多几行 / 目标宽高比。 */
-const TOP_TREE_GAP = 56;
-const TOP_ROW_GAP = 48;
+const TOP_TREE_GAP = 96;
+const TOP_ROW_GAP = 72;
 const TOP_MAX_ROWS = 6;
 const TARGET_ASPECT = 1.9;
 

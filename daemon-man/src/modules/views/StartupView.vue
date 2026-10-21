@@ -1,8 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import {
+  ArrowDown,
+  ArrowUp,
   Check,
+  ChevronDown,
   Filter,
   Layers,
   MonitorSmartphone,
@@ -39,7 +42,12 @@ import {
   type CategoryFilter,
   type LocationFilter,
 } from "@/modules/components/startup/categories";
-import { inputClass } from "@/modules/components/ui/form";
+import {
+  canEditScript,
+  canRevealItem,
+} from "@/modules/components/startup/script";
+import { inputClass, selectClass } from "@/modules/components/ui/form";
+import ToggleSwitch from "@/modules/components/ui/ToggleSwitch.vue";
 import { useI18n } from "@/modules/locales";
 import { useAppStore } from "@/modules/stores/app";
 import { useAutostartStore } from "@/modules/stores/autostart";
@@ -62,6 +70,20 @@ const search = ref("");
 const filter = ref<FilterKind>("all");
 const category = ref<CategoryFilter>("all");
 const location = ref<LocationFilter>("all");
+
+type SortKey = "name" | "status" | "source" | "location";
+
+const sortKey = ref<SortKey>("name");
+const sortAsc = ref(true);
+
+const advancedOpen = ref(false);
+const advRequiresAdmin = ref(false);
+const advEditable = ref(false);
+const advRevealable = ref(false);
+const advRunOnce = ref(false);
+const advancedButton = ref<HTMLElement | null>(null);
+const advancedPanel = ref<HTMLElement | null>(null);
+
 const selected = ref<Set<string>>(new Set());
 const pending = ref<Set<string>>(new Set());
 const takeOverOpen = ref(false);
@@ -179,12 +201,17 @@ const filtered = computed<AutostartItem[]>(() => {
     if (filter.value === "enabled" && !item.enabled) return false;
     if (filter.value === "disabled" && item.enabled) return false;
     if (filter.value === "takenOver" && !item.takenOver) return false;
+    if (advRequiresAdmin.value && !item.requiresAdmin) return false;
+    if (advEditable.value && !canEditScript(item)) return false;
+    if (advRevealable.value && !canRevealItem(item)) return false;
+    if (advRunOnce.value && item.source !== "registry-run-once") return false;
     if (words.length === 0) return true;
     const haystack = [
       item.name,
       item.command,
       item.sourceLabel,
       item.locator,
+      item.id,
       item.detail ?? "",
       item.executable ?? "",
       item.args ?? "",
@@ -203,6 +230,118 @@ const visible = computed<AutostartItem[]>(() =>
       (location.value === "all" || locationOf(item) === location.value),
   ),
 );
+
+const sortOptions = computed<{ value: SortKey; label: string }[]>(() => [
+  { value: "name", label: t("startup.sort.name") },
+  { value: "status", label: t("startup.sort.status") },
+  { value: "source", label: t("startup.sort.source") },
+  { value: "location", label: t("startup.sort.location") },
+]);
+
+const SOURCE_ORDER: AutostartItem["source"][] = [
+  "registry-run",
+  "registry-run-once",
+  "startup-folder",
+  "scheduled-task",
+  "service",
+];
+
+/** 名称排序始终作为次级排序，保证结果稳定。 */
+function compareByName(a: AutostartItem, b: AutostartItem): number {
+  return a.name.localeCompare(b.name, locale.value);
+}
+
+function statusRank(item: AutostartItem): number {
+  if (item.removed) return 3;
+  if (item.enabled) return 0;
+  if (item.takenOver) return 1;
+  return 2;
+}
+
+function locationRank(item: AutostartItem): number {
+  return locationOf(item) === "user" ? 0 : 1;
+}
+
+function compareBySortKey(a: AutostartItem, b: AutostartItem): number {
+  switch (sortKey.value) {
+    case "status":
+      return statusRank(a) - statusRank(b) || compareByName(a, b);
+    case "source":
+      return SOURCE_ORDER.indexOf(a.source) - SOURCE_ORDER.indexOf(b.source) ||
+        compareByName(a, b);
+    case "location":
+      return locationRank(a) - locationRank(b) || compareByName(a, b);
+    case "name":
+    default:
+      return compareByName(a, b);
+  }
+}
+
+/** 排序在筛选（含 Tabs/搜索/高级筛选）之后应用。 */
+const sortedVisible = computed<AutostartItem[]>(() => {
+  const rows = visible.value.slice();
+  rows.sort((a, b) => {
+    const result = compareBySortKey(a, b);
+    return sortAsc.value ? result : -result;
+  });
+  return rows;
+});
+
+const advancedCount = computed(
+  () =>
+    [
+      advRequiresAdmin.value,
+      advEditable.value,
+      advRevealable.value,
+      advRunOnce.value,
+    ].filter(Boolean).length,
+);
+
+function toggleAdvanced() {
+  advancedOpen.value = !advancedOpen.value;
+}
+
+function clearAdvanced() {
+  advRequiresAdmin.value = false;
+  advEditable.value = false;
+  advRevealable.value = false;
+  advRunOnce.value = false;
+}
+
+function onDocumentPointerDown(event: MouseEvent) {
+  if (!advancedOpen.value) return;
+  const target = event.target;
+  if (!(target instanceof Node)) return;
+  if (advancedPanel.value?.contains(target)) return;
+  if (advancedButton.value?.contains(target)) return;
+  advancedOpen.value = false;
+}
+
+function onDocumentKeydown(event: KeyboardEvent) {
+  if (event.key !== "Escape") return;
+  if (!advancedOpen.value) return;
+  advancedOpen.value = false;
+}
+
+function bindAdvancedListeners() {
+  document.addEventListener("pointerdown", onDocumentPointerDown, true);
+  document.addEventListener("keydown", onDocumentKeydown);
+}
+
+function unbindAdvancedListeners() {
+  document.removeEventListener("pointerdown", onDocumentPointerDown, true);
+  document.removeEventListener("keydown", onDocumentKeydown);
+}
+
+watch(advancedOpen, (open) => {
+  if (open) {
+    bindAdvancedListeners();
+  } else {
+    unbindAdvancedListeners();
+  }
+});
+
+onBeforeUnmount(unbindAdvancedListeners);
 
 /** 类别 Tab 数量：基于「当前位置 Tab + 搜索 + 状态筛选」的结果。 */
 const categoryOptions = computed(() => {
@@ -711,7 +850,9 @@ onMounted(async () => {
     </div>
 
     <SectionCard :padded="false" dense>
-      <div class="flex flex-col gap-2.5 border-b border-zinc-200/80 p-3 dark:border-zinc-800/80 lg:flex-row lg:items-center">
+      <div
+        class="flex flex-col gap-2.5 border-b border-zinc-200/80 p-3 dark:border-zinc-800/80 lg:flex-row lg:flex-wrap lg:items-center"
+      >
         <div class="relative min-w-0 flex-1">
           <Search
             class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400"
@@ -720,8 +861,139 @@ onMounted(async () => {
             v-model="search"
             :class="[inputClass, 'pl-9']"
             type="search"
-            :placeholder="t('startup.searchPlaceholder')"
+            :placeholder="t('startup.searchHint')"
           />
+        </div>
+
+        <div class="flex shrink-0 items-center gap-1.5">
+          <span
+            class="hidden text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400 sm:inline"
+          >
+            {{ t("startup.sort") }}
+          </span>
+          <div class="relative w-36 shrink-0">
+            <select v-model="sortKey" :class="selectClass">
+              <option
+                v-for="option in sortOptions"
+                :key="option.value"
+                :value="option.value"
+              >
+                {{ option.label }}
+              </option>
+            </select>
+            <ChevronDown
+              class="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-400"
+            />
+          </div>
+          <BaseButton
+            variant="ghost"
+            size="sm"
+            icon-only
+            :title="sortAsc ? t('startup.sortAsc') : t('startup.sortDesc')"
+            :aria-label="sortAsc ? t('startup.sortAsc') : t('startup.sortDesc')"
+            @click="sortAsc = !sortAsc"
+          >
+            <ArrowUp v-if="sortAsc" class="h-3.5 w-3.5" />
+            <ArrowDown v-else class="h-3.5 w-3.5" />
+          </BaseButton>
+        </div>
+
+        <div ref="advancedButton" class="relative shrink-0">
+          <BaseButton
+            variant="secondary"
+            size="sm"
+            :title="
+              advancedCount
+                ? t('startup.filter.activeCount', { count: advancedCount })
+                : t('startup.advancedFilter')
+            "
+            :aria-label="t('startup.advancedFilter')"
+            :aria-expanded="advancedOpen"
+            @click="toggleAdvanced"
+          >
+            <Filter class="h-3.5 w-3.5" />
+            {{ t("startup.advancedFilter") }}
+            <span
+              v-if="advancedCount"
+              class="tabular inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-brand-600 px-1 text-[10px] font-semibold text-white dark:bg-brand-500"
+              :aria-label="
+                t('startup.filter.activeCount', { count: advancedCount })
+              "
+            >
+              {{ advancedCount }}
+            </span>
+          </BaseButton>
+
+          <div
+            v-if="advancedOpen"
+            ref="advancedPanel"
+            class="absolute left-0 top-full z-30 mt-1.5 w-64 max-w-[80vw] rounded-xl border border-zinc-200 bg-white p-1 shadow-xl shadow-zinc-900/10 dark:border-zinc-700 dark:bg-zinc-900 dark:shadow-black/40"
+            role="dialog"
+            :aria-label="t('startup.advancedFilter')"
+          >
+            <div class="flex items-center justify-between gap-2 px-2.5 pb-1.5 pt-1">
+              <span
+                class="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400"
+              >
+                {{ t("startup.advancedFilter") }}
+              </span>
+              <span
+                v-if="advancedCount"
+                class="text-[11px] text-brand-600 dark:text-brand-400"
+              >
+                {{ t("startup.filter.activeCount", { count: advancedCount }) }}
+              </span>
+            </div>
+
+            <div class="flex flex-col gap-0.5 p-1 pt-0">
+              <label
+                class="flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-xs text-zinc-700 transition hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              >
+                <span class="min-w-0 truncate">
+                  {{ t("startup.filter.requiresAdmin") }}
+                </span>
+                <ToggleSwitch v-model="advRequiresAdmin" size="sm" />
+              </label>
+              <label
+                class="flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-xs text-zinc-700 transition hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              >
+                <span class="min-w-0 truncate">
+                  {{ t("startup.filter.editable") }}
+                </span>
+                <ToggleSwitch v-model="advEditable" size="sm" />
+              </label>
+              <label
+                class="flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-xs text-zinc-700 transition hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              >
+                <span class="min-w-0 truncate">
+                  {{ t("startup.filter.revealable") }}
+                </span>
+                <ToggleSwitch v-model="advRevealable" size="sm" />
+              </label>
+              <label
+                class="flex cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-xs text-zinc-700 transition hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+              >
+                <span class="min-w-0 truncate">
+                  {{ t("startup.filter.runOnce") }}
+                </span>
+                <ToggleSwitch v-model="advRunOnce" size="sm" />
+              </label>
+            </div>
+
+            <div
+              class="border-t border-zinc-200/80 p-1 dark:border-zinc-800"
+            >
+              <BaseButton
+                variant="ghost"
+                size="sm"
+                block
+                :disabled="advancedCount === 0"
+                @click="clearAdvanced"
+              >
+                {{ t("startup.filter.clear") }}
+              </BaseButton>
+            </div>
+          </div>
         </div>
 
         <div
@@ -807,7 +1079,7 @@ onMounted(async () => {
       >
         <span class="inline-flex items-center gap-1">
           <Filter class="h-3 w-3" />
-          {{ t("startup.totalCount", { count: visible.length }) }}
+          {{ t("startup.totalCount", { count: sortedVisible.length }) }}
         </span>
         <span v-if="selectedItems.length" class="text-brand-600 dark:text-brand-400">
           {{ t("startup.selected", { count: selectedItems.length }) }}
@@ -836,7 +1108,7 @@ onMounted(async () => {
         class="divide-y divide-zinc-200/80 dark:divide-zinc-800/80"
       >
         <StartupItemRow
-          v-for="item in visible"
+          v-for="item in sortedVisible"
           :key="item.id"
           :item="item"
           :selected="isSelected(item.id)"

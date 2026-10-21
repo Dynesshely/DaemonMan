@@ -404,7 +404,12 @@ function indentClass(depth: number): string {
               </span>
               <template v-if="row.isGroup">
                 <span
-                  class="shrink-0 rounded-full bg-teal-500/15 px-1.5 text-[10px] font-medium text-teal-700 dark:bg-teal-400/20 dark:text-teal-200"
+                  class="shrink-0 rounded-full px-1.5 text-[10px] font-medium"
+                  :class="
+                    row.node.groupParallel
+                      ? 'bg-violet-500/15 text-violet-700 dark:bg-violet-400/20 dark:text-violet-200'
+                      : 'bg-teal-500/15 text-teal-700 dark:bg-teal-400/20 dark:text-teal-200'
+                  "
                 >
                   {{
                     row.node.groupParallel

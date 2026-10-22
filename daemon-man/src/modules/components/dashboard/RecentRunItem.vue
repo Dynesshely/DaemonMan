@@ -24,7 +24,13 @@ const nodeStates = computed<NodeRunState[]>(() =>
 const doneCount = computed(
   () =>
     nodeStates.value.filter((node) =>
-      ["success", "failed", "skipped", "cancelled"].includes(node.status),
+      [
+        "success",
+        "failed",
+        "skipped",
+        "skipped-existing",
+        "cancelled",
+      ].includes(node.status),
     ).length,
 );
 
@@ -51,8 +57,22 @@ const dotClasses: Record<string, string> = {
   warn: "bg-amber-500",
   info: "bg-sky-500",
   accent: "bg-brand-500",
+  skipped: "bg-teal-500 dark:bg-teal-400",
   neutral: "bg-zinc-400 dark:bg-zinc-600",
 };
+
+const messageClass = computed(() => {
+  switch (props.run.status) {
+    case "failed":
+      return "text-red-600 dark:text-red-400";
+    case "cancelled":
+      return "text-amber-600 dark:text-amber-400";
+    case "success":
+      return "text-emerald-600 dark:text-emerald-400";
+    default:
+      return "text-zinc-500 dark:text-zinc-400";
+  }
+});
 
 const visibleDots = computed(() => nodeStates.value.slice(0, 28));
 const hiddenDots = computed(() =>
@@ -123,7 +143,8 @@ const hiddenDots = computed(() =>
 
       <p
         v-if="run.message"
-        class="mt-1.5 truncate text-[11px] text-red-600 dark:text-red-400"
+        class="mt-1.5 truncate text-[11px]"
+        :class="messageClass"
         :title="run.message"
       >
         {{ run.message }}

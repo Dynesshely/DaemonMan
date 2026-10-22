@@ -36,6 +36,7 @@ function progressLabel(run: WorkflowRun): string {
       node.status === "success" ||
       node.status === "failed" ||
       node.status === "skipped" ||
+      node.status === "skipped-existing" ||
       node.status === "cancelled",
   ).length;
   return `${done}/${nodes.length}`;

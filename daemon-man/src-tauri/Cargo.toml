@@ -1,6 +1,6 @@
 [package]
 name = "daemon-man"
-version = "0.1.6"
+version = "0.1.7"
 description = "DaemonMan - workflow driven startup & daemon manager"
 authors = ["Dynesshely"]
 edition = "2021"

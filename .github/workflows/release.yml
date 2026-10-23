@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check semver tag and project versions
+        id: version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$tag' does not match vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+          version="${tag#v}"
+          conf_version=$(node -p "require('./daemon-man/src-tauri/tauri.conf.json').version")
+          package_version=$(node -p "require('./daemon-man/package.json').version")
+          cargo_version=$(awk -F'"' '/^version = / {print $2; exit}' daemon-man/src-tauri/Cargo.toml)
+
+          echo "tag=$tag tauri=$conf_version package=$package_version cargo=$cargo_version"
+          if [[ "$version" != "$conf_version" || "$version" != "$package_version" || "$version" != "$cargo_version" ]]; then
+            echo "::error::Tag version $version does not match project versions."
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and publish Windows installer
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: daemon-man/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "daemon-man/src-tauri -> target"
+
+      - name: Install dependencies
+        working-directory: daemon-man
+        run: pnpm install --frozen-lockfile
+
+      - name: Build NSIS installer
+        working-directory: daemon-man
+        run: pnpm tauri build --bundles nsis
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemonman-${{ needs.validate.outputs.version }}-windows-x64
+          path: daemon-man/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $installer = Get-ChildItem "daemon-man/src-tauri/target/release/bundle/nsis" -Filter "*.exe" |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw "Installer not found."
+          }
+
+          $checksum = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLower()
+          $checksumFile = Join-Path $installer.Directory "SHA256SUMS.txt"
+          "$checksum  $($installer.Name)" | Set-Content $checksumFile -Encoding ascii
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $installer.FullName $checksumFile --clobber
+          } else {
+            gh release create $tag $installer.FullName $checksumFile `
+              --title "DaemonMan $tag" `
+              --generate-notes `
+              --verify-tag
+          }

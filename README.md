@@ -17,6 +17,7 @@
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5-3178C6?style=flat-square&logo=typescript&logoColor=white" />
   <img alt="Version" src="https://img.shields.io/github/v/tag/Dynesshely/DaemonMan?style=flat-square&label=version&color=4f46e5" />
   <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-4f46e5?style=flat-square" />
+  <img alt="Release" src="https://github.com/Dynesshely/DaemonMan/actions/workflows/release.yml/badge.svg" />
   <img alt="Stars" src="https://img.shields.io/github/stars/Dynesshely/DaemonMan?style=flat-square&color=f59e0b" />
 </p>
 

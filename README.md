@@ -86,7 +86,7 @@ DaemonMan/
 
 <p align="center">
   <a href="https://star-history.com/#Dynesshely/DaemonMan&Date">
-    <img src="https://api.star-history.com/svg?repos=Dynesshely/DaemonMan&type=Date" alt="Star History Chart" />
+    <img src="https://api.star-history.com/svg?repos=Dynesshely/DaemonMan&type=Date&theme=dark" alt="Star History Chart" />
   </a>
 </p>
 

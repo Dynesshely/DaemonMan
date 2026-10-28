@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { Ban, Boxes, Clock } from "lucide-vue-next";
+import { Handle, Position } from "@vue-flow/core";
+import { Ban, Boxes, Clock, Gauge, Timer } from "lucide-vue-next";
 
 import type { NodeStatus } from "@/api";
 import { useI18n } from "@/modules/locales";
@@ -71,6 +72,7 @@ const palette = computed(() =>
           "bg-violet-500/15 text-violet-700 dark:bg-violet-400/20 dark:text-violet-200",
         subtle: "text-violet-600/80 dark:text-violet-300/80",
         subtleIcon: "text-violet-600/70 dark:text-violet-300/70",
+        handle: "border-violet-400! bg-white! dark:bg-zinc-900!",
       }
     : {
         container: props.selected
@@ -84,6 +86,7 @@ const palette = computed(() =>
           "bg-teal-500/15 text-teal-700 dark:bg-teal-400/20 dark:text-teal-200",
         subtle: "text-teal-600/80 dark:text-teal-300/80",
         subtleIcon: "text-teal-600/70 dark:text-teal-300/70",
+        handle: "border-teal-400! bg-white! dark:bg-zinc-900!",
       },
 );
 
@@ -106,6 +109,21 @@ const delayLabel = computed(() =>
     ? formatMs(node.value.groupDelayMs)
     : null,
 );
+
+/** 并行分组：最大并发（0=不限）/ 批次间隔 徽标。 */
+const parallelLimitLabel = computed(() =>
+  mode.value === "parallel" && node.value.groupParallelLimit > 0
+    ? t("node.groupParallelLimitShort", { count: node.value.groupParallelLimit })
+    : null,
+);
+
+const parallelIntervalLabel = computed(() =>
+  mode.value === "parallel" && node.value.groupParallelIntervalMs > 0
+    ? t("node.groupParallelIntervalShort", {
+        ms: formatMs(node.value.groupParallelIntervalMs),
+      })
+    : null,
+);
 </script>
 
 <template>
@@ -114,6 +132,20 @@ const delayLabel = computed(() =>
     <div
       class="absolute inset-0 rounded-2xl border-2 border-dashed transition-colors"
       :class="palette.container"
+    />
+
+    <!-- 分组之间连线用的左右端口：贴边、纵向居中，不挡组头与卡片 -->
+    <Handle
+      type="target"
+      :position="Position.Left"
+      class="nodrag z-10! h-2.5! w-2.5! border-2! shadow-sm"
+      :class="palette.handle"
+    />
+    <Handle
+      type="source"
+      :position="Position.Right"
+      class="nodrag z-10! h-2.5! w-2.5! border-2! shadow-sm"
+      :class="palette.handle"
     />
 
     <!-- 标题栏：可拖动整组 / 点击选中分组 -->
@@ -146,6 +178,24 @@ const delayLabel = computed(() =>
       >
         <Clock class="h-2.5 w-2.5" />
         {{ delayLabel }}
+      </span>
+      <span
+        v-if="parallelLimitLabel"
+        class="flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+        :class="palette.badge"
+        :title="t('node.groupParallelLimitHint')"
+      >
+        <Gauge class="h-2.5 w-2.5" />
+        {{ parallelLimitLabel }}
+      </span>
+      <span
+        v-if="parallelIntervalLabel"
+        class="flex shrink-0 items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+        :class="palette.badge"
+        :title="t('node.groupParallelIntervalHint')"
+      >
+        <Timer class="h-2.5 w-2.5" />
+        {{ parallelIntervalLabel }}
       </span>
       <span class="shrink-0 text-[10px]" :class="palette.subtle">
         {{ t("workflow.nodeCount", { count: children.length }) }}

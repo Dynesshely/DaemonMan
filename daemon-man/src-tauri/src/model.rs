@@ -319,6 +319,12 @@ pub struct WorkflowNode {
     pub group_mode: Option<GroupMode>,
     /// 分组级延迟：顺序模式下应用于组内相邻节点之间，覆盖组内连线上的延时
     pub group_delay_ms: u64,
+    /// 并行分组每批最多同时启动的直接子项数；0 表示不限制。
+    /// 例如 limit=3、interval=3000：每批 3 个，上一批开始后至少隔 3 秒再启动下一批
+    /// （上一批还没全部完成时会等它完成，因此「最大并发」永远不被突破）。
+    pub group_parallel_limit: u32,
+    /// 并行分组批次之间的间隔毫秒（仅 limit > 0 且确有多个批次时生效）。
+    pub group_parallel_interval_ms: u64,
     /// 顺序分组是否使用简洁展示（紧凑换行、隐藏组内连线、拖拽排序）
     pub group_compact: bool,
 }
@@ -340,6 +346,8 @@ impl Default for WorkflowNode {
             group_parallel: false,
             group_mode: None,
             group_delay_ms: 0,
+            group_parallel_limit: 0,
+            group_parallel_interval_ms: 0,
             group_compact: true,
         }
     }

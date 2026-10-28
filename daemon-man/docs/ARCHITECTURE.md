@@ -93,10 +93,10 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
 6. **单点执行**：`engine::spawn_single_node_run` 校验节点存在且非分组、强制 `enabled=true`，用只含该节点的最小工作流（edges 清空、沿用原 workflow id/name，并把 `skip_existing_processes` 置真以遵循节点的「已存在则跳过」）复用同一执行器，便于调试；不校验整张图，未保存的草稿也能单点运行。节点 id 保持不变，前端按 `run.workflowId + nodeId` 显示状态。
 7. **分组单点执行**：`engine::spawn_group_run` 递归收集分组内所有后代可执行节点（含嵌套组、排除分组节点本身），强制 `enabled=true`，只保留两端都在集合内的边；沿用原 workflow id/name/skip_existing，走同一执行器产生完整运行记录，便于整体调试一个分组。
 8. **分组模式与有效执行图**：`engine::effective_workflow` 在运行时生成副本（不写回）：
-   - **Sequence**：移除该分组管辖的连线，按直接子项在 `nodes` 中的顺序串联（嵌套组作为一个单元递归）；跳过「连线延时」候选 delay 节点；`group_delay_ms > 0` 时在相邻单元间插入合成 Delay 节点（id `group-delay:<group>:<index>`，名称「分组延迟 N ms」）；
-   - **Parallel**：移除组内连线，子项同时启动；
+   - **Sequence**：移除该分组管辖的连线，按直接子项在 `nodes` 中的顺序串联（嵌套组作为一个单元递归）；若直接子分组之间存在显式连线，先做稳定拓扑排序决定这些分组的先后，再串联；跳过「连线延时」候选 delay 节点；`group_delay_ms > 0` 时在相邻单元间插入合成 Delay 节点（id `group-delay:<group>:<index>`，名称「分组延迟 N ms」）；
+   - **Parallel**：移除普通组内连线，子项同时启动；但保留「分组↔分组」连线作为显式依赖。`group_parallel_limit > 0` 时按直接子项切批，每条批次边界生成两个合成节点：`group-parallel:<group>:<boundary>:tick`（Delay = `group_parallel_interval_ms`，节拍从上一批**开始**起算，首批挂在分组开始锚点即第一批的外部前置上）与 `group-parallel:<group>:<boundary>:gate`（Delay = 0，汇合 tick 与上一批全部出口）。因此下一批的实际启动时刻 = max(上一批开始 + interval, 上一批完成)：快批次严格按固定节拍启动，慢批次也不会突破最大并发。合成节点不写入 `run.nodes`，运行历史里看不到；
    - **Graph**：保持原连线。
-   边归属用「两端节点最近公共分组」判定，跨组/顶层边始终保留；`group_mode` 缺省时按 `group_parallel` 推导。`validate_workflow`/运行前校验都基于有效执行图，组内被忽略的连线不会误判为环。
+   边归属用「两端节点最近公共分组」判定，跨组/顶层边始终保留；`group_mode` 缺省时按 `group_parallel` 推导。所有模式处理完后，涉及分组节点的连线统一展开为「源单元出口 → 目标单元入口」的普通边（id `group-link:<源边>:<source>-><target>`），因此分组依赖可被调度、也能被环检测；`validate_workflow`/运行前校验都基于有效执行图。
 9. **进程父进程**：普通启动走 `CreateProcessW + STARTUPINFOEXW`，用 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 把父进程指向当前 shell（`GetShellWindow` 所属 explorer），使工作流启动的进程不挂在 DaemonMan 进程树下；属性列表/句柄失败或 `CREATE_BREAKAWAY_FROM_JOB` 不被允许时按「去 breakaway → 普通 CreateProcess」回退。管理员启动仍由 ShellExecuteEx(runas) 处理。
 10. **已运行检测**：`platform::proc::find_running_app(spec, display_name)` 先解析 `.lnk` 目标与参数；若目标是浏览器（chrome/msedge/brave/chromium/opera/vivaldi）或其代理（`chrome_proxy.exe` / `msedge_proxy.exe` 等），按安装路径判断浏览器归属，并把浏览器本体与代理进程的 pid 都作为窗口归属候选。随后区分两类节点：**浏览器应用**（Chrome/Edge/Edge Beta、Chrome profile 快捷方式）按安装目录 + `--profile-directory` 匹配进程，只有同一 profile 在跑才算已存在；**PWA/Web App**（proxy 快捷方式或带 `--app-id` / `--app=`）必须匹配到对应可见窗口才算存在，普通标签页标题会被过滤。非浏览器节点按「启动目标路径 + 进程命令行第一个参数」匹配，能区分 Sandboxie 等沙箱中的同名 QQ/微信，沙箱目标不会按进程名兜底。无法精确读取命令行 `--app-id` 的情况仍有标题匹配误判可能，取舍为「宁可跳过也不重复开窗」。
 

@@ -70,10 +70,12 @@ import {
   DEFAULT_GROUP_WIDTH,
   GROUP_HEADER,
   GROUP_PADDING,
+  LAYOUT_GRID,
   NODE_HEIGHT,
   NODE_WIDTH,
   computeAutoLayout,
   computeGroupPlans,
+  snapToGrid,
 } from "./layout";
 import { nodeKindMeta, nodeKindOrder } from "./meta";
 import WorkflowGroupNode from "./nodes/WorkflowGroupNode.vue";
@@ -81,7 +83,9 @@ import WorkflowNodeCard from "./nodes/WorkflowNodeCard.vue";
 import {
   errorText,
   compactAncestorOf,
+  groupDepthOf,
   groupModeOf,
+  groupZIndexOf,
   isCompactGroup,
 } from "./shared";
 import {
@@ -211,7 +215,12 @@ const DELETE_KEYS = ["Delete", "Backspace"];
 // 吸附（snap 16px，默认开启，localStorage 记忆）
 // ---------------------------------------------------------------------------
 const SNAP_STORAGE_KEY = "daemon-man-workflow-snap";
-const SNAP_GRID: [number, number] = [16, 16];
+const SNAP_GRID: [number, number] = [LAYOUT_GRID, LAYOUT_GRID];
+
+/** 向上取整到网格（包围盒用，保证吸附后仍完整包住内容）。 */
+function ceilToGrid(value: number): number {
+  return Math.ceil(value / LAYOUT_GRID) * LAYOUT_GRID;
+}
 
 function readSnapPreference(): boolean {
   try {
@@ -272,15 +281,23 @@ let lastRouteAt = 0;
 function computeRoutesNow() {
   if (routingDisabled) return;
   lastRouteAt = performance.now();
-  const nodes = getNodes.value
-    .filter((node) => node.type !== "group")
-    .map((node) => ({
+  // 分组容器也作为路由节点传进去：既是障碍物，也让 group↔group 边能拿到锚点。
+  // 分组尺寸用 Vue Flow 实测值（含组头），取不到时回落到默认分组尺寸。
+  const nodes = getNodes.value.map((node) => {
+    const isGroup = node.type === "group";
+    const width = node.dimensions.width;
+    const height = node.dimensions.height;
+    return {
       id: node.id,
       x: node.position.x,
       y: node.position.y,
-      width: node.dimensions.width > 0 ? node.dimensions.width : NODE_WIDTH,
-      height: node.dimensions.height > 0 ? node.dimensions.height : NODE_HEIGHT,
-    }));
+      width:
+        width > 0 ? width : isGroup ? DEFAULT_GROUP_WIDTH : NODE_WIDTH,
+      height:
+        height > 0 ? height : isGroup ? DEFAULT_GROUP_HEIGHT : NODE_HEIGHT,
+      ...(isGroup ? { isGroup: true, headerHeight: GROUP_HEADER } : {}),
+    };
+  });
   if (nodes.length === 0) {
     if (edgeRoutes.value.size > 0) edgeRoutes.value = new Map();
     return;
@@ -554,12 +571,25 @@ function syncFlowNodeTypes() {
       continue;
     }
     if (!current) {
-      addNodes(buildFlowNode(node));
+      addNodes(
+        buildFlowNode(
+          node,
+          undefined,
+          node.kind === "group" ? groupDepthOf(node, draft.nodes) : 0,
+        ),
+      );
       restored = true;
       continue;
     }
     if (current.type !== node.kind) {
       updateNode(node.id, { type: node.kind });
+    }
+    // 分组 zIndex 按嵌套深度分层：外层低、内层高，保证内层组头不被外层容器遮挡。
+    if (node.kind === "group") {
+      const zIndex = groupZIndexOf(node, draft.nodes);
+      if (current.zIndex !== zIndex) {
+        updateNode(node.id, { zIndex });
+      }
     }
   }
   if (restored) scheduleGroupGeometry();
@@ -734,11 +764,14 @@ function computeGroupBoxes(): Map<string, GroupBox> {
       maxY = Math.max(maxY, box.y + box.height);
     }
 
+    // 分组包围盒同样吸附到 16px 网格：组边框、组头也要落在点阵上，
+    // 否则「子节点对齐了、组边框还歪着」看起来仍然不整齐。
+    // 尺寸向上取整到网格，保证吸附后仍然完整包住子节点。
     const box: GroupBox = {
-      x: Math.round(minX - GROUP_PADDING),
-      y: Math.round(minY - GROUP_HEADER - GROUP_PADDING),
-      width: Math.round(maxX - minX + GROUP_PADDING * 2),
-      height: Math.round(maxY - minY + GROUP_HEADER + GROUP_PADDING * 2),
+      x: snapToGrid(minX - GROUP_PADDING),
+      y: snapToGrid(minY - GROUP_HEADER - GROUP_PADDING),
+      width: ceilToGrid(maxX - minX + GROUP_PADDING * 2),
+      height: ceilToGrid(maxY - minY + GROUP_HEADER + GROUP_PADDING * 2),
     };
     resolving.delete(group.id);
     result.set(group.id, box);
@@ -1366,7 +1399,11 @@ function rebuildFromDraft(next: Workflow | null) {
     ...visibleNodes.filter((node) => node.kind !== "group"),
   ];
   flowNodes.value = orderedNodes.map((node) =>
-    buildFlowNode(node, initialBoxes.get(node.id)),
+    buildFlowNode(
+      node,
+      initialBoxes.get(node.id),
+      node.kind === "group" ? groupDepthOf(node, next.nodes) : 0,
+    ),
   );
   applyTopology(next);
   flowEdges.value = buildEdgesFor(next);
@@ -1466,6 +1503,27 @@ function onConnect(connection: Connection) {
   if (!current) return;
   const { source, target } = connection;
   if (!source || !target || source === target) return;
+
+  const sourceNode = current.nodes.find((node) => node.id === source);
+  const targetNode = current.nodes.find((node) => node.id === target);
+  if (!sourceNode || !targetNode) return;
+
+  // 分组之间允许连线，但必须「同为分组」且「同一父分组」（顶层均为 null 也允许）。
+  const sourceIsGroup = sourceNode.kind === "group";
+  const targetIsGroup = targetNode.kind === "group";
+  if (sourceIsGroup || targetIsGroup) {
+    if (!(sourceIsGroup && targetIsGroup)) {
+      ui.notify("warn", t("workflow.groupEdgeOnlyBetweenGroups"));
+      return;
+    }
+    const sourceParent = sourceNode.parentId ?? null;
+    const targetParent = targetNode.parentId ?? null;
+    if (sourceParent !== targetParent) {
+      ui.notify("warn", t("workflow.groupEdgeSameParentOnly"));
+      return;
+    }
+  }
+
   if (current.edges.some((edge) => edge.source === source && edge.target === target)) {
     ui.notify("info", t("workflow.edgeDuplicate"));
     return;
@@ -1511,9 +1569,46 @@ function onEdgeClick(event: EdgeMouseEvent) {
 }
 
 /** Vue Flow 内置删除（Delete / Backspace）只会改内部 state，这里同步回 draft。 */
+/** 每个节点上一次的实测尺寸：量测阶段会连发多次 dimensions 变更，只在真正变化时重算。 */
+const lastMeasuredSize = new Map<string, string>();
+/** 每个节点上一次的画布坐标：紧凑网格重排、分组几何修正这类「程序化挪动」不走拖拽路径，
+ *  不在这里补触发的话，路由仍按旧位置算端口，箭头就会落偏 1–3px。 */
+const lastFlowPosition = new Map<string, string>();
+
 function onNodesChange(changes: NodeChange[]) {
   const current = store.draft;
   if (!current) return;
+
+  // 尺寸量测完成 / 变化：端口锚点与分组包围盒都依赖实测宽高。不重算的话，
+  // 路由会一直用 NODE_HEIGHT 这类占位尺寸，箭头就落不到卡片两侧的圆点上
+  // （首帧量测前算过一次，量测完成后必须补一次）。
+  let sizeChanged = false;
+  for (const change of changes) {
+    if (change.type !== "dimensions") continue;
+    const dimensions = change.dimensions ?? findNode(change.id)?.dimensions;
+    const width = Math.round(dimensions?.width ?? 0);
+    const height = Math.round(dimensions?.height ?? 0);
+    if (width <= 0 || height <= 0) continue;
+    const key = `${width}x${height}`;
+    if (lastMeasuredSize.get(change.id) === key) continue;
+    lastMeasuredSize.set(change.id, key);
+    sizeChanged = true;
+  }
+  let positionChanged = false;
+  for (const change of changes) {
+    if (change.type !== "position") continue;
+    const position = change.position ?? findNode(change.id)?.position;
+    if (!position) continue;
+    const key = `${Math.round(position.x * 2) / 2},${Math.round(position.y * 2) / 2}`;
+    if (lastFlowPosition.get(change.id) === key) continue;
+    lastFlowPosition.set(change.id, key);
+    positionChanged = true;
+  }
+  if (sizeChanged || positionChanged) scheduleEdgeRouting();
+  // 注意：这里不能再调 scheduleGroupGeometry()——分组高度变化本身也会触发
+  // dimensions 变更，重算 → updateNode → 再触发，会和紧凑网格重排形成 606/613
+  // 来回震荡的反馈环。分组几何由自动排列、拖拽、运行状态等既有路径负责。
+
   const removedIds = changes
     .filter((change): change is NodeRemoveChange => change.type === "remove")
     .map((change) => change.id);
@@ -2004,7 +2099,7 @@ defineExpose({
         <WorkflowEdgeLine v-bind="edgeProps" />
       </template>
 
-      <Background :gap="18" :size="1" :pattern-color="gridColor" />
+      <Background :gap="SNAP_GRID[0]" :size="1" :pattern-color="gridColor" />
 
       <!-- 节点面板 -->
       <Panel

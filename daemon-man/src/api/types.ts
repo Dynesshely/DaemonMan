@@ -108,6 +108,10 @@ export interface WorkflowNode {
   groupMode: GroupMode | null;
   /** 分组级延迟：顺序模式下应用于组内相邻节点之间，覆盖组内连线延时 */
   groupDelayMs: number;
+  /** 并行分组每批最多同时启动的子项数；0 = 不限制 */
+  groupParallelLimit: number;
+  /** 并行分组批次之间的间隔毫秒 */
+  groupParallelIntervalMs: number;
   /** 顺序分组是否简洁展示（紧凑换行、隐藏组内连线、拖拽排序） */
   groupCompact: boolean;
 }

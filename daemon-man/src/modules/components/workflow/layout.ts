@@ -14,22 +14,33 @@ export const NODE_WIDTH = 224;
 export const NODE_HEIGHT = 68;
 
 /** 分组容器内边距 / 标题栏高度。 */
-export const GROUP_PADDING = 24;
-export const GROUP_HEADER = 30;
+// 内边距 / 组头高度都取 16 的倍数：分组包围盒与内部子节点才能同时落在点阵上。
+export const GROUP_PADDING = 32;
+export const GROUP_HEADER = 32;
 
 /** 空分组（还没有子项）的默认尺寸。 */
 export const DEFAULT_GROUP_WIDTH = 240;
 export const DEFAULT_GROUP_HEIGHT = 120;
 
 /** 分组内网格（简洁顺序 / 并行）：cell 间留出连线通道。 */
-const GRID_GAP_X = 44;
-const GRID_GAP_Y = 40;
+// 网格步长 = NODE_WIDTH + GRID_GAP_X / NODE_HEIGHT + GRID_GAP_Y，取 16 的倍数，
+// 这样紧凑网格的每一行每一列都正好是整格，吸附不会把间距抹成 32/48 交替。
+const GRID_GAP_X = 48;
+const GRID_GAP_Y = 44;
 
 /** 自动排列顶层的基础间距 / 原点。 */
 export const LAYOUT_COLUMN_GAP = 80;
-export const LAYOUT_ROW_GAP = 24;
+export const LAYOUT_ROW_GAP = 32;
 export const LAYOUT_ORIGIN_X = 80;
-export const LAYOUT_ORIGIN_Y = 60;
+export const LAYOUT_ORIGIN_Y = 64;
+
+/** 画布网格步长，必须与 WorkflowCanvas 的 SNAP_GRID 一致。 */
+export const LAYOUT_GRID = 16;
+
+/** 把坐标吸附到画布网格。 */
+export function snapToGrid(value: number): number {
+  return Math.round(value / LAYOUT_GRID) * LAYOUT_GRID;
+}
 
 /** 思维导图：层间横向间距 / 兄弟子树纵向间距 / 多个根之间。 */
 // 列间距要能容纳 88px 宽的延时药丸标签（居中后两侧仍有空隙）。
@@ -47,11 +58,20 @@ const TREE_NO_WRAP_MAX_ASPECT = 2.6;
 /** 层数太少的短链不折行（折了反而破坏父子从左到右的直觉）。 */
 const MIN_WRAP_LEVELS = 4;
 
-/** 顶层多棵「根树」排布：行内间距 / 行间距 / 最多几行 / 目标宽高比。 */
-const TOP_TREE_GAP = 96;
-const TOP_ROW_GAP = 72;
-const TOP_MAX_ROWS = 6;
-const TARGET_ASPECT = 1.9;
+/**
+ * 顶层多棵「根树」排布：
+ * - 顶层单元（分组超级节点 / 未分组节点）先按思维导图拆成独立的根树；
+ * - 根树再按「行 / 列」做二维打包：穷举连续分行方案（或按目标宽度分行），
+ *   同时尝试按高度/面积的自由排序与 masonry 列打包，取空白最少且宽高比接近目标的方案；
+ * - 树之间有连线时保持结构顺序（不重排），完全独立的树允许重排。
+ */
+const TOP_TREE_GAP = 72;
+const TOP_ROW_GAP = 56;
+const TOP_TARGET_ASPECT = 1.8;
+/** 顶层最多尝试的行数（仅用于兜底排版，不再是硬性上限）。 */
+const TOP_MAX_ROWS = 8;
+/** 根树数量不超过该值时穷举全部分行方案；超过则用目标宽度贪心。 */
+const TOP_EXHAUSTIVE_TREES = 14;
 
 export interface GroupSize {
   width: number;
@@ -848,9 +868,303 @@ export function computeGroupPlans(
   return plans;
 }
 
+// ---------------------------------------------------------------------------
+// 顶层根树打包
+//
+// 每棵根树是一个矩形的「超级单元」。旧实现只按「行数均分」切行，行内顶部对齐，
+// 行高取该行最高树，导致矮树下方留下大块空白、分组/树之间出现长距离空隙。
+// 这里改成二维打包搜索：
+// - 行打包：穷举「连续分段」方案（树数量大时按目标宽度贪心 + 均分行数兜底），
+//   同时尝试按高度/宽度/面积排序（仅当树之间没有连线时允许重排）；
+// - 列打包：同样的连续分段，竖排成列（适合一批扁宽树）；
+// - masonry：按固定行数/列数「填最短的一行/列」，进一步压掉行高不齐的空白。
+// 评分 = 宽高比偏差 + 空白率（未被树覆盖的 bbox 面积）+ 轻微行/列数惩罚。
+// ---------------------------------------------------------------------------
+
+interface TreePlacement {
+  tree: ForestTree;
+  x: number;
+  y: number;
+}
+
+interface PackedForest {
+  placements: TreePlacement[];
+  width: number;
+  height: number;
+  rows: number;
+  columns: number;
+  whitespace: number;
+  aspect: number;
+}
+
+/** 树的面积（按自身 bbox），用于空白率估算。 */
+function treeArea(tree: ForestTree): number {
+  return Math.max(1, tree.width) * Math.max(1, tree.height);
+}
+
+function measurePlacements(
+  placements: TreePlacement[],
+  rows: number,
+  columns: number,
+): PackedForest {
+  let width = 0;
+  let height = 0;
+  let covered = 0;
+  for (const placement of placements) {
+    width = Math.max(width, placement.x + placement.tree.width);
+    height = Math.max(height, placement.y + placement.tree.height);
+    covered += treeArea(placement.tree);
+  }
+  const area = Math.max(1, width) * Math.max(1, height);
+  return {
+    placements,
+    width,
+    height,
+    rows,
+    columns,
+    whitespace: Math.max(0, 1 - covered / area),
+    aspect: width / Math.max(1, height),
+  };
+}
+
+/** 按行放置：breaks 是每行包含的树数量（顺序连续）。 */
+function placeRows(order: ForestTree[], breaks: number[]): PackedForest {
+  const placements: TreePlacement[] = [];
+  let cursor = 0;
+  let y = 0;
+  let rowCount = 0;
+  for (const count of breaks) {
+    if (count <= 0) continue;
+    const rowTrees = order.slice(cursor, cursor + count);
+    if (rowTrees.length === 0) continue;
+    cursor += count;
+    rowCount += 1;
+    let x = 0;
+    let rowHeight = 0;
+    for (const tree of rowTrees) {
+      placements.push({ tree, x, y });
+      x += tree.width + TOP_TREE_GAP;
+      rowHeight = Math.max(rowHeight, tree.height);
+    }
+    y += rowHeight + TOP_ROW_GAP;
+  }
+  return measurePlacements(placements, rowCount, 0);
+}
+
+/** 按列放置：breaks 是每列包含的树数量（顺序连续）。 */
+function placeColumns(order: ForestTree[], breaks: number[]): PackedForest {
+  const placements: TreePlacement[] = [];
+  let cursor = 0;
+  let x = 0;
+  let columnCount = 0;
+  for (const count of breaks) {
+    if (count <= 0) continue;
+    const columnTrees = order.slice(cursor, cursor + count);
+    if (columnTrees.length === 0) continue;
+    cursor += count;
+    columnCount += 1;
+    let y = 0;
+    let columnWidth = 0;
+    for (const tree of columnTrees) {
+      placements.push({ tree, x, y });
+      y += tree.height + TOP_ROW_GAP;
+      columnWidth = Math.max(columnWidth, tree.width);
+    }
+    x += columnWidth + TOP_TREE_GAP;
+  }
+  return measurePlacements(placements, 0, columnCount);
+}
+
+/** masonry 行：固定行数，依次把树放进当前累计宽度最短的一行。 */
+function placeMasonryRows(order: ForestTree[], rowCount: number): PackedForest {
+  const count = Math.max(1, Math.min(rowCount, order.length));
+  const rows: TreePlacement[][] = Array.from({ length: count }, () => []);
+  const widths = new Array<number>(count).fill(0);
+  for (const tree of order) {
+    let target = 0;
+    for (let index = 1; index < count; index += 1) {
+      if (widths[index] < widths[target] - 1e-6) target = index;
+    }
+    widths[target] += tree.width + TOP_TREE_GAP;
+    rows[target].push({ tree, x: 0, y: 0 });
+  }
+  const placements: TreePlacement[] = [];
+  let y = 0;
+  for (const row of rows) {
+    let x = 0;
+    let rowHeight = 0;
+    for (const item of row) {
+      placements.push({ tree: item.tree, x, y });
+      x += item.tree.width + TOP_TREE_GAP;
+      rowHeight = Math.max(rowHeight, item.tree.height);
+    }
+    y += rowHeight + TOP_ROW_GAP;
+    widths.push(x);
+  }
+  return measurePlacements(placements, count, 0);
+}
+
+/** masonry 列：固定列数，依次把树放进当前累计高度最短的一列。 */
+function placeMasonryColumns(order: ForestTree[], columnCount: number): PackedForest {
+  const count = Math.max(1, Math.min(columnCount, order.length));
+  const columns: TreePlacement[][] = Array.from({ length: count }, () => []);
+  const heights = new Array<number>(count).fill(0);
+  for (const tree of order) {
+    let target = 0;
+    for (let index = 1; index < count; index += 1) {
+      if (heights[index] < heights[target] - 1e-6) target = index;
+    }
+    heights[target] += tree.height + TOP_ROW_GAP;
+    columns[target].push({ tree, x: 0, y: 0 });
+  }
+  const placements: TreePlacement[] = [];
+  let x = 0;
+  for (const column of columns) {
+    let y = 0;
+    let columnWidth = 0;
+    for (const item of column) {
+      placements.push({ tree: item.tree, x, y });
+      y += item.tree.height + TOP_ROW_GAP;
+      columnWidth = Math.max(columnWidth, item.tree.width);
+    }
+    x += columnWidth + TOP_TREE_GAP;
+  }
+  return measurePlacements(placements, 0, count);
+}
+
+/** 枚举把 count 个元素切成若干连续段的全部方案（段数不定）。 */
+function* allPartitions(count: number): Generator<number[]> {
+  if (count <= 0) {
+    yield [];
+    return;
+  }
+  const buffer: number[] = [];
+  function* walk(remaining: number): Generator<number[]> {
+    if (remaining === 0) {
+      yield [...buffer];
+      return;
+    }
+    for (let take = 1; take <= remaining; take += 1) {
+      buffer.push(take);
+      yield* walk(remaining - take);
+      buffer.pop();
+    }
+  }
+  yield* walk(count);
+}
+
+function partitionScore(packed: PackedForest): number {
+  const aspect = Math.max(0.05, packed.aspect);
+  const aspectPenalty = Math.abs(Math.log(aspect / TOP_TARGET_ASPECT));
+  // 极端宽/高再额外惩罚：避免 4:1 或 0.6:1 这类难看的图。
+  const extreme =
+    aspect > 3.4 ? (aspect - 3.4) * 0.6 : aspect < 0.85 ? (0.85 - aspect) * 0.9 : 0;
+  const rowsPenalty = Math.max(0, packed.rows - 1) * 0.015;
+  const columnsPenalty = Math.max(0, packed.columns - 1) * 0.01;
+  // 空白权重高于宽高比：用户反馈「分组/树之间大块空白」比「必须 16:9」更刺眼，
+  // 只要整体仍在 1.4–2.4 的 landscape 区间内即可。
+  return aspectPenalty * 1.3 + packed.whitespace * 3.4 + extreme + rowsPenalty + columnsPenalty;
+}
+
+/** 大的树先排，让行/列更容易均衡；仅在树之间无连线时允许。 */
+function sortTrees(trees: ForestTree[], by: "height" | "width" | "area"): ForestTree[] {
+  const value = (tree: ForestTree) =>
+    by === "height" ? tree.height : by === "width" ? tree.width : treeArea(tree);
+  return [...trees].sort(
+    (left, right) =>
+      value(right) - value(left) || left.rootId.localeCompare(right.rootId),
+  );
+}
+
+/**
+ * 顶层根树打包：返回每棵树相对左上角的坐标。
+ * `hasCrossTreeEdges = true` 时保持原始结构顺序（不重排，保证依赖方向可读）。
+ */
+function packForestTrees(
+  trees: ForestTree[],
+  hasCrossTreeEdges: boolean,
+): PackedForest {
+  if (trees.length === 0) {
+    return {
+      placements: [],
+      width: 0,
+      height: 0,
+      rows: 0,
+      columns: 0,
+      whitespace: 0,
+      aspect: 1,
+    };
+  }
+
+  const orders: ForestTree[][] = [trees];
+  if (!hasCrossTreeEdges && trees.length > 1) {
+    orders.push(sortTrees(trees, "height"));
+    orders.push(sortTrees(trees, "area"));
+    orders.push(sortTrees(trees, "width"));
+  }
+
+  let best: PackedForest | null = null;
+  const consider = (candidate: PackedForest) => {
+    if (candidate.placements.length === 0) return;
+    if (!best || partitionScore(candidate) < partitionScore(best) - 1e-9) {
+      best = candidate;
+    }
+  };
+
+  for (const order of orders) {
+    if (order.length <= TOP_EXHAUSTIVE_TREES) {
+      for (const breaks of allPartitions(order.length)) {
+        consider(placeRows(order, breaks));
+        consider(placeColumns(order, breaks));
+      }
+    } else {
+      // 树太多时：均分行数 + 按目标宽度贪心切分。
+      const totalArea = order.reduce((sum, tree) => sum + treeArea(tree), 0);
+      const baseWidth = Math.sqrt(totalArea * TOP_TARGET_ASPECT);
+      const targets = [0.55, 0.7, 0.85, 1, 1.15, 1.3, 1.5, 1.8].map(
+        (scale) => baseWidth * scale,
+      );
+      for (let rowCount = 1; rowCount <= Math.min(TOP_MAX_ROWS, order.length); rowCount += 1) {
+        const base = Math.floor(order.length / rowCount);
+        const extra = order.length % rowCount;
+        const breaks: number[] = [];
+        for (let row = 0; row < rowCount; row += 1) {
+          breaks.push(base + (row < extra ? 1 : 0));
+        }
+        consider(placeRows(order, breaks));
+      }
+      for (const target of targets) {
+        const breaks: number[] = [];
+        let current = 0;
+        let width = 0;
+        for (const tree of order) {
+          if (current > 0 && width + tree.width + TOP_TREE_GAP > target) {
+            breaks.push(current);
+            current = 0;
+            width = 0;
+          }
+          current += 1;
+          width += tree.width + TOP_TREE_GAP;
+        }
+        if (current > 0) breaks.push(current);
+        consider(placeRows(order, breaks));
+        consider(placeColumns(order, breaks));
+      }
+    }
+
+    // masonry：固定行/列数，填最空的一行/列。
+    for (let count = 1; count <= Math.min(TOP_MAX_ROWS, order.length); count += 1) {
+      consider(placeMasonryRows(order, count));
+      consider(placeMasonryColumns(order, count));
+    }
+  }
+
+  // 兜底：至少按「每棵树一行」放置（正常搜索一定能产出更优解）。
+  return best ?? placeRows(trees, trees.map(() => 1));
+}
+
 /** 只取尺寸（画布需要根据分组计划更新容器外框）。 */
-export function computeGroupSizes(
-  nodes: WorkflowNode[],
+export function computeGroupSizes(  nodes: WorkflowNode[],
   edges: WorkflowEdge[] = [],
 ): Map<string, GroupSize> {
   const sizes = new Map<string, GroupSize>();
@@ -921,78 +1235,32 @@ function computeAutoLayoutCore(
 
   const forest = layoutUnitForest(topLevel, pairs, sizeOf, compare);
 
-  // 多棵根树排布：逐行数（1..6）尝试「均分换行」，取整体宽高比最接近目标的方案。
-  // 单棵树已经过列折行，这里主要处理多棵树/多分组的横向拼排。
-  const trees = forest.trees;
-
-  const packBalanced = (rowCount: number): ForestTree[][] => {
-    // 均分行数：每行树数量尽量相同，避免贪心在最后一行堆成超宽行。
-    const rows: ForestTree[][] = [];
-    const base = Math.floor(trees.length / rowCount);
-    const extra = trees.length % rowCount;
-    let index = 0;
-    for (let row = 0; row < rowCount; row += 1) {
-      const count = base + (row < extra ? 1 : 0);
-      if (count <= 0) continue;
-      rows.push(trees.slice(index, index + count));
-      index += count;
-    }
-    return rows;
-  };
-
-  const measureRows = (rows: ForestTree[][]) => {
-    let width = 0;
-    let height = 0;
-    rows.forEach((rowTrees, index) => {
-      let rowWidth = 0;
-      let rowHeight = 0;
-      rowTrees.forEach((tree, treeIndex) => {
-        if (treeIndex > 0) rowWidth += TOP_TREE_GAP;
-        rowWidth += tree.width;
-        rowHeight = Math.max(rowHeight, tree.height);
-      });
-      width = Math.max(width, rowWidth);
-      if (index > 0) height += TOP_ROW_GAP;
-      height += rowHeight;
-    });
-    return { width, height };
-  };
-
-  let rows = packBalanced(1);
-  let bestScore = Number.POSITIVE_INFINITY;
-  const rowLimit = Math.min(TOP_MAX_ROWS, Math.max(1, trees.length));
-  for (let rowCount = 1; rowCount <= rowLimit; rowCount += 1) {
-    const candidate = packBalanced(rowCount);
-    const bounds = measureRows(candidate);
-    const aspect = bounds.height > 0
-      ? bounds.width / bounds.height
-      : Number.POSITIVE_INFINITY;
-    const score = Math.abs(aspect - TARGET_ASPECT);
-    if (score < bestScore) {
-      bestScore = score;
-      rows = candidate;
+  // 顶层根树是否存在「跨树连线」：没有连线时允许重排/列打包（纯二维装箱），
+  // 有连线时保持结构顺序，保证依赖方向可读。
+  const treeOfNode = new Map<string, number>();
+  forest.trees.forEach((tree, index) => {
+    for (const id of tree.nodes) treeOfNode.set(id, index);
+  });
+  let hasCrossTreeEdges = false;
+  for (const [source, target] of pairs) {
+    if (treeOfNode.get(source) !== treeOfNode.get(target)) {
+      hasCrossTreeEdges = true;
+      break;
     }
   }
+  const packed = packForestTrees(forest.trees, hasCrossTreeEdges);
 
   const positions = new Map<string, NodePosition>();
-  let rowTop = LAYOUT_ORIGIN_Y;
-  for (const rowTrees of rows) {
-    if (rowTrees.length === 0) continue;
-    let rowX = LAYOUT_ORIGIN_X;
-    let rowHeight = 0;
-    for (const tree of rowTrees) {
-      for (const id of tree.nodes) {
-        const position = forest.positions.get(id);
-        if (!position) continue;
-        positions.set(id, {
-          x: Math.round(rowX + position.x - tree.minX),
-          y: Math.round(rowTop + position.y),
-        });
-      }
-      rowX += tree.width + TOP_TREE_GAP;
-      rowHeight = Math.max(rowHeight, tree.height);
+  for (const placement of packed.placements) {
+    const tree = placement.tree;
+    for (const id of tree.nodes) {
+      const position = forest.positions.get(id);
+      if (!position) continue;
+      positions.set(id, {
+        x: Math.round(LAYOUT_ORIGIN_X + placement.x + position.x - tree.minX),
+        y: Math.round(LAYOUT_ORIGIN_Y + placement.y + position.y),
+      });
     }
-    rowTop += rowHeight + TOP_ROW_GAP;
   }
 
   // 分组内部：按计划把直接子项递归展开到最终坐标。
@@ -1017,5 +1285,18 @@ function computeAutoLayoutCore(
   };
 
   for (const unit of topLevel) expand(unit.id);
+
+  // 吸附到画布网格（与 WorkflowCanvas 的 SNAP_GRID 一致）：布局内部的常量
+  // （原点 60、内边距 24、行距 40 …）都不是 16 的倍数，若不吸附，自动排列出来的
+  // 节点会落在点阵网格之间，和手动拖动（按 16px 吸附）的观感不一致。
+  for (const [id, position] of result) {
+    const snapped = {
+      x: snapToGrid(position.x),
+      y: snapToGrid(position.y),
+    };
+    if (snapped.x !== position.x || snapped.y !== position.y) {
+      result.set(id, snapped);
+    }
+  }
   return result;
 }

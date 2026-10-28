@@ -68,3 +68,28 @@ export function compactAncestorOf(
   }
   return null;
 }
+
+/**
+ * 分组的嵌套深度（顶层分组 = 0）：沿 parentId 数上方分组层数，成环时停止。
+ * 用于画布 zIndex 分层（外层低、内层高）。
+ */
+export function groupDepthOf(node: WorkflowNode, nodes: WorkflowNode[]): number {
+  const byId = new Map(nodes.map((item) => [item.id, item]));
+  const seen = new Set<string>([node.id]);
+  let depth = 0;
+  let current = node.parentId ? byId.get(node.parentId) : null;
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    if (current.kind === "group") depth += 1;
+    current = current.parentId ? byId.get(current.parentId) : null;
+  }
+  return depth;
+}
+
+/**
+ * 分组节点的画布 zIndex：按嵌套深度分层（外层更负、内层更大），
+ * 但始终 < 0，保证分组背景永远在普通卡片（zIndex 0）下方。
+ */
+export function groupZIndexOf(node: WorkflowNode, nodes: WorkflowNode[]): number {
+  return groupDepthOf(node, nodes) - 1000;
+}

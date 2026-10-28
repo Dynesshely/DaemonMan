@@ -465,6 +465,7 @@ onBeforeUnmount(() => {
         >
           <WorkflowCanvas
             v-if="draft && viewMode === 'nodes'"
+            :key="draft.id"
             ref="canvasRef"
             class="h-full flex-1"
             :selected-node-id="selectedNodeId"

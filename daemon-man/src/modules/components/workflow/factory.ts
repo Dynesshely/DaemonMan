@@ -68,6 +68,8 @@ export function createWorkflowNode(
     groupParallel: false,
     groupMode: null,
     groupDelayMs: 0,
+    groupParallelLimit: 0,
+    groupParallelIntervalMs: 0,
     groupCompact: true,
   };
 }
@@ -76,6 +78,7 @@ export function createWorkflowNode(
 export function buildFlowNode(
   node: WorkflowNode,
   groupSize?: { width: number; height: number },
+  groupDepth = 0,
 ): Node<FlowNodeData> {
   const base: Node<FlowNodeData> = {
     id: node.id,
@@ -87,17 +90,17 @@ export function buildFlowNode(
   if (node.kind !== "group") return base;
 
   // 分组节点是可拖动的容器背景：拖动时整组（含嵌套后代）跟随平移。
-  // 子节点在层级与 DOM 顺序上都位于分组之上，所以分组不会遮挡子节点交互。
+  // zIndex 按嵌套深度分层（外层低、内层高，全部 < 0），保证内层组头不被外层容器遮挡，
+  // 同时所有分组仍在普通卡片（zIndex 0）下方。
   const width = groupSize?.width ?? DEFAULT_GROUP_WIDTH;
   const height = groupSize?.height ?? DEFAULT_GROUP_HEIGHT;
   return {
     ...base,
     width,
     height,
-    // 置底：保证后创建的分组也不会盖住已有子节点（分组只是背景容器）。
-    zIndex: -1,
+    zIndex: groupDepth - 1000,
     draggable: true,
-    connectable: false,
+    connectable: true,
     selectable: true,
     style: {
       width: `${width}px`,
@@ -139,6 +142,8 @@ export function buildFlowEdge(
     source: edge.source,
     target: edge.target,
     type: "workflow",
+    // 固定 0：分组节点的 zIndex 为负，不能让分组间连线继承负值而沉到画布下面。
+    zIndex: 0,
     data: {
       edge,
       flow,

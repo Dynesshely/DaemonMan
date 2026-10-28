@@ -86,6 +86,9 @@ fn normalize(mut workflow: Workflow) -> Workflow {
             node.group_mode = Some(mode);
             node.group_parallel = mode == GroupMode::Parallel;
             node.group_delay_ms = node.group_delay_ms.min(600_000);
+            node.group_parallel_limit = node.group_parallel_limit.min(1_000);
+            node.group_parallel_interval_ms =
+                node.group_parallel_interval_ms.min(600_000);
         }
     }
 

@@ -54,6 +54,7 @@ const groupMode = computed<GroupMode>({
   set: (value) => applyGroupMode(props.node, value),
 });
 const isSequenceGroup = computed(() => groupMode.value === "sequence");
+const isParallelGroup = computed(() => groupMode.value === "parallel");
 
 const argsText = computed({
   get: () => props.node.app.args.join("\n"),
@@ -419,6 +420,24 @@ async function testLaunch() {
             v-model="props.node.groupDelayMs"
             :label="t('node.groupDelay')"
             :hint="t('node.groupDelayHint')"
+            :min="0"
+            :max="600000"
+            :step="100"
+          />
+        </template>
+        <template v-if="isParallelGroup">
+          <NumberField
+            v-model="props.node.groupParallelLimit"
+            :label="t('node.groupParallelLimit')"
+            :hint="t('node.groupParallelLimitHint')"
+            :min="0"
+            :max="1000"
+            :step="1"
+          />
+          <NumberField
+            v-model="props.node.groupParallelIntervalMs"
+            :label="t('node.groupParallelIntervalMs')"
+            :hint="t('node.groupParallelIntervalHint')"
             :min="0"
             :max="600000"
             :step="100"

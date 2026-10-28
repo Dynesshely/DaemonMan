@@ -152,14 +152,54 @@ pub async fn wait_for_window(
     proc::wait_for_window(process_name, require_visible, timeout, cancel).await
 }
 
+/// 等待指定目标（按命令行/exe 路径匹配）的窗口出现。
+pub async fn wait_for_target_window(
+    target: &str,
+    require_visible: bool,
+    timeout: Duration,
+    cancel: &Arc<AtomicBool>,
+) -> bool {
+    proc::wait_for_target_window(target, require_visible, timeout, cancel).await
+}
+
 /// 向主窗口发送 WM_CLOSE。
 pub fn close_main_window(process_name: &str) -> bool {
     proc::close_main_window(process_name)
 }
 
+/// 等待指定 pid 的窗口出现。
+pub async fn wait_for_pid_window(
+    pid: u32,
+    require_visible: bool,
+    timeout: Duration,
+    cancel: &Arc<AtomicBool>,
+) -> bool {
+    proc::wait_for_pid_window(pid, require_visible, timeout, cancel).await
+}
+
+/// 向指定 pid 的主窗口发送 WM_CLOSE。
+pub fn close_window_for_pid(pid: u32) -> bool {
+    proc::close_window_for_pid(pid)
+}
+
+/// 把指定 pid 的主窗口置前。
+pub fn focus_window_for_pid(pid: u32) -> bool {
+    proc::focus_window_for_pid(pid)
+}
+
+/// 向指定启动目标的主窗口发送 WM_CLOSE。
+pub fn close_target_main_window(target: &str) -> bool {
+    proc::close_target_main_window(target)
+}
+
 /// 把主窗口置前。
 pub fn focus_main_window(process_name: &str) -> bool {
     proc::focus_main_window(process_name)
+}
+
+/// 把指定启动目标的主窗口置前。
+pub fn focus_target_main_window(target: &str) -> bool {
+    proc::focus_target_main_window(target)
 }
 
 /// 提取文件图标（PNG data URL）；失败返回 None。

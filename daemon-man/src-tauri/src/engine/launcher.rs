@@ -3,7 +3,8 @@
 //! 负责：已运行则跳过、启动、启动后缓冲、等待主窗口、关闭启动画面、置前窗口。
 //! 「已运行则跳过」由调用方传入**有效开关**（`workflow.skip_existing_processes
 //! && spec.skip_if_running`），为 false 时必定真正启动、且不会发起任何检测；
-//! 检测走 `platform::proc::find_running_app`（普通应用按进程名，浏览器 PWA 按可见窗口标题）。
+//! 检测走 `platform::proc::find_running_app`（普通应用按启动目标路径/命令行匹配，
+//! 浏览器 PWA 按可见窗口标题，浏览器 profile 按 `--profile-directory` 区分）。
 //! 所有分支都会给出中文 `message`，失败时返回带上下文的 `Err`。
 
 use std::sync::atomic::AtomicBool;
@@ -43,6 +44,11 @@ pub async fn launch_spec(
     }
 
     let process_name = resolve_process_name(spec);
+    let target_path = proc::resolve_path(&spec.path)
+        .unwrap_or_else(|| spec.path.trim().trim_matches('"').to_string());
+    let target_usable = !target_path.is_empty()
+        && !target_path.to_ascii_lowercase().contains("://")
+        && !target_path.to_ascii_lowercase().starts_with("shell:");
     // 消息里优先用节点显示名，没有时退回进程名。
     let label = display_label(display_name, &process_name);
 
@@ -93,13 +99,31 @@ pub async fn launch_spec(
         } else {
             spec.window_timeout_ms
         };
-        let appeared = platform::wait_for_window(
-            &process_name,
-            true,
-            Duration::from_millis(timeout_ms),
-            cancel,
-        )
-        .await;
+        let appeared = if target_usable {
+            platform::wait_for_target_window(
+                &target_path,
+                true,
+                Duration::from_millis(timeout_ms),
+                cancel,
+            )
+            .await
+        } else if let Some(pid) = pid {
+            platform::wait_for_pid_window(
+                pid,
+                true,
+                Duration::from_millis(timeout_ms),
+                cancel,
+            )
+            .await
+        } else {
+            platform::wait_for_window(
+                &process_name,
+                true,
+                Duration::from_millis(timeout_ms),
+                cancel,
+            )
+            .await
+        };
         if !appeared {
             if is_cancelled(cancel) {
                 bail!("已取消（等待「{process_name}」主窗口期间）");
@@ -110,8 +134,45 @@ pub async fn launch_spec(
     }
 
     // 5. 关闭启动画面 / 托盘类程序的主窗口。
+    //    必须按启动目标匹配窗口：同名 exe 可能同时有多个沙箱/profile 实例。
+    //    未启用 wait_for_window 时窗口可能还没出来，短暂重试而不是立即放弃。
     if spec.close_main_window {
-        if platform::close_main_window(&process_name) {
+        let sandbox_target = target_path.to_ascii_lowercase().contains("\\sandbox\\");
+        let mut closed = false;
+        // 优先用刚启动的 pid，避免关到同名 exe 的另一个沙箱/profile 实例。
+        if let Some(pid) = pid {
+            closed = platform::close_window_for_pid(pid);
+        }
+        if !closed && target_usable {
+            closed = platform::close_target_main_window(&target_path);
+        }
+        if !closed && !target_usable {
+            closed = platform::close_main_window(&process_name);
+        }
+        if !closed && !spec.wait_for_window {
+            for _ in 0..10 {
+                if is_cancelled(cancel) {
+                    break;
+                }
+                if !sleep_cancellable(Duration::from_millis(200), cancel).await {
+                    break;
+                }
+                if let Some(pid) = pid {
+                    closed = platform::close_window_for_pid(pid);
+                }
+                if !closed && target_usable {
+                    closed = platform::close_target_main_window(&target_path);
+                }
+                if closed {
+                    break;
+                }
+            }
+        }
+        // 非沙箱应用允许按进程名兜底；沙箱绝不能按名字兜底，否则会关错实例。
+        if !closed && !sandbox_target {
+            closed = platform::close_main_window(&process_name);
+        }
+        if closed {
             message.push_str("，已请求关闭其主窗口");
         } else {
             message.push_str("，但未能关闭其主窗口（可能已关闭或没有窗口）");
@@ -120,7 +181,17 @@ pub async fn launch_spec(
 
     // 6. 置前窗口。
     if spec.focus_window {
-        if platform::focus_main_window(&process_name) {
+        let mut focused = false;
+        if let Some(pid) = pid {
+            focused = platform::focus_window_for_pid(pid);
+        }
+        if !focused && target_usable {
+            focused = platform::focus_target_main_window(&target_path);
+        }
+        if !focused && !target_usable {
+            focused = platform::focus_main_window(&process_name);
+        }
+        if focused {
             message.push_str("，主窗口已置前");
         } else {
             message.push_str("，但未能置前主窗口");

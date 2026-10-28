@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use windows::core::{Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, FALSE, HANDLE, HWND, LPARAM, TRUE, WPARAM};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
@@ -716,6 +716,8 @@ pub(crate) struct BrowserTargetInfo {
     pub is_pwa: bool,
     /// 安装目录（小写），用于区分 Edge / Edge Beta 等同名进程。
     pub install_root: Option<String>,
+    /// Chrome/Edge 的 `--profile-directory`（已去引号）；用于区分不同 profile。
+    pub profile: Option<String>,
 }
 
 pub(crate) fn browser_target_info(
@@ -769,9 +771,10 @@ pub(crate) fn browser_target_info(
     let lower_args = args.to_ascii_lowercase();
     let target_name = normalize_process_name(&process_name_from_path(target));
     let is_proxy = target_name.ends_with("_proxy");
+    let profile = profile_directory_from_args(args);
     let has_app_args =
         lower_args.contains("--app-id") || lower_args.contains("--app=");
-    let has_profile_args = lower_args.contains("--profile-directory");
+    let has_profile_args = profile.is_some() || lower_args.contains("--profile-directory");
     // 显示名明确是浏览器本体（Chrome / Edge / Edge Beta / Brave …）时，
     // 即使目标只是浏览器 exe，也按「浏览器应用」处理：进程在跑即跳过。
     let display = normalize_display_name(display_name);
@@ -803,7 +806,53 @@ pub(crate) fn browser_target_info(
         proxy,
         is_pwa,
         install_root,
+        profile,
     })
+}
+
+/// 从浏览器命令行参数里提取 `--profile-directory`（支持 `=` 与空格两种写法、
+/// 引号包裹的空格 profile 名）。参数可能来自快捷方式。
+pub(crate) fn profile_directory_from_args(args: &str) -> Option<String> {
+    let lower = args.to_ascii_lowercase();
+    let needle = "--profile-directory";
+    let mut search_from = 0usize;
+    while let Some(offset) = lower[search_from..].find(needle) {
+        let index = search_from + offset;
+        let mut rest = &args[index + needle.len()..];
+        rest = rest.trim_start();
+        if let Some(stripped) = rest.strip_prefix('=') {
+            rest = stripped.trim_start();
+        }
+        if rest.is_empty() {
+            break;
+        }
+        let value = if let Some(quoted) = rest.strip_prefix('"') {
+            quoted.split('"').next().unwrap_or("").to_string()
+        } else {
+            rest.split_whitespace().next().unwrap_or("").to_string()
+        };
+        if !value.is_empty() && value != "=" {
+            return Some(value);
+        }
+        search_from = index + 1;
+    }
+    None
+}
+
+fn process_cmd_line(process: &sysinfo::Process) -> String {
+    process
+        .cmd()
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn command_line_has_profile(process: &sysinfo::Process, profile: &str) -> bool {
+    let command_line = process_cmd_line(process);
+    !command_line.is_empty()
+        && profile_directory_from_args(&command_line)
+            .is_some_and(|found| found.eq_ignore_ascii_case(profile))
 }
 
 /// 把规范化后的浏览器进程名映射到 `'static` 字符串。
@@ -842,10 +891,14 @@ fn proxy_browser_name(name: &str) -> Option<&'static str> {
     }
 }
 
-/// 浏览器 + 代理进程的 pid 列表，按安装目录过滤，避免 Edge / Edge Beta 互相误判。
+/// 浏览器 + 代理进程的 pid 列表，按安装目录与 profile 过滤。
 fn browser_target_pids(info: &BrowserTargetInfo) -> Vec<u32> {
     let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
     let wanted = [
         normalize_process_name(info.browser),
         normalize_process_name(info.proxy),
@@ -860,6 +913,11 @@ fn browser_target_pids(info: &BrowserTargetInfo) -> Vec<u32> {
             let Some(exe) = process.exe() else { continue };
             let exe = exe.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
             if !exe.starts_with(root) {
+                continue;
+            }
+        }
+        if let Some(profile) = info.profile.as_deref() {
+            if !command_line_has_profile(process, profile) {
                 continue;
             }
         }
@@ -958,17 +1016,71 @@ fn resolve_launch_target(spec: &AppLaunchSpec) -> String {
     path
 }
 
+/// 路径比较用的规范化：去引号、统一分隔符、小写、去 verbatim 前缀。
+fn normalize_path_key(path: &str) -> String {
+    let trimmed = path.trim().trim_matches('"');
+    trimmed
+        .strip_prefix(r"\\?\")
+        .unwrap_or(trimmed)
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+/// 进程命令行第一个参数或 exe 路径是否等于目标路径。
+///
+/// Sandboxie 等沙箱进程的 `ExecutablePath` 是宿主路径，但命令行里保留沙箱路径，
+/// 因此必须优先比较命令行，才能区分同一 exe 在不同沙箱中的实例。
+fn process_matches_target(process: &sysinfo::Process, target: &str) -> bool {
+    let target_key = normalize_path_key(target);
+    if target_key.is_empty() {
+        return false;
+    }
+    if let Some(first) = process.cmd().first() {
+        if normalize_path_key(&first.to_string_lossy()) == target_key {
+            return true;
+        }
+    }
+    process
+        .exe()
+        .is_some_and(|exe| normalize_path_key(&exe.to_string_lossy()) == target_key)
+}
+
+/// 找出命令行/exe 路径匹配目标路径的进程。
+fn process_pids_for_target(target: &str) -> Vec<u32> {
+    let key = normalize_path_key(target);
+    if key.is_empty() {
+        return Vec::new();
+    }
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    system
+        .processes()
+        .iter()
+        .filter(|(_, process)| process_matches_target(process, target))
+        .map(|(pid, _)| pid.as_u32())
+        .collect()
+}
+
+fn is_sandbox_target(target: &str) -> bool {
+    target.to_ascii_lowercase().contains("\\sandbox\\")
+}
+
 /// 判断某个启动配置对应的应用是否已在运行，返回已存在的 pid。
 ///
 /// `display_name` 是节点/应用显示名，用于窗口标题匹配（浏览器 PWA / Web App）。
 ///
 /// 策略：
-/// 1. 普通应用：沿用进程名检测（`spec.process_name` 优先，否则从解析后的目标 exe 推导）；
-/// 2. `.lnk`：先 `resolve_lnk` 拿 target 再判断；
-/// 3. 浏览器（chrome/msedge/brave/chromium/opera/vivaldi）：浏览器本体的进程名无法区分
-///    具体 PWA，所以只在「属于该浏览器的可见窗口」里按标题匹配 display_name；
-///    匹配不到就认为该 App 没打开（不能因为浏览器本体在跑就跳过启动）；
-/// 4. 非浏览器不做标题匹配，避免误判成别的窗口；
+/// 1. 普通应用：优先按「解析后的目标路径 + 进程命令行第一个参数」匹配，能区分沙箱；
+///    非沙箱路径匹配不到时再退回进程名；
+/// 2. `.lnk`：先 `resolve_lnk` 拿 target 与参数再判断；
+/// 3. 浏览器（chrome/msedge/brave/chromium/opera/vivaldi）：按安装目录判断归属，
+///    浏览器应用支持 `--profile-directory` 区分 profile；PWA 只按可见窗口标题匹配
+///    display_name，匹配不到就认为该 App 没打开；
+/// 4. 沙箱目标（`\Sandbox\`）绝不按进程名兜底，避免把另一个沙箱的同名 QQ/微信误判；
 /// 5. 任何不确定的情况返回 `None`（调用方会正常启动）。
 // 说明：本函数是给 engine launcher 接入用的公开入口；在 engine 切换过来之前，
 // 单编译 crate 会把它（及其内部 helper）判为「未使用」，这里显式放行，避免污染构建告警。
@@ -1012,8 +1124,12 @@ pub fn find_running_app(spec: &AppLaunchSpec, display_name: &str) -> Option<u32>
     let args = format!("{} {}", spec.args.join(" "), link_args);
     if let Some(info) = browser_target_info(target, explicit, &args, display_name) {
         let pids = browser_target_pids(&info);
+        if pids.is_empty() {
+            return None;
+        }
         if !info.is_pwa {
-            // 浏览器应用（Chrome / Edge / Edge Beta 等）：进程在跑即跳过。
+            // 浏览器应用（Chrome / Edge / Edge Beta、带 profile 的 Chrome 快捷方式）：
+            // 有匹配 profile 的进程才算已存在。
             return pids.first().copied();
         }
         if normalize_display_name(display_name).chars().count() >= 2 {
@@ -1023,6 +1139,14 @@ pub fn find_running_app(spec: &AppLaunchSpec, display_name: &str) -> Option<u32>
         return pids.first().copied();
     }
 
+    // 非浏览器：优先按启动目标路径匹配，区分不同沙箱的同名进程；
+    // 沙箱目标绝不按进程名兜底，避免把另一个沙箱的 QQ/微信误判为已存在。
+    if let Some(pid) = process_pids_for_target(target).into_iter().next() {
+        return Some(pid);
+    }
+    if is_sandbox_target(target) {
+        return None;
+    }
     process_pids(&process_name).first().copied()
 }
 
@@ -1165,12 +1289,24 @@ fn find_window_by_process_name(process_name: &str) -> Option<WindowEntry> {
     if pids.is_empty() {
         return None;
     }
+    find_window_by_pids(&pids)
+}
+
+fn find_window_by_pids(pids: &[u32]) -> Option<WindowEntry> {
     let windows = all_titled_windows();
     windows
         .iter()
         .find(|window| window.visible && pids.contains(&window.pid))
         .or_else(|| windows.iter().find(|window| pids.contains(&window.pid)))
         .cloned()
+}
+
+fn find_window_by_target(target: &str) -> Option<WindowEntry> {
+    let pids = process_pids_for_target(target);
+    if pids.is_empty() {
+        return None;
+    }
+    find_window_by_pids(&pids)
 }
 
 /// 等待进程主窗口出现。
@@ -1209,9 +1345,108 @@ pub async fn wait_for_window(
     }
 }
 
+/// 等待指定 target 的窗口出现。
+///
+/// 与 `wait_for_window` 的区别：同一 exe 可能存在多个沙箱/profile 实例，
+/// 这里只认启动目标对应的进程，不会误等/误关另一个实例。
+pub async fn wait_for_target_window(
+    target: &str,
+    require_visible: bool,
+    timeout: Duration,
+    cancel: &Arc<AtomicBool>,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        let pids = process_pids_for_target(target);
+        if !pids.is_empty() {
+            if !require_visible {
+                return true;
+            }
+            if all_titled_windows()
+                .iter()
+                .any(|window| window.visible && pids.contains(&window.pid))
+            {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(WAIT_WINDOW_POLL).await;
+    }
+}
+
+/// 等待指定 pid 的窗口出现。
+pub async fn wait_for_pid_window(
+    pid: u32,
+    require_visible: bool,
+    timeout: Duration,
+    cancel: &Arc<AtomicBool>,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        if !require_visible && process_pids_for_pid(pid).is_empty() {
+            // 进程可能已退出；继续等窗口没有意义。
+            return false;
+        }
+        if find_main_window(pid).is_some() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(WAIT_WINDOW_POLL).await;
+    }
+}
+
+fn process_pids_for_pid(pid: u32) -> Vec<u32> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    system
+        .processes()
+        .keys()
+        .filter(|id| id.as_u32() == pid)
+        .map(|id| id.as_u32())
+        .collect()
+}
+
+/// 向指定 pid 的主窗口发送 WM_CLOSE。
+pub fn close_window_for_pid(pid: u32) -> bool {
+    let Some(window) = find_main_window(pid) else {
+        return false;
+    };
+    unsafe { PostMessageW(window.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() }
+}
+
+/// 把指定 pid 的主窗口置前。
+pub fn focus_window_for_pid(pid: u32) -> bool {
+    let Some(window) = find_main_window(pid) else {
+        return false;
+    };
+    activate_window(&window)
+}
+
 /// 向主窗口发送 WM_CLOSE。
 pub fn close_main_window(process_name: &str) -> bool {
     let Some(window) = find_window_by_process_name(process_name) else {
+        return false;
+    };
+    unsafe { PostMessageW(window.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() }
+}
+
+/// 向指定启动目标（同一 exe 的多个实例也能区分）的主窗口发送 WM_CLOSE。
+pub fn close_target_main_window(target: &str) -> bool {
+    let Some(window) = find_window_by_target(target) else {
         return false;
     };
     unsafe { PostMessageW(window.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() }
@@ -1222,6 +1457,18 @@ pub fn focus_main_window(process_name: &str) -> bool {
     let Some(window) = find_window_by_process_name(process_name) else {
         return false;
     };
+    activate_window(&window)
+}
+
+/// 把指定启动目标的主窗口置前。
+pub fn focus_target_main_window(target: &str) -> bool {
+    let Some(window) = find_window_by_target(target) else {
+        return false;
+    };
+    activate_window(&window)
+}
+
+fn activate_window(window: &WindowEntry) -> bool {
     unsafe {
         let _ = ShowWindow(window.hwnd, SW_RESTORE);
         if SetForegroundWindow(window.hwnd).as_bool() {
@@ -1439,6 +1686,24 @@ mod tests {
         for name in ["firefox", "chrome_proxy", "msedgewebview2", "explorer", ""] {
             assert!(!is_browser_process_name(name), "{name} 不应识别为浏览器");
         }
+    }
+
+    #[test]
+    fn profile_directory_parsing() {
+        assert_eq!(
+            profile_directory_from_args(r#"--profile-directory="Profile 1""#).as_deref(),
+            Some("Profile 1")
+        );
+        assert_eq!(
+            profile_directory_from_args("--profile-directory=Default").as_deref(),
+            Some("Default")
+        );
+        assert_eq!(
+            profile_directory_from_args(r#"--profile-directory "Profile 2""#).as_deref(),
+            Some("Profile 2")
+        );
+        assert_eq!(profile_directory_from_args("--profile-directory").as_deref(), None);
+        assert_eq!(profile_directory_from_args("--app-id=abc").as_deref(), None);
     }
 
     #[test]

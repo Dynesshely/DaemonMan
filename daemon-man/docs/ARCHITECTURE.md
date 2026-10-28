@@ -98,7 +98,7 @@ DAG 校验与调度     Windows 集成（注册表/任务/服务/进程/窗口�
    - **Graph**：保持原连线。
    边归属用「两端节点最近公共分组」判定，跨组/顶层边始终保留；`group_mode` 缺省时按 `group_parallel` 推导。`validate_workflow`/运行前校验都基于有效执行图，组内被忽略的连线不会误判为环。
 9. **进程父进程**：普通启动走 `CreateProcessW + STARTUPINFOEXW`，用 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 把父进程指向当前 shell（`GetShellWindow` 所属 explorer），使工作流启动的进程不挂在 DaemonMan 进程树下；属性列表/句柄失败或 `CREATE_BREAKAWAY_FROM_JOB` 不被允许时按「去 breakaway → 普通 CreateProcess」回退。管理员启动仍由 ShellExecuteEx(runas) 处理。
-10. **已运行检测**：`platform::proc::find_running_app(spec, display_name)` 先解析 `.lnk` 目标与参数；若目标是浏览器（chrome/msedge/brave/chromium/opera/vivaldi）或其代理（`chrome_proxy.exe` / `msedge_proxy.exe` 等），按安装路径判断浏览器归属，并把浏览器本体与代理进程的 pid 都作为窗口归属候选。随后区分两类节点：**浏览器应用**（Chrome/Edge/Edge Beta、Chrome profile 快捷方式等）按安装目录匹配进程，进程在跑即视为已存在；**PWA/Web App**（proxy 快捷方式或带 `--app-id` / `--app=`）必须匹配到对应可见窗口才算存在，普通标签页标题会被过滤。无法精确读取命令行 `--app-id`（windows crate 未导出对应 API），标题匹配可能对无浏览器后缀的标签页产生误判，取舍为「宁可跳过也不重复开窗」。
+10. **已运行检测**：`platform::proc::find_running_app(spec, display_name)` 先解析 `.lnk` 目标与参数；若目标是浏览器（chrome/msedge/brave/chromium/opera/vivaldi）或其代理（`chrome_proxy.exe` / `msedge_proxy.exe` 等），按安装路径判断浏览器归属，并把浏览器本体与代理进程的 pid 都作为窗口归属候选。随后区分两类节点：**浏览器应用**（Chrome/Edge/Edge Beta、Chrome profile 快捷方式）按安装目录 + `--profile-directory` 匹配进程，只有同一 profile 在跑才算已存在；**PWA/Web App**（proxy 快捷方式或带 `--app-id` / `--app=`）必须匹配到对应可见窗口才算存在，普通标签页标题会被过滤。非浏览器节点按「启动目标路径 + 进程命令行第一个参数」匹配，能区分 Sandboxie 等沙箱中的同名 QQ/微信，沙箱目标不会按进程名兜底。无法精确读取命令行 `--app-id` 的情况仍有标题匹配误判可能，取舍为「宁可跳过也不重复开窗」。
 
 ## 4. 自启动接管
 
@@ -156,6 +156,7 @@ GUI 始终以普通权限运行。需要管理员权限的单个操作（启用/
 - 组内延迟：顺序模式下 `group_delay_ms` 覆盖组内连线延时，组头显示延迟徽标。
 - 分组配色：顺序/按连线分组 teal、并行分组 violet（边框/底色/标题/徽标/选中 ring 区分），文本视图同步并显示模式。
 - 分组自适应：画布监听节点实际量测尺寸与运行状态，按后代节点的最大 right/bottom 重新包络分组容器（只改画布几何，不写 draft），确保运行徽标/跳过提示让卡片变高时边框仍包住所有子项。
+- 启动后窗口操作：`closeMainWindow` 优先按刚启动的 pid 定位主窗口，其次按启动目标路径匹配（区分同名沙箱实例）；若未启用 `waitForWindow`，会短暂重试等待窗口出现，避免在窗口创建前就放弃关闭。
 - 连线延时：只有一个入边/一个出边且条件均为 success 的 delay 节点视为「连线延时」；自动排列时从布局图折叠、两条边合并为一条 source→target 的合成边（`delay:<sourceEdgeId>:<targetEdgeId>`），画布完全不渲染该延时节点，改由自定义边用 `EdgeLabelRenderer` 在 `getSmoothStepPath` 的 labelX/labelY 渲染标签，因此标签必然位于连线上、不会浮空或绕线。点击合成边（标签区域 `pointer-events:none`，点击落到边的交互路径）会选中隐藏的延时节点，右侧可编辑延时；删除合成边等价于删除其折叠的两条原始边，延时恢复为普通卡片。相邻的两个延时节点不折叠，避免合成边引用不可见节点。
 - 吸附：Vue Flow `snap-to-grid` 16px，可开关；分组节点可拖动，拖动时整组后代按整数 delta 平移。
 - 边分类：`target.layer === source.layer + 1 && condition === "success"` 为执行流（实线、品牌色、粗箭头）；其余（跨层/同层跳线、失败/总是）为依赖线（虚线、灰色、细箭头）。图例见画布工具栏。
